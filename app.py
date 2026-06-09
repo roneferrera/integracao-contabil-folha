@@ -1,22 +1,94 @@
 import streamlit as st
 import pdfplumber
 import pandas as pd
-from io import BytesIO
+from io import BytesIO, StringIO
 import re
 
-st.set_page_config(page_title="PDF Rubricas → Excel", page_icon="📊", layout="wide")
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURAÇÃO DA PÁGINA
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(
+    page_title="Domínio Sistemas | Thomson Reuters",
+    page_icon="🟠",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-st.title("📊 Conversor: Rubricas/Itens Não Configurados → Excel")
-st.markdown("Faça o upload do PDF para converter as rubricas em planilha Excel estruturada.")
+VERSAO = "V2.0"
 
-# ── Mapeamento de tipos de integração ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  TEMA THOMSON REUTERS
+# ══════════════════════════════════════════════════════════════════════════════
+def apply_tr_theme():
+    st.markdown("""
+        <style>
+        html, body, [class*="css"] {
+            font-family: 'Segoe UI', 'Arial', sans-serif;
+            color: #444444;
+        }
+        h1, h2, h3 { color: #FF8000; font-weight: 700; }
+        section[data-testid="stSidebar"] {
+            background-color: #444444;
+            color: #FFFFFF;
+        }
+        section[data-testid="stSidebar"] * { color: #FFFFFF !important; }
+        .stButton > button {
+            background-color: #FF8000; color: #FFFFFF;
+            border: none; border-radius: 4px; font-weight: bold;
+        }
+        .stButton > button:hover { background-color: #D64001; color: #FFFFFF; }
+        .stDownloadButton > button {
+            background-color: #FF8000; color: #FFFFFF;
+            border: none; border-radius: 4px; font-weight: bold;
+        }
+        .stDownloadButton > button:hover { background-color: #D64001; color: #FFFFFF; }
+        hr { border-color: #FF8000; }
+        [data-testid="metric-container"] {
+            background-color: #E9E9E9;
+            border-left: 4px solid #FF8000;
+            border-radius: 4px;
+            padding: 10px;
+        }
+        [data-testid="stFileUploader"] {
+            border: 2px dashed #FF8000;
+            border-radius: 6px;
+            padding: 10px;
+        }
+        .instrucoes-box {
+            background-color: #E9E9E9;
+            border-left: 4px solid #FF8000;
+            border-radius: 4px;
+            padding: 16px 20px;
+            margin: 12px 0;
+            color: #444444;
+            font-family: 'Segoe UI', Arial, sans-serif;
+        }
+        .instrucoes-box h4 {
+            color: #FF8000;
+            margin-top: 14px;
+            margin-bottom: 6px;
+        }
+        .instrucoes-box h4:first-child { margin-top: 0; }
+        </style>
+    """, unsafe_allow_html=True)
+
+apply_tr_theme()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAPEAMENTOS
+# ══════════════════════════════════════════════════════════════════════════════
 TIPO_MAP = {
-    "Folha Normal": 1,
-    "Empresa":      2,
-    "Férias":       3,
-    "Rescisão":     4,
-    "Provisão de Férias": 5,
-    "Provisão de 13º":    6,
+    "folha normal":       1,
+    "empresa":            2,
+    "férias":             3,
+    "ferias":             3,
+    "rescisão":           4,
+    "rescisao":           4,
+    "provisão de férias": 5,
+    "provisao de ferias": 5,
+    "provisão de 13":     6,
+    "provisao de 13":     6,
+    "provisão de 13º":    6,
 }
 
 TIPO_DESC = {
@@ -28,30 +100,39 @@ TIPO_DESC = {
     6: "Prov. 13",
 }
 
-# ── Mapeamento de centros de custo ─────────────────────────────────────────────
-CC_MAP = {
-    "1":  "ADMINISTRAÇÃO",
-    "2":  "ESTAGIÁRIOS",
-    "6":  "ROCHE",
-    "10": "BAYER",
-    "13": "GERAL",
-}
+TIPO_ICONE = {1: "📋", 2: "🏢", 3: "🏖️", 4: "📤", 5: "📅", 6: "🎄"}
+
+IGNORE_PATTERNS = [
+    re.compile(r"^RELAÇÃO DE RUBRICAS",        re.IGNORECASE),
+    re.compile(r"^Página\s*:",                 re.IGNORECASE),
+    re.compile(r"^Emissão\s*:",                re.IGNORECASE),
+    re.compile(r"^Hora\s*:",                   re.IGNORECASE),
+    re.compile(r"^Empresa\s*:",                re.IGNORECASE),
+    re.compile(r"^Código\s+Descrição",         re.IGNORECASE),
+]
+
+RE_CC    = re.compile(r"^Centro de Custo\s*:\s*(\d+)\s+(.+)$", re.IGNORECASE)
+RE_EVENT = re.compile(r"^\s*(\d+)\s+(.+)$")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PARSER DO PDF
+# ══════════════════════════════════════════════════════════════════════════════
+def normalize_tipo(line: str) -> int | None:
+    key = line.strip().lower()
+    if "13" in key:
+        key = re.sub(r"[º°].*$", "", key).strip()
+        key = re.sub(r"\s+$", "", key)
+    return TIPO_MAP.get(key)
+
+
+def should_ignore(line: str) -> bool:
+    return any(p.match(line) for p in IGNORE_PATTERNS)
 
 
 def parse_pdf(file_bytes: bytes) -> pd.DataFrame:
-    """Extrai todas as linhas do PDF e monta o DataFrame."""
     rows = []
-
-    # Padrões de detecção
-    re_tipo   = re.compile(
-        r"^(Folha Normal|Empresa|Férias|Rescisão|Provisão de Férias|Provisão de 13[oº°])\s*$",
-        re.IGNORECASE,
-    )
-    re_cc     = re.compile(r"^Centro de Custo:\s*(\d+)\s+(.+)$", re.IGNORECASE)
-    re_event  = re.compile(r"^\s*(\d+)\s+(.+)$")
-    re_header = re.compile(r"^(Código|RELAÇÃO DE RUBRICAS|Página|Emissão|Hora|Empresa:)", re.IGNORECASE)
-
-    current_tipo = None
+    current_tipo    = None
     current_cc_cod  = None
     current_cc_desc = None
 
@@ -60,228 +141,598 @@ def parse_pdf(file_bytes: bytes) -> pd.DataFrame:
             text = page.extract_text()
             if not text:
                 continue
-
-            for raw_line in text.splitlines():
-                line = raw_line.strip()
-
+            for raw in text.splitlines():
+                line = raw.strip()
                 if not line:
                     continue
-
-                # Ignora cabeçalhos de página
-                if re_header.match(line):
+                if should_ignore(line):
                     continue
 
-                # ── Tipo de integração ─────────────────────────────────────
-                m_tipo = re_tipo.match(line)
-                if m_tipo:
-                    # Normaliza "Provisão de 13o" → "Provisão de 13º"
-                    raw = m_tipo.group(1)
-                    if re.search(r"13[oO°]", raw):
-                        raw = "Provisão de 13º"
-                    current_tipo = TIPO_MAP.get(raw)
+                # Tipo de integração
+                tipo_code = normalize_tipo(line)
+                if tipo_code is not None:
+                    current_tipo = tipo_code
                     continue
 
-                # ── Centro de Custo ────────────────────────────────────────
-                m_cc = re_cc.match(line)
+                # Centro de Custo
+                m_cc = RE_CC.match(line)
                 if m_cc:
                     current_cc_cod  = m_cc.group(1).strip()
                     current_cc_desc = m_cc.group(2).strip()
                     continue
 
-                # ── Evento (código + descrição) ────────────────────────────
-                m_ev = re_event.match(line)
+                # Evento
+                m_ev = RE_EVENT.match(line)
                 if m_ev and current_tipo and current_cc_cod:
                     cod_ev  = m_ev.group(1).strip()
                     desc_ev = m_ev.group(2).strip()
-                    tipo_num  = current_tipo
-                    tipo_desc = TIPO_DESC.get(tipo_num, "")
-
                     rows.append({
-                        "Cód Centro de Custo":       current_cc_cod,
-                        "Desc. Centro de Custo":     current_cc_desc,
-                        "Tipo da Integração":        tipo_num,
-                        "Desc. Tipo Integração":     tipo_desc,
-                        "Cod Evento":                cod_ev,
-                        "Descrição Evento":          desc_ev,
-                        "Cod + Descrição Evento":    f"{cod_ev} - {desc_ev}",
+                        "Cód Centro de Custo":    current_cc_cod,
+                        "Desc. Centro de Custo":  current_cc_desc,
+                        "Tipo da Integração":     current_tipo,
+                        "Desc. Tipo Integração":  TIPO_DESC[current_tipo],
+                        "Cod Evento":             cod_ev,
+                        "Descrição Evento":       desc_ev,
+                        "Cod + Descrição Evento": f"{cod_ev} - {desc_ev}",
                     })
 
     return pd.DataFrame(rows)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  GERAÇÃO DO ARQUIVO "evento exemplo.txt" (aba "evento")
+#
+#  Colunas (tabuladas):
+#  Código da Empresa | Centro de custo | Código Sequencial da Integração |
+#  Tipo da Integração (...) | Descrição | Código da Conta Débito |
+#  Código da Conta Crédito | Código do Histórico | Complemento
+#
+#  Regras observadas no exemplo:
+#  - Código da Empresa: preenchido apenas na 1ª linha de cada CC (demais = vazio)
+#  - Centro de custo:   preenchido apenas na 1ª linha de cada CC (demais = vazio)
+#  - Código Sequencial: sequência global crescente (1, 2, 3 ...)
+#  - Conta Débito/Crédito/Histórico/Complemento: vazios (não configurados)
+# ══════════════════════════════════════════════════════════════════════════════
+def gerar_evento_txt(df: pd.DataFrame, cod_empresa: str) -> bytes:
+    """
+    Gera o arquivo tabulado no formato da aba 'evento' do evento exemplo.xlsx.
+    Tipos incluídos: Folha Normal (1), Empresa (2), Férias (3), Rescisão (4).
+    Provisões (5 e 6) vão para o arquivo integra.
+    """
+    HEADER = "\t".join([
+        "Código da Empresa",
+        "Centro de custo",
+        "Código Sequencial da Integração",
+        "Tipo da Integração (1 - Folha mensal; 2 - Empresa; 3 - Férias; 4 - Rescisao; 5 - Prov. Férias; 6 - Prov. 13)",
+        "Descrição",
+        "Código da Conta Débito",
+        "Código da Conta Crédito",
+        "Código do Histórico",
+        "Complemento",
+    ])
+
+    # Filtra tipos 1-4 (evento)
+    df_ev = df[df["Tipo da Integração"].isin([1, 2, 3, 4])].copy()
+
+    linhas = [HEADER]
+    seq = 1
+    prev_cc = None
+
+    for _, row in df_ev.iterrows():
+        cc_key = (row["Cód Centro de Custo"], row["Tipo da Integração"])
+
+        if cc_key != prev_cc:
+            emp_val = cod_empresa
+            cc_val  = row["Cód Centro de Custo"]
+            prev_cc = cc_key
+        else:
+            emp_val = ""
+            cc_val  = ""
+
+        linha = "\t".join([
+            emp_val,                          # Código da Empresa
+            cc_val,                           # Centro de custo
+            str(seq),                         # Código Sequencial
+            str(row["Tipo da Integração"]),   # Tipo da Integração
+            row["Descrição Evento"],          # Descrição
+            "",                               # Conta Débito
+            "",                               # Conta Crédito
+            "",                               # Histórico
+            "",                               # Complemento
+        ])
+        linhas.append(linha)
+        seq += 1
+
+    conteudo = "\n".join(linhas)
+    return conteudo.encode("utf-8-sig")   # BOM para Excel abrir corretamente
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GERAÇÃO DO ARQUIVO "integra exemplo.txt" (aba "Plan1")
+#
+#  Colunas (tabuladas):
+#  Código da Empresa | Centro de Custo | Código Sequencial da Integração |
+#  Tipo da Integração (...) | Descrição | Código da Conta Crédito |
+#  Código da Conta Débito | Código do Histórico
+#
+#  Regras observadas no exemplo:
+#  - Centro de Custo: nan (vazio) no exemplo → mantemos vazio
+#  - Código Sequencial: sequência global crescente
+#  - Contas/Histórico: vazios
+#  - Inclui TODOS os tipos (1-6)
+# ══════════════════════════════════════════════════════════════════════════════
+def gerar_integra_txt(df: pd.DataFrame, cod_empresa: str) -> bytes:
+    """
+    Gera o arquivo tabulado no formato da aba 'Plan1' do integra exemplo.xls.
+    Inclui todos os tipos de integração (1 a 6).
+    """
+    HEADER = "\t".join([
+        "Código da Empresa",
+        "Centro de Custo",
+        "Código Sequencial da Integração",
+        "Tipo da Integração (1 - Folha mensal; 2 - Empresa; 3 - Férias; 4 - Rescisao; 5 - Prov. Férias; 6 - Prov. 13)",
+        "Descrição",
+        "Código da Conta Crédito",
+        "Código da Conta Débito",
+        "Código do Histórico",
+    ])
+
+    linhas = [HEADER]
+    seq = 1
+
+    for _, row in df.iterrows():
+        linha = "\t".join([
+            cod_empresa,                      # Código da Empresa
+            "",                               # Centro de Custo (nan no exemplo)
+            str(seq),                         # Código Sequencial
+            str(row["Tipo da Integração"]),   # Tipo da Integração
+            row["Descrição Evento"],          # Descrição
+            "",                               # Conta Crédito
+            "",                               # Conta Débito
+            "",                               # Histórico
+        ])
+        linhas.append(linha)
+        seq += 1
+
+    conteudo = "\n".join(linhas)
+    return conteudo.encode("utf-8-sig")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GERAÇÃO DO EXCEL DE VISUALIZAÇÃO
+# ══════════════════════════════════════════════════════════════════════════════
 def to_excel(df: pd.DataFrame) -> bytes:
-    """Converte o DataFrame para bytes de um arquivo .xlsx estilizado."""
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="Rubricas")
+        wb = writer.book
+        ws = writer.sheets["Rubricas"]
 
-        workbook  = writer.book
-        worksheet = writer.sheets["Rubricas"]
-
-        # ── Formatos ───────────────────────────────────────────────────────
-        header_fmt = workbook.add_format({
-            "bold":       True,
-            "bg_color":   "#1F4E79",
-            "font_color": "#FFFFFF",
-            "border":     1,
-            "align":      "center",
-            "valign":     "vcenter",
-            "text_wrap":  True,
+        hdr = wb.add_format({
+            "bold": True, "bg_color": "#FF8000", "font_color": "#FFFFFF",
+            "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True,
         })
-        cell_fmt = workbook.add_format({
-            "border":  1,
-            "valign":  "vcenter",
-            "align":   "left",
+        cell = wb.add_format({"border": 1, "valign": "vcenter", "align": "left"})
+        cnum = wb.add_format({"border": 1, "valign": "vcenter", "align": "center"})
+        alt  = wb.add_format({
+            "border": 1, "valign": "vcenter", "align": "left", "bg_color": "#FFF0E0"
         })
-        num_fmt = workbook.add_format({
-            "border":  1,
-            "valign":  "vcenter",
-            "align":   "center",
-        })
-        alt_fmt = workbook.add_format({        # linha alternada
-            "border":    1,
-            "valign":    "vcenter",
-            "align":     "left",
-            "bg_color":  "#D6E4F0",
-        })
-        alt_num_fmt = workbook.add_format({
-            "border":    1,
-            "valign":    "vcenter",
-            "align":     "center",
-            "bg_color":  "#D6E4F0",
+        anum = wb.add_format({
+            "border": 1, "valign": "vcenter", "align": "center", "bg_color": "#FFF0E0"
         })
 
-        # ── Cabeçalho ──────────────────────────────────────────────────────
-        for col_num, col_name in enumerate(df.columns):
-            worksheet.write(0, col_num, col_name, header_fmt)
+        for c, col in enumerate(df.columns):
+            ws.write(0, c, col, hdr)
+        ws.set_row(0, 32)
 
-        # ── Larguras das colunas ───────────────────────────────────────────
-        col_widths = {
-            "Cód Centro de Custo":    8,
-            "Desc. Centro de Custo": 22,
-            "Tipo da Integração":    10,
-            "Desc. Tipo Integração": 18,
-            "Cod Evento":             8,
-            "Descrição Evento":      40,
-            "Cod + Descrição Evento":45,
-        }
-        for col_num, col_name in enumerate(df.columns):
-            worksheet.set_column(col_num, col_num, col_widths.get(col_name, 18))
+        widths = [10, 24, 12, 18, 10, 42, 52]
+        for c, w in enumerate(widths):
+            ws.set_column(c, c, w)
 
-        # ── Dados com zebra striping ───────────────────────────────────────
-        num_cols = {"Cód Centro de Custo", "Tipo da Integração", "Cod Evento"}
-        for row_num, row_data in enumerate(df.itertuples(index=False), start=1):
-            is_alt = row_num % 2 == 0
-            for col_num, col_name in enumerate(df.columns):
-                value = row_data[col_num]
-                if col_name in num_cols:
-                    fmt = alt_num_fmt if is_alt else num_fmt
+        num_cols_idx = {0, 2, 4}
+
+        for r, row in enumerate(df.itertuples(index=False), start=1):
+            even = r % 2 == 0
+            for c in range(len(df.columns)):
+                val = row[c]
+                if c in num_cols_idx:
+                    ws.write(r, c, val, anum if even else cnum)
                 else:
-                    fmt = alt_fmt if is_alt else cell_fmt
-                worksheet.write(row_num, col_num, value, fmt)
+                    ws.write(r, c, val, alt if even else cell)
 
-        # ── Altura do cabeçalho ────────────────────────────────────────────
-        worksheet.set_row(0, 30)
-
-        # ── Freeze pane no cabeçalho ───────────────────────────────────────
-        worksheet.freeze_panes(1, 0)
-
-        # ── AutoFilter ────────────────────────────────────────────────────
-        worksheet.autofilter(0, 0, len(df), len(df.columns) - 1)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, len(df), len(df.columns) - 1)
 
     return output.getvalue()
 
 
-# ── Interface Streamlit ────────────────────────────────────────────────────────
-uploaded_file = st.file_uploader("📁 Selecione o arquivo PDF", type=["pdf"])
+# ══════════════════════════════════════════════════════════════════════════════
+#  HEADER PRINCIPAL
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown(
+    f"""
+    <div style="background:#444444; padding:24px 28px 18px 28px;
+                border-radius:8px; border-top:6px solid #FF8000;
+                margin-bottom:28px;">
+        <h2 style="color:#FF8000; margin:0;
+                   font-family:'Segoe UI',Arial,sans-serif;">
+            📊 Rubricas/Itens Não Configurados → TXT Tabulado
+            &nbsp;|&nbsp; {VERSAO}
+        </h2>
+        <p style="color:#DDDDDD; margin:6px 0 0 0;
+                  font-family:'Segoe UI',Arial,sans-serif;">
+            Converte o PDF em dois arquivos TXT tabulados:
+            <strong>evento_exemplo.txt</strong> e <strong>integra_exemplo.txt</strong>
+            prontos para importação no Domínio Sistemas.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-if uploaded_file:
-    with st.spinner("🔄 Processando PDF..."):
-        file_bytes = uploaded_file.read()
-        df = parse_pdf(file_bytes)
+# ══════════════════════════════════════════════════════════════════════════════
+#  SIDEBAR
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("### ⚙️ Configurações")
+
+    cod_empresa = st.text_input(
+        "Código da Empresa",
+        value="1",
+        help="Código da empresa que será preenchido nos arquivos TXT.",
+    )
+
+    st.markdown("---")
+    st.markdown("### 📋 Tipos de Integração")
+    for cod, desc in TIPO_DESC.items():
+        icone = TIPO_ICONE.get(cod, "•")
+        st.caption(f"{icone} **{cod}** — {desc}")
+
+    st.markdown("---")
+    st.markdown("### 📄 Arquivos gerados")
+    st.caption("**evento_exemplo.txt**")
+    st.caption("→ Tipos 1 (Folha), 2 (Empresa), 3 (Férias), 4 (Rescisão)")
+    st.caption("→ Aba: evento")
+    st.markdown("")
+    st.caption("**integra_exemplo.txt**")
+    st.caption("→ Todos os tipos (1 a 6)")
+    st.caption("→ Aba: Plan1")
+
+    st.markdown("---")
+    st.markdown("### ℹ Sobre")
+    st.markdown(f"**Versão:** {VERSAO}")
+    st.markdown("**Thomson Reuters**")
+    st.markdown("**Domínio Sistemas**")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  INSTRUÇÕES
+# ══════════════════════════════════════════════════════════════════════════════
+with st.expander("📖 **Instruções de Uso** — clique para expandir", expanded=False):
+    st.markdown(
+        """
+        <div class="instrucoes-box">
+
+        <h4>🔹 Arquivos gerados</h4>
+        <table style="width:100%; border-collapse:collapse;">
+          <tr style="background:#FF8000; color:white;">
+            <th style="padding:6px; text-align:left;">Arquivo</th>
+            <th style="padding:6px; text-align:left;">Aba de destino</th>
+            <th style="padding:6px; text-align:left;">Tipos incluídos</th>
+            <th style="padding:6px; text-align:left;">Colunas</th>
+          </tr>
+          <tr style="background:#FFF0E0;">
+            <td style="padding:6px;"><b>evento_exemplo.txt</b></td>
+            <td style="padding:6px;">evento</td>
+            <td style="padding:6px;">1, 2, 3, 4</td>
+            <td style="padding:6px;">Empresa | CC | Seq | Tipo | Descrição | Déb | Créd | Hist | Complemento</td>
+          </tr>
+          <tr>
+            <td style="padding:6px;"><b>integra_exemplo.txt</b></td>
+            <td style="padding:6px;">Plan1</td>
+            <td style="padding:6px;">1, 2, 3, 4, 5, 6</td>
+            <td style="padding:6px;">Empresa | CC | Seq | Tipo | Descrição | Créd | Déb | Hist</td>
+          </tr>
+        </table>
+
+        <h4>🔹 Passo a passo</h4>
+        <ol>
+          <li>Informe o <b>Código da Empresa</b> na sidebar.</li>
+          <li>Faça o upload do PDF <b>RubricasItens não Configurados</b>.</li>
+          <li>Clique em <b>▶ Processar PDF</b>.</li>
+          <li>Baixe os dois arquivos TXT e o Excel de visualização.</li>
+          <li>Abra cada TXT no Excel e cole na aba correspondente do template.</li>
+        </ol>
+
+        <h4>⚠️ Observações</h4>
+        <ul>
+          <li>Os campos <b>Conta Débito, Conta Crédito, Histórico e Complemento</b>
+              ficam vazios — devem ser preenchidos manualmente no Domínio.</li>
+          <li>O <b>Código Sequencial</b> é gerado automaticamente (1, 2, 3...).</li>
+          <li>No <b>evento_exemplo</b>, Empresa e CC aparecem apenas na 1ª linha
+              de cada bloco (igual ao arquivo de exemplo).</li>
+          <li>No <b>integra_exemplo</b>, CC fica vazio (igual ao arquivo de exemplo).</li>
+        </ul>
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+st.markdown("---")
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SESSION STATE
+# ══════════════════════════════════════════════════════════════════════════════
+defaults = {
+    "df":            None,
+    "evento_bytes":  None,
+    "integra_bytes": None,
+    "excel_bytes":   None,
+    "processado":    False,
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  UPLOAD + BOTÕES
+# ══════════════════════════════════════════════════════════════════════════════
+uploaded = st.file_uploader(
+    "📁 Arquivo PDF — Relação de Rubricas/Itens Não Configurados",
+    type=["pdf"],
+    help="Relatório exportado do Domínio Sistemas.",
+)
+
+col_btn1, col_btn2 = st.columns([1, 1])
+with col_btn1:
+    gerar = st.button(
+        "▶ Processar PDF",
+        disabled=(uploaded is None),
+        use_container_width=True,
+        type="primary",
+    )
+with col_btn2:
+    limpar = st.button("🗑 Limpar", use_container_width=True)
+
+if limpar:
+    for k, v in defaults.items():
+        st.session_state[k] = v
+    st.rerun()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PROCESSAMENTO
+# ══════════════════════════════════════════════════════════════════════════════
+if gerar and uploaded is not None:
+    with st.spinner("🔄 Processando PDF e gerando arquivos..."):
+        df = parse_pdf(uploaded.read())
 
     if df.empty:
-        st.error("⚠️ Nenhum dado foi extraído. Verifique se o PDF está correto.")
+        st.error("⚠️ Nenhum dado extraído. Verifique se o PDF está correto.")
     else:
-        st.success(f"✅ {len(df)} registros extraídos com sucesso!")
+        st.session_state.df            = df
+        st.session_state.evento_bytes  = gerar_evento_txt(df, cod_empresa)
+        st.session_state.integra_bytes = gerar_integra_txt(df, cod_empresa)
+        st.session_state.excel_bytes   = to_excel(df)
+        st.session_state.processado    = True
+        st.rerun()
 
-        # ── Métricas resumo ────────────────────────────────────────────────
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total de Registros",      len(df))
-        col2.metric("Centros de Custo",         df["Cód Centro de Custo"].nunique())
-        col3.metric("Tipos de Integração",      df["Tipo da Integração"].nunique())
-        col4.metric("Eventos Únicos",           df["Cod Evento"].nunique())
+# ══════════════════════════════════════════════════════════════════════════════
+#  RESULTADO
+# ══════════════════════════════════════════════════════════════════════════════
+if st.session_state.processado and st.session_state.df is not None:
+    df = st.session_state.df
 
-        st.divider()
+    st.success(f"✅ **{len(df)} registros** extraídos com sucesso!")
 
-        # ── Filtros interativos ────────────────────────────────────────────
-        st.subheader("🔍 Filtros")
-        fcol1, fcol2, fcol3 = st.columns(3)
+    # ── Métricas ──────────────────────────────────────────────────────────────
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("📄 Total de Registros",  len(df))
+    m2.metric("🏢 Centros de Custo",     df["Cód Centro de Custo"].nunique())
+    m3.metric("🔢 Tipos de Integração",  df["Tipo da Integração"].nunique())
+    m4.metric("🎯 Eventos Únicos",       df["Cod Evento"].nunique())
 
-        with fcol1:
-            cc_options = ["Todos"] + sorted(
-                df["Cód Centro de Custo"].unique().tolist(), key=lambda x: int(x)
+    st.markdown("---")
+
+    # ── Downloads principais ──────────────────────────────────────────────────
+    st.markdown("### ⬇️ Downloads")
+
+    d1, d2, d3 = st.columns(3)
+
+    with d1:
+        st.markdown("**📄 evento_exemplo.txt**")
+        st.caption("Aba: evento | Tipos: 1, 2, 3, 4")
+        n_evento = len(df[df["Tipo da Integração"].isin([1, 2, 3, 4])])
+        st.download_button(
+            label=f"⬇ Baixar evento_exemplo.txt ({n_evento} linhas)",
+            data=st.session_state.evento_bytes,
+            file_name="evento_exemplo.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+    with d2:
+        st.markdown("**📄 integra_exemplo.txt**")
+        st.caption("Aba: Plan1 | Tipos: 1 a 6")
+        st.download_button(
+            label=f"⬇ Baixar integra_exemplo.txt ({len(df)} linhas)",
+            data=st.session_state.integra_bytes,
+            file_name="integra_exemplo.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
+
+    with d3:
+        st.markdown("**📊 Visualização Excel**")
+        st.caption("Todas as colunas extraídas")
+        st.download_button(
+            label="⬇ Baixar Excel de visualização",
+            data=st.session_state.excel_bytes,
+            file_name="rubricas_nao_configuradas.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    st.markdown("---")
+
+    # ── Prévia dos TXTs ───────────────────────────────────────────────────────
+    st.markdown("### 👁️ Prévia dos Arquivos Gerados")
+
+    tab1, tab2 = st.tabs(["📄 evento_exemplo.txt", "📄 integra_exemplo.txt"])
+
+    with tab1:
+        prev_ev = st.session_state.evento_bytes.decode("utf-8-sig")
+        linhas_ev = prev_ev.splitlines()
+        st.caption(f"Total: {len(linhas_ev)-1} registros + cabeçalho")
+        preview_ev = "\n".join(linhas_ev[:21])
+        st.code(preview_ev, language="text")
+        if len(linhas_ev) > 21:
+            st.caption(f"... e mais {len(linhas_ev)-21} linhas")
+
+    with tab2:
+        prev_in = st.session_state.integra_bytes.decode("utf-8-sig")
+        linhas_in = prev_in.splitlines()
+        st.caption(f"Total: {len(linhas_in)-1} registros + cabeçalho")
+        preview_in = "\n".join(linhas_in[:21])
+        st.code(preview_in, language="text")
+        if len(linhas_in) > 21:
+            st.caption(f"... e mais {len(linhas_in)-21} linhas")
+
+    st.markdown("---")
+
+    # ── Filtros + Tabela ──────────────────────────────────────────────────────
+    st.markdown("### 🔍 Filtros e Visualização")
+    f1, f2, f3 = st.columns(3)
+
+    with f1:
+        cc_opts = ["Todos"] + sorted(
+            df["Cód Centro de Custo"].unique().tolist(), key=int
+        )
+        cc_labels = {
+            c: f"{c} — {df[df['Cód Centro de Custo']==c]['Desc. Centro de Custo'].iloc[0]}"
+            for c in cc_opts if c != "Todos"
+        }
+        sel_cc = st.selectbox(
+            "Centro de Custo", cc_opts,
+            format_func=lambda x: cc_labels.get(x, x),
+        )
+
+    with f2:
+        tipo_opts = ["Todos"] + sorted(df["Tipo da Integração"].unique().tolist())
+        sel_tipo = st.selectbox(
+            "Tipo de Integração", tipo_opts,
+            format_func=lambda x: (
+                f"{TIPO_ICONE.get(x,'')} {x} — {TIPO_DESC[x]}"
+                if x != "Todos" else x
+            ),
+        )
+
+    with f3:
+        busca = st.text_input("🔎 Buscar evento (código ou descrição)")
+
+    dff = df.copy()
+    if sel_cc   != "Todos":
+        dff = dff[dff["Cód Centro de Custo"] == sel_cc]
+    if sel_tipo != "Todos":
+        dff = dff[dff["Tipo da Integração"] == sel_tipo]
+    if busca:
+        mask = (
+            dff["Cod Evento"].str.contains(busca, case=False, na=False)
+            | dff["Descrição Evento"].str.contains(busca, case=False, na=False)
+        )
+        dff = dff[mask]
+
+    st.dataframe(dff, use_container_width=True, height=420)
+    st.caption(f"Exibindo **{len(dff)}** de **{len(df)}** registros")
+
+    # ── Resumos ───────────────────────────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("📊 Resumo por Tipo de Integração"):
+        resumo = (
+            df.groupby(["Tipo da Integração", "Desc. Tipo Integração"])
+            .agg(
+                Registros         =("Cod Evento", "count"),
+                Centros_de_Custo  =("Cód Centro de Custo", "nunique"),
+                Eventos_Únicos    =("Cod Evento", "nunique"),
             )
-            sel_cc = st.selectbox("Centro de Custo", cc_options)
+            .reset_index()
+        )
+        st.dataframe(resumo, use_container_width=True, hide_index=True)
 
-        with fcol2:
-            tipo_options = ["Todos"] + sorted(df["Tipo da Integração"].unique().tolist())
-            sel_tipo = st.selectbox(
-                "Tipo de Integração",
-                tipo_options,
-                format_func=lambda x: f"{x} - {TIPO_DESC[x]}" if x != "Todos" else x,
+    with st.expander("📊 Resumo por Centro de Custo"):
+        resumo_cc = (
+            df.groupby(["Cód Centro de Custo", "Desc. Centro de Custo"])
+            .agg(
+                Registros        =("Cod Evento", "count"),
+                Tipos_Integração =("Tipo da Integração", "nunique"),
+                Eventos_Únicos   =("Cod Evento", "nunique"),
             )
+            .reset_index()
+        )
+        st.dataframe(resumo_cc, use_container_width=True, hide_index=True)
 
-        with fcol3:
-            search_ev = st.text_input("🔎 Buscar Evento (código ou descrição)")
-
-        # Aplica filtros
-        df_filtered = df.copy()
-        if sel_cc != "Todos":
-            df_filtered = df_filtered[df_filtered["Cód Centro de Custo"] == sel_cc]
-        if sel_tipo != "Todos":
-            df_filtered = df_filtered[df_filtered["Tipo da Integração"] == sel_tipo]
-        if search_ev:
-            mask = (
-                df_filtered["Cod Evento"].str.contains(search_ev, case=False, na=False)
-                | df_filtered["Descrição Evento"].str.contains(search_ev, case=False, na=False)
-            )
-            df_filtered = df_filtered[mask]
-
-        st.dataframe(df_filtered, use_container_width=True, height=450)
-        st.caption(f"Exibindo {len(df_filtered)} de {len(df)} registros")
-
-        st.divider()
-
-        # ── Download ───────────────────────────────────────────────────────
-        st.subheader("⬇️ Exportar")
-        excel_bytes = to_excel(df)  # exporta sempre o df completo
-
-        dcol1, dcol2 = st.columns([1, 3])
-        with dcol1:
-            st.download_button(
-                label="📥 Baixar Excel Completo",
-                data=excel_bytes,
-                file_name="rubricas_nao_configuradas.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-
-        # Download filtrado
-        if len(df_filtered) < len(df):
-            excel_filtered = to_excel(df_filtered)
-            with dcol2:
-                st.download_button(
-                    label=f"📥 Baixar Excel Filtrado ({len(df_filtered)} registros)",
-                    data=excel_filtered,
-                    file_name="rubricas_nao_configuradas_filtrado.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                )
 else:
-    st.info("👆 Faça o upload do PDF 'RubricasItens não Configurados.pdf' para começar.")
+    if not st.session_state.processado:
+        st.markdown(
+            """
+            <div class="instrucoes-box">
+            <h4>👆 Como começar</h4>
+            <p>Informe o <b>Código da Empresa</b> na sidebar, faça o upload do PDF
+            <b>Relação de Rubricas/Itens Não Configurados</b> e clique em
+            <b>▶ Processar PDF</b>.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    # ── Legenda de tipos ───────────────────────────────────────────────────
-    st.subheader("📋 Legenda — Tipos de Integração")
-    leg_data = [{"Código": k, "Descrição": v} for k, v in TIPO_DESC.items()]
-    st.table(pd.DataFrame(leg_data))
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown("#### 📄 Arquivo: evento_exemplo.txt")
+            st.table(pd.DataFrame({
+                "Coluna": [
+                    "Código da Empresa",
+                    "Centro de custo",
+                    "Código Sequencial da Integração",
+                    "Tipo da Integração",
+                    "Descrição",
+                    "Código da Conta Débito",
+                    "Código da Conta Crédito",
+                    "Código do Histórico",
+                    "Complemento",
+                ],
+                "Obs": [
+                    "1ª linha do bloco",
+                    "1ª linha do bloco",
+                    "Sequencial global",
+                    "1, 2, 3 ou 4",
+                    "Do PDF",
+                    "Vazio",
+                    "Vazio",
+                    "Vazio",
+                    "Vazio",
+                ]
+            }))
+
+        with col_r:
+            st.markdown("#### 📄 Arquivo: integra_exemplo.txt")
+            st.table(pd.DataFrame({
+                "Coluna": [
+                    "Código da Empresa",
+                    "Centro de Custo",
+                    "Código Sequencial da Integração",
+                    "Tipo da Integração",
+                    "Descrição",
+                    "Código da Conta Crédito",
+                    "Código da Conta Débito",
+                    "Código do Histórico",
+                ],
+                "Obs": [
+                    "Sempre preenchido",
+                    "Vazio (nan)",
+                    "Sequencial global",
+                    "1, 2, 3, 4, 5 ou 6",
+                    "Do PDF",
+                    "Vazio",
+                    "Vazio",
+                    "Vazio",
+                ]
+            }))
