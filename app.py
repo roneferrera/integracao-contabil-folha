@@ -1,8 +1,8 @@
 # ============================================================
-# app_integracao_dominio.py  –  Integração Contábil Domínio V2.0
+# app_integracao_dominio.py  –  Integração Contábil Domínio V2.1
 # Entradas:
 #   1. RubricasItens não Configurados.pdf  → eventos sem config contábil
-#   2. Rubricas.pdf                        → catálogo de tipos de rubrica
+#   2. rubricas.txt                        → catálogo de tipos de rubrica
 #   3. evento exemplo.xlsx                 → contas contábeis já configuradas
 # Saída:
 #   arquivo TXT no formato Domínio Separador
@@ -14,7 +14,7 @@ import pandas as pd
 import re
 from io import BytesIO
 
-VERSAO = "V2.0"
+VERSAO = "V2.1"
 
 # ==============================
 # TEMA TR
@@ -55,25 +55,84 @@ def apply_tr_theme():
 
 
 # ==============================
-# LINHAS A IGNORAR NO PDF DE RUBRICAS
+# PARSE DO TXT DE RUBRICAS (novo)
 # ==============================
-IGNORE_PATTERNS_RUBRICAS = [
-    r"^EMPRESA PADR",
-    r"^RUBRICAS",
-    r"^Emiss",
-    r"^Hora:",
-    r"^Pág",
-    r"^Cód\.",
-    r"^\s*$",
-    r"^[A-Z]\.\s",       # letras de acumuladores ex: "A. I.R.R.F"
-    r"^Soma na base",
-]
+def parse_rubricas_txt(file_bytes: bytes, log: list) -> dict:
+    """
+    Lê o rubricas.txt (TSV exportado do Domínio) e retorna:
+        { cod_evento (str): tipo_norm (str) }
 
-def should_ignore_rubricas(line: str) -> bool:
-    for pat in IGNORE_PATTERNS_RUBRICAS:
-        if re.search(pat, line, re.IGNORECASE):
-            return True
-    return False
+    Estrutura das colunas (separadas por TAB):
+        [0]  cod_empresa_padrao   (ex: 9995)
+        [1]  cod_empresa          (ex: 45)
+        [2]  cod_evento           (ex: 1)
+        [3]  descricao            (ex: HORAS NORMAIS)
+        [4]  tipo_rubrica         P=Provento | D=Desconto | I=Informativa | ID=Inf.Dedutora
+        ...  demais campos ignorados
+
+    Mapeamento tipo_rubrica → tipo_norm:
+        P   → Provento
+        D   → Desconto
+        I   → Informativa
+        ID  → Inf. dedutora
+    """
+    catalog = {}
+    TIPO_MAP = {
+        "P":  "Provento",
+        "D":  "Desconto",
+        "I":  "Informativa",
+        "ID": "Inf. dedutora",
+    }
+
+    try:
+        texto = file_bytes.decode("latin-1", errors="replace")
+    except Exception as e:
+        log.append(f"ERRO ao decodificar rubricas.txt: {e}")
+        return catalog
+
+    linhas_lidas    = 0
+    linhas_validas  = 0
+    tipos_ignorados = set()
+
+    for raw in texto.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        linhas_lidas += 1
+        partes = raw.split("\t")
+
+        # Precisa de pelo menos 5 colunas: [0..4]
+        if len(partes) < 5:
+            continue
+
+        cod   = partes[2].strip()
+        tipo  = partes[4].strip().upper()
+
+        if not cod:
+            continue
+
+        tipo_norm = TIPO_MAP.get(tipo)
+        if tipo_norm is None:
+            tipos_ignorados.add(tipo)
+            continue
+
+        # Primeira ocorrência de cada código = mais confiável
+        if cod not in catalog:
+            catalog[cod] = tipo_norm
+            linhas_validas += 1
+
+    log.append(
+        f"rubricas.txt: {linhas_lidas} linha(s) lida(s) | "
+        f"{linhas_validas} código(s) único(s) mapeado(s)."
+    )
+    if tipos_ignorados:
+        log.append(
+            f"  ↳ Tipos não mapeados encontrados (ignorados): "
+            f"{', '.join(sorted(tipos_ignorados))}"
+        )
+
+    return catalog
 
 
 # ==============================
@@ -103,68 +162,16 @@ def should_ignore_nao_config(line: str) -> bool:
 
 
 # ==============================
-# PARSE DO PDF DE RUBRICAS (catálogo de tipos)
-# ==============================
-def parse_rubricas_pdf(file_bytes: bytes, log: list) -> dict:
-    """
-    Lê o Rubricas.pdf e retorna dict {cod (str): tipo_norm (str)}
-    Captura tipos colados ou separados na linha.
-    """
-    catalog = {}
-
-    RE_LINHA = re.compile(
-        r"^\s*(\d+)\s+"
-        r"(.+?)"
-        r"\s*(Provento|Desconto|Inf\.\s*ded(?:utora)?|Informativa)"
-        r"[\s\w]",
-        re.IGNORECASE,
-    )
-
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                continue
-            for raw in text.splitlines():
-                line = raw.strip()
-                if not line or should_ignore_rubricas(line):
-                    continue
-                m = RE_LINHA.match(line)
-                if m:
-                    cod      = m.group(1).strip()
-                    tipo_raw = m.group(3).strip().lower()
-                    if "provento"   in tipo_raw: tipo_norm = "Provento"
-                    elif "desconto" in tipo_raw: tipo_norm = "Desconto"
-                    elif "inf. ded" in tipo_raw or "inf.ded" in tipo_raw:
-                        tipo_norm = "Inf. dedutora"
-                    elif "informat" in tipo_raw: tipo_norm = "Informativa"
-                    else: tipo_norm = m.group(3).strip()
-                    if cod not in catalog:
-                        catalog[cod] = tipo_norm
-
-    log.append(f"Rubricas.pdf: {len(catalog)} tipo(s) identificado(s) no catálogo.")
-    return catalog
-
-
-# ==============================
 # PARSE DO PDF DE ITENS NÃO CONFIGURADOS
 # ==============================
 def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
     """
     Lê o PDF 'Rubricas/Itens não Configurados' e retorna lista de dicts:
     [{ 'cod': str, 'descricao': str, 'tipo_folha': str, 'centro_custo': str }, ...]
-
-    Estrutura do PDF:
-      Folha Normal / Férias / Rescisão / Provisão de Férias / Provisão de 13º / Empresa
-      Centro de Custo: N NOME
-        Código  Descrição
-        208     REEMBOLSO DE QUILOMETRAGEM
-        ...
     """
     eventos = []
-    vistos  = set()   # (cod, tipo_folha, centro_custo) para evitar duplicatas
+    vistos  = set()
 
-    # Mapeamento de seção para tipo_integ
     SECAO_TIPO = {
         "Folha Normal":       "1",
         "Empresa":            "2",
@@ -175,20 +182,15 @@ def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
         "Provisão de 13o":    "6",
     }
 
-    # Regex para linha de evento: código numérico + descrição
     RE_EVENTO = re.compile(r"^\s*(\d+)\s+(.+)$")
-
-    # Regex para linha de seção
-    RE_SECAO = re.compile(
+    RE_SECAO  = re.compile(
         r"^(Folha Normal|Empresa|Férias|Rescisão|"
         r"Provisão de Férias|Provisão de 13º|Provisão de 13o)$",
         re.IGNORECASE,
     )
-
-    # Regex para Centro de Custo
     RE_CC = re.compile(r"^Centro de Custo:\s*(\d+)\s+(.+)$", re.IGNORECASE)
 
-    tipo_folha_atual  = "1"
+    tipo_folha_atual   = "1"
     centro_custo_atual = ""
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
@@ -201,35 +203,28 @@ def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
                 if not line:
                     continue
 
-                # Detecta seção (tipo de folha)
                 m_sec = RE_SECAO.match(line)
                 if m_sec:
                     sec = m_sec.group(1).strip()
-                    # Normaliza
                     for k, v in SECAO_TIPO.items():
                         if k.lower() in sec.lower():
                             tipo_folha_atual = v
                             break
                     continue
 
-                # Detecta Centro de Custo
                 m_cc = RE_CC.match(line)
                 if m_cc:
                     centro_custo_atual = m_cc.group(1).strip()
                     continue
 
-                # Ignora cabeçalhos e rodapés
                 if should_ignore_nao_config(line):
                     continue
 
-                # Tenta capturar linha de evento
                 m_ev = RE_EVENTO.match(line)
                 if m_ev:
                     cod  = m_ev.group(1).strip()
                     desc = m_ev.group(2).strip()
 
-                    # Filtra falsos positivos (ex: "1/2 FERIAS" começa com dígito)
-                    # Código válido: puramente numérico
                     if not cod.isdigit():
                         continue
 
@@ -272,7 +267,7 @@ def ler_excel_contas(file_bytes: bytes, log: list) -> dict:
             break
 
     if not sheet:
-        log.append(f"AVISO: Aba 'evento' não encontrada no Excel. Abas: {xls.sheet_names}")
+        log.append(f"AVISO: Aba 'evento' não encontrada. Abas: {xls.sheet_names}")
         return contas
 
     try:
@@ -284,7 +279,6 @@ def ler_excel_contas(file_bytes: bytes, log: list) -> dict:
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how="all")
 
-    # Mapeia nomes de colunas
     col_map = {}
     for col in df.columns:
         cl = col.lower()
@@ -309,7 +303,6 @@ def ler_excel_contas(file_bytes: bytes, log: list) -> dict:
         hist = str(row.get(col_map.get("historico", ""), "") or "").strip()
         comp = str(row.get(col_map.get("complemento", ""), "") or "").strip()
 
-        # Limpa "nan"
         deb  = "" if deb.lower()  == "nan" else deb
         cred = "" if cred.lower() == "nan" else cred
         hist = "" if hist.lower() == "nan" else hist
@@ -356,22 +349,21 @@ def gerar_txt_dominio(
         tipo_integ   = ev["tipo_folha"]
         centro_custo = ev["centro_custo"]
 
-        # Busca tipo no catálogo
+        # Busca tipo no catálogo (rubricas.txt)
         tipo_rubrica = catalog_tipos.get(cod, "")
 
-        # Busca contas no Excel
+        # Busca contas no Excel — tenta chave exata (cod, tipo) ou só cod
         conta_info = contas_excel.get((cod, tipo_integ), {})
-        # Tenta também sem o tipo (chave só pelo código)
         if not conta_info:
             for k, v in contas_excel.items():
                 if k[0] == cod:
                     conta_info = v
                     break
 
-        conta_deb  = conta_info.get("conta_debito",  "")
-        conta_cred = conta_info.get("conta_credito", "")
-        historico  = conta_info.get("historico",     "")
-        complemento = conta_info.get("complemento",  "")
+        conta_deb   = conta_info.get("conta_debito",  "")
+        conta_cred  = conta_info.get("conta_credito", "")
+        historico   = conta_info.get("historico",     "")
+        complemento = conta_info.get("complemento",   "")
 
         # Status
         if not tipo_rubrica:
@@ -468,8 +460,11 @@ def main():
             <ol>
                 <li><b>Rubricas/Itens não Configurados.pdf</b>: relatório gerado no Domínio
                     em <i>Plano e Acumuladores → Rubricas/Itens não Configurados</i>.</li>
-                <li><b>Rubricas.pdf</b>: relatório gerado no Domínio em
-                    <i>Plano e Acumuladores → Rubricas</i> (catálogo completo com tipos).</li>
+                <li><b>rubricas.txt</b>: arquivo exportado do Domínio em
+                    <i>Plano e Acumuladores → Rubricas</i> (formato TSV com todos os campos).
+                    A coluna 5 (índice 4) contém o tipo:
+                    <code>P</code>=Provento, <code>D</code>=Desconto,
+                    <code>I</code>=Informativa, <code>ID</code>=Inf. dedutora.</li>
                 <li><b>Excel de Contas (.xlsx)</b>: planilha com as contas contábeis
                     já configuradas (aba <code>evento</code>).</li>
             </ol>
@@ -478,7 +473,7 @@ def main():
             <ul>
                 <li>Lê todos os eventos sem configuração contábil do PDF 1.</li>
                 <li>Busca o <b>tipo de rubrica</b> (Provento/Desconto/Informativa/Inf. dedutora)
-                    de cada evento no PDF 2.</li>
+                    de cada evento no TXT 2 — leitura direta do campo, sem regex.</li>
                 <li>Busca as <b>contas contábeis</b> (débito/crédito/histórico) no Excel.</li>
                 <li>Gera o <b>arquivo TXT</b> no formato Domínio Separador.</li>
             </ul>
@@ -514,10 +509,10 @@ def main():
             help="Relatório 'Rubricas/Itens não Configurados' do Domínio.",
         )
     with col2:
-        pdf_rubricas = st.file_uploader(
-            "2️⃣ PDF — Rubricas (catálogo)",
-            type=["pdf"],
-            help="Relatório 'Rubricas' completo do Domínio (com tipos).",
+        txt_rubricas = st.file_uploader(
+            "2️⃣ TXT — Rubricas (catálogo)",
+            type=["txt"],
+            help="Arquivo rubricas.txt exportado do Domínio (TSV com tipo na coluna 5).",
         )
     with col3:
         excel_contas = st.file_uploader(
@@ -526,7 +521,7 @@ def main():
             help="Planilha com contas débito/crédito já configuradas (aba 'evento').",
         )
 
-    arquivos_ok = pdf_nao_config is not None and pdf_rubricas is not None
+    arquivos_ok = pdf_nao_config is not None and txt_rubricas is not None
 
     col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
@@ -549,11 +544,11 @@ def main():
     if gerar and arquivos_ok:
         log = ["Iniciando processamento..."]
 
-        # 1. Catálogo de tipos (Rubricas.pdf)
-        with st.spinner("Lendo Rubricas.pdf (catálogo de tipos)..."):
-            catalog_tipos = parse_rubricas_pdf(pdf_rubricas.read(), log)
+        # 1. Catálogo de tipos (rubricas.txt)
+        with st.spinner("Lendo rubricas.txt (catálogo de tipos)..."):
+            catalog_tipos = parse_rubricas_txt(txt_rubricas.read(), log)
 
-        # 2. Eventos não configurados
+        # 2. Eventos não configurados (PDF)
         with st.spinner("Lendo PDF de Itens Não Configurados..."):
             eventos = parse_nao_configurados_pdf(pdf_nao_config.read(), log)
 
@@ -602,7 +597,6 @@ def main():
             m3.metric("⚠️ Sem tipo",       sem_tipo)
             m4.metric("ℹ️ Sem conta",      sem_conta)
 
-            # Tabela com highlight
             def highlight_row(row):
                 s = str(row.get("Status", ""))
                 if s.startswith("✅"):  return ["background-color:#d4edda"] * len(row)
@@ -615,19 +609,17 @@ def main():
                 use_container_width=True,
             )
 
-            # Expander: sem tipo no catálogo
             sem_tipo_df = df[df["Status"].str.startswith("⚠️")]
             if not sem_tipo_df.empty:
                 with st.expander(
                     f"⚠️ Eventos sem tipo no catálogo ({len(sem_tipo_df)}) "
-                    f"— verificar Rubricas.pdf"
+                    f"— código não encontrado no rubricas.txt"
                 ):
                     st.dataframe(
                         sem_tipo_df[["Código", "Descrição", "Tipo Integração", "Centro Custo"]],
                         use_container_width=True,
                     )
 
-            # Expander: sem conta
             sem_conta_df = df[df["Status"].str.startswith("ℹ️")]
             if not sem_conta_df.empty:
                 with st.expander(
@@ -640,7 +632,6 @@ def main():
                         use_container_width=True,
                     )
 
-            # Prévia do arquivo
             with st.expander("👁️ Prévia do arquivo gerado (primeiras 30 linhas)"):
                 preview = "".join(
                     st.session_state.txt_gerado
