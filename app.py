@@ -14,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-VERSAO = "V4.0"
+VERSAO = "V5.0"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TEMA THOMSON REUTERS
@@ -60,6 +60,10 @@ def apply_tr_theme():
         .step-title {
             color: #FF8000; font-weight: bold; font-size: 15px; margin-bottom: 6px;
         }
+        .alert-box {
+            background: #FFF3CD; border: 1px solid #FF8000;
+            border-radius: 6px; padding: 12px 16px; margin: 8px 0; color: #444;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -69,200 +73,158 @@ apply_tr_theme()
 #  MAPEAMENTOS
 # ══════════════════════════════════════════════════════════════════════════════
 TIPO_DESC = {
-    1: "Folha mensal",
-    2: "Empresa",
-    3: "Férias",
-    4: "Rescisão",
-    5: "Prov. Férias",
-    6: "Prov. 13",
+    1: "Folha mensal", 2: "Empresa", 3: "Férias",
+    4: "Rescisão", 5: "Prov. Férias", 6: "Prov. 13",
 }
 TIPO_ICONE = {1: "📋", 2: "🏢", 3: "🏖️", 4: "📤", 5: "📅", 6: "🎄"}
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  VALIDAÇÃO DO PDF
+# ══════════════════════════════════════════════════════════════════════════════
+def detectar_tipo_pdf(file_bytes: bytes) -> str:
+    try:
+        with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+            if not pdf.pages:
+                return "desconhecido"
+            text = (pdf.pages[0].extract_text() or "").upper()
+            if "RELAÇÃO DE RUBRICAS" in text or "RELACAO DE RUBRICAS" in text:
+                if "NÃO CONFIGURADOS" in text or "NAO CONFIGURADOS" in text:
+                    return "rubricas_nao_config"
+            if "PLANO E ACUMULADORES" in text:
+                return "cadastro_eventos"
+    except Exception:
+        pass
+    return "desconhecido"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARSER — PDF RUBRICAS NÃO CONFIGURADAS
-#  Estrutura real do PDF:
-#  - Cabeçalho: "RELAÇÃO DE RUBRICAS/ITENS NÃO CONFIGURADOS"
-#  - "Empresa: 45 - ENTERPRISE SOFTWARE SOLUTIONS BRASIL LTD"
-#  - Seção tipo: "Folha Normal" | "Empresa" | "Férias" | "Rescisão" |
-#                "Provisão de Férias" | "Provisão de 13º"
-#  - "Centro de Custo: 1 ADMINISTRAÇÃO"
-#  - Cabeçalho colunas: "Código  Descrição"
-#  - Linhas de evento: "19  DIFERENCA DE SALARIOS"
 # ══════════════════════════════════════════════════════════════════════════════
-
-# Regex para detectar o tipo de integração (seção)
-# Ordem importa: testar os mais específicos primeiro
 RE_TIPO_SECAO = [
-    (re.compile(r"^Provisão\s+de\s+Férias\s*$",    re.IGNORECASE), 5),
-    (re.compile(r"^Provisao\s+de\s+Ferias\s*$",    re.IGNORECASE), 5),
-    (re.compile(r"^Provisão\s+de\s+13",             re.IGNORECASE), 6),
-    (re.compile(r"^Provisao\s+de\s+13",             re.IGNORECASE), 6),
-    (re.compile(r"^Folha\s+Normal\s*$",             re.IGNORECASE), 1),
-    (re.compile(r"^Férias\s*$",                     re.IGNORECASE), 3),
-    (re.compile(r"^Ferias\s*$",                     re.IGNORECASE), 3),
-    (re.compile(r"^Rescisão\s*$",                   re.IGNORECASE), 4),
-    (re.compile(r"^Rescisao\s*$",                   re.IGNORECASE), 4),
-    (re.compile(r"^Empresa\s*$",                    re.IGNORECASE), 2),
+    (re.compile(r"^Provisão\s+de\s+Férias\s*$",  re.IGNORECASE), 5),
+    (re.compile(r"^Provisao\s+de\s+Ferias\s*$",  re.IGNORECASE), 5),
+    (re.compile(r"^Provisão\s+de\s+13",           re.IGNORECASE), 6),
+    (re.compile(r"^Provisao\s+de\s+13",           re.IGNORECASE), 6),
+    (re.compile(r"^Folha\s+Normal\s*$",           re.IGNORECASE), 1),
+    (re.compile(r"^Férias\s*$",                   re.IGNORECASE), 3),
+    (re.compile(r"^Ferias\s*$",                   re.IGNORECASE), 3),
+    (re.compile(r"^Rescisão\s*$",                 re.IGNORECASE), 4),
+    (re.compile(r"^Rescisao\s*$",                 re.IGNORECASE), 4),
+    (re.compile(r"^Empresa\s*$",                  re.IGNORECASE), 2),
 ]
-
-# Regex para Centro de Custo: "Centro de Custo: 1 ADMINISTRAÇÃO"
-RE_CC = re.compile(r"^Centro\s+de\s+Custo\s*:\s*(\d+)\s+(.+)$", re.IGNORECASE)
-
-# Regex para evento: "19  DIFERENCA DE SALARIOS"
-# Código numérico (pode ser 1-5 dígitos) seguido de espaço(s) e descrição
-RE_EVENTO = re.compile(r"^\s*(\d+)\s{1,}(.+)$")
-
-# Linhas a ignorar completamente
-IGNORE_EXACT = {
-    "código descrição",
-    "codigo descricao",
-    "código  descrição",
-}
+RE_CC    = re.compile(r"^Centro\s+de\s+Custo\s*:\s*(\d+)\s+(.+)$", re.IGNORECASE)
+RE_EVENT = re.compile(r"^\s*(\d+)\s{1,}(.+)$")
 
 def should_ignore_rubrica(line: str) -> bool:
-    """Retorna True se a linha deve ser ignorada."""
     s = line.strip()
     sl = s.lower()
-
-    # Linhas vazias
-    if not s:
-        return True
-
-    # Cabeçalho do relatório
-    if "relação de rubricas" in sl or "relacao de rubricas" in sl:
-        return True
-
-    # Linha de empresa (começa com "Empresa:" seguido de número/texto)
-    # MAS não confundir com a seção "Empresa" (que é só "Empresa" sozinho)
-    if re.match(r"^Empresa\s*:\s*\d+", s, re.IGNORECASE):
-        return True
-
-    # Paginação
-    if re.match(r"^Página\s*:", s, re.IGNORECASE):
-        return True
-    if re.match(r"^Emissão\s*:", s, re.IGNORECASE):
-        return True
-    if re.match(r"^Hora\s*:", s, re.IGNORECASE):
-        return True
-
-    # Cabeçalho de colunas
-    if sl in IGNORE_EXACT:
-        return True
-    if re.match(r"^[Cc]ód(?:igo)?\s+[Dd]escrição", s):
-        return True
-
+    if not s: return True
+    if "relação de rubricas" in sl or "relacao de rubricas" in sl: return True
+    if re.match(r"^Empresa\s*:\s*\d+", s, re.IGNORECASE): return True
+    if re.match(r"^Página\s*:",  s, re.IGNORECASE): return True
+    if re.match(r"^Emissão\s*:", s, re.IGNORECASE): return True
+    if re.match(r"^Hora\s*:",    s, re.IGNORECASE): return True
+    if re.match(r"^[Cc]ód(?:igo)?\s+[Dd]escrição", s): return True
+    if sl in {"código descrição", "codigo descricao",
+              "código  descrição", "codigo  descricao"}: return True
     return False
 
-
 def detect_tipo(line: str) -> int | None:
-    """Detecta se a linha é um marcador de tipo de integração. Retorna código ou None."""
     s = line.strip()
     for pattern, code in RE_TIPO_SECAO:
         if pattern.match(s):
             return code
     return None
 
-
 def parse_rubricas_pdf(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Extrai todos os eventos do PDF de Rubricas/Itens Não Configurados.
-    Retorna DataFrame com colunas:
-      Cód Centro de Custo | Desc. Centro de Custo | Tipo da Integração |
-      Desc. Tipo Integração | Cod Evento | Descrição Evento
-    """
     rows = []
-    current_tipo    = None   # int 1-6
-    current_cc_cod  = None   # str
-    current_cc_desc = None   # str
-
+    current_tipo = current_cc_cod = current_cc_desc = None
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
             if not text:
                 continue
-
             for raw in text.splitlines():
                 line = raw.strip()
-
-                # ── Ignora linhas de cabeçalho/rodapé ──────────────────────
                 if should_ignore_rubrica(line):
                     continue
-
-                # ── Detecta tipo de integração (seção) ─────────────────────
                 tipo = detect_tipo(line)
                 if tipo is not None:
                     current_tipo = tipo
-                    # Ao mudar de tipo, NÃO reseta o CC
                     continue
-
-                # ── Detecta Centro de Custo ─────────────────────────────────
                 m_cc = RE_CC.match(line)
                 if m_cc:
                     current_cc_cod  = m_cc.group(1).strip()
                     current_cc_desc = m_cc.group(2).strip()
                     continue
-
-                # ── Detecta Evento ──────────────────────────────────────────
                 if current_tipo is not None and current_cc_cod is not None:
-                    m_ev = RE_EVENTO.match(line)
+                    m_ev = RE_EVENT.match(line)
                     if m_ev:
-                        cod_ev  = m_ev.group(1).strip()
-                        desc_ev = m_ev.group(2).strip()
                         rows.append({
                             "Cód Centro de Custo":   current_cc_cod,
                             "Desc. Centro de Custo": current_cc_desc,
                             "Tipo da Integração":    current_tipo,
                             "Desc. Tipo Integração": TIPO_DESC[current_tipo],
-                            "Cod Evento":            cod_ev,
-                            "Descrição Evento":      desc_ev,
+                            "Cod Evento":            m_ev.group(1).strip(),
+                            "Descrição Evento":      m_ev.group(2).strip(),
                         })
-
     return pd.DataFrame(rows)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PARSER — PDF CADASTRO DE EVENTOS (Rubricas.pdf — Plano e Acumuladores)
 #
-#  Estrutura real (31 páginas):
-#  Colunas: Cód. | Descrição | Tipo | Base | Unidade | Taxa | A B C ...
-#  Exemplo: "1 HORAS NORMAIS Provento Nenhuma Horas 0,00 1 1 1 1 ..."
-#           "235 DESC.ADIANT.SALARIAL IRRFInf. ded Formula Automático 0,00 ..."
-#           "40 HORAS FALTAS Desconto Salário Contratual Horas 0,00 ..."
+#  Estrutura real do PDF (31 páginas):
+#  Cada linha contém: CÓDIGO  DESCRIÇÃO(pode ser truncada)  TIPO  Base  Unidade...
 #
-#  O campo "Tipo" pode ser: Provento | Desconto | Informativa | Inf. ded(utora)
-#  O PDF trunca os nomes longos na coluna Descrição, mas o Tipo está sempre
-#  presente como uma das 4 palavras acima.
+#  O TIPO aparece na mesma linha, após a descrição (que pode ser truncada pelo PDF).
+#  Valores possíveis: "Provento" | "Desconto" | "Informativa" | "Inf. ded"
+#
+#  Exemplos reais:
+#  "1 HORAS NORMAIS Provento Nenhuma Horas 0,00 ..."
+#  "40 HORAS FALTAS Desconto Salário Contratual Horas 0,00 ..."
+#  "235 DESC.ADIANT.SALARIAL IRRFInf. ded Formula Automático 0,00 ..."
+#  "243 CONVENIO MEDICO - INFORMATIVO Inf. dedutora Nenhuma Valor 0,00 ..."
+#  "23 F.G.T.S DE RESCISAO InformativaNenhuma Valor 8,00 ..."
+#  "813 FGTS FERIAS InformativaNenhuma Valor 8,00 ..."
+#
+#  Regex: captura código (numérico) + tudo até encontrar o tipo
 # ══════════════════════════════════════════════════════════════════════════════
 
-# Regex para capturar: CÓDIGO  DESCRIÇÃO(truncada)  TIPO  ...resto
-# O tipo aparece como: Provento | Desconto | Informativa | Inf. ded
-RE_CAD_LINE = re.compile(
-    r"^\s*(\d+)\s+"           # código numérico
-    r"(.+?)\s+"               # descrição (pode ser truncada)
-    r"(Provento|Desconto|Informativa|Inf\.\s*ded\w*)"  # tipo
-    r"\s+",                   # espaço após o tipo
+# Regex principal: código + descrição (lazy) + tipo
+# O tipo pode estar colado na descrição (sem espaço) como "InformativaNenhuma"
+RE_CAD_EVENTO = re.compile(
+    r"^\s*(\d+)\s+"                                      # código
+    r"(.+?)\s*"                                          # descrição (lazy, pode ser truncada)
+    r"(Provento|Desconto|Informativa|Inf\.\s*ded\w*)"    # tipo
+    r"[\s\w]",                                           # seguido de espaço ou letra (Base/Unidade)
     re.IGNORECASE,
 )
 
 IGNORE_CAD_PATTERNS = [
-    re.compile(r"^EMPRESA PADRÃO",       re.IGNORECASE),
-    re.compile(r"^Página\s*:",           re.IGNORECASE),
-    re.compile(r"^Emissão\s*:",          re.IGNORECASE),
-    re.compile(r"^Hora\s*:",             re.IGNORECASE),
-    re.compile(r"^RUBRICAS\s*$",         re.IGNORECASE),
-    re.compile(r"^Cód\.\s+Descrição",    re.IGNORECASE),
-    re.compile(r"^Soma na base",         re.IGNORECASE),
-    re.compile(r"^[A-Z]\.\s+[A-Z]",     re.IGNORECASE),  # "A. I.R.R.F."
+    re.compile(r"^EMPRESA PADRÃO",    re.IGNORECASE),
+    re.compile(r"^Página\s*:",        re.IGNORECASE),
+    re.compile(r"^Emissão\s*:",       re.IGNORECASE),
+    re.compile(r"^Hora\s*:",          re.IGNORECASE),
+    re.compile(r"^RUBRICAS\s*$",      re.IGNORECASE),
+    re.compile(r"^Cód\.\s+Descrição", re.IGNORECASE),
+    re.compile(r"^Soma na base",      re.IGNORECASE),
+    re.compile(r"^[A-Z]\.\s+[A-Z]",  re.IGNORECASE),
 ]
 
 def should_ignore_cad(line: str) -> bool:
     return any(p.match(line.strip()) for p in IGNORE_CAD_PATTERNS)
 
+def normalizar_tipo_rubrica(tipo_raw: str) -> str:
+    t = tipo_raw.strip().lower()
+    if "provento"   in t: return "Provento"
+    if "desconto"   in t: return "Desconto"
+    if "inf. ded"   in t or "inf.ded" in t: return "Inf. dedutora"
+    if "informat"   in t: return "Informativa"
+    return tipo_raw.strip()
+
 def parse_cadastro_eventos_pdf(file_bytes: bytes) -> dict:
     """
     Retorna dict {cod_evento (str): tipo_rubrica (str)}
-    Tipos normalizados: 'Provento' | 'Desconto' | 'Informativa' | 'Inf. dedutora'
+    Identifica o tipo pelo CÓDIGO do evento, lendo a mesma linha.
     """
     catalog = {}
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
@@ -274,22 +236,18 @@ def parse_cadastro_eventos_pdf(file_bytes: bytes) -> dict:
                 line = raw.strip()
                 if not line or should_ignore_cad(line):
                     continue
-                m = RE_CAD_LINE.match(line)
+                m = RE_CAD_EVENTO.match(line)
                 if m:
-                    cod  = m.group(1).strip()
-                    tipo = m.group(3).strip().lower()
-                    if "provento"    in tipo: tipo_norm = "Provento"
-                    elif "desconto"  in tipo: tipo_norm = "Desconto"
-                    elif "inf. ded"  in tipo or "inf.ded" in tipo:
-                        tipo_norm = "Inf. dedutora"
-                    elif "informat"  in tipo: tipo_norm = "Informativa"
-                    else:                     tipo_norm = m.group(3).strip()
-                    catalog[cod] = tipo_norm
+                    cod       = m.group(1).strip()
+                    tipo_raw  = m.group(3).strip()
+                    tipo_norm = normalizar_tipo_rubrica(tipo_raw)
+                    # Só registra se ainda não visto (primeira ocorrência = mais confiável)
+                    if cod not in catalog:
+                        catalog[cod] = tipo_norm
     return catalog
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-#  COLORAÇÃO DE TIPO RUBRICA (compatível com pandas antigo e novo)
+#  COLORAÇÃO DE TIPO RUBRICA
 # ══════════════════════════════════════════════════════════════════════════════
 def color_tipo_rubrica(val):
     cores = {
@@ -300,7 +258,6 @@ def color_tipo_rubrica(val):
         "—":             "background-color:#f0f0f0; color:#888888",
     }
     return cores.get(val, "")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GERAÇÃO DO EXCEL INTERMEDIÁRIO
@@ -392,18 +349,15 @@ def gerar_excel_intermediario(df: pd.DataFrame) -> bytes:
 
     return output.getvalue()
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  GERAÇÃO DOS TXTs FINAIS
 # ══════════════════════════════════════════════════════════════════════════════
 def _nan_to_str(val) -> str:
-    if val is None:
-        return ""
+    if val is None: return ""
     s = str(val).strip()
     return "" if s.lower() in ("nan", "none") else s
 
 def gerar_evento_txt(df: pd.DataFrame, cod_empresa: str) -> bytes:
-    """Aba 'evento' — Tipos 1, 2, 3, 4"""
     HEADER = "\t".join([
         "Código da Empresa", "Centro de custo",
         "Código Sequencial da Integração",
@@ -433,7 +387,6 @@ def gerar_evento_txt(df: pd.DataFrame, cod_empresa: str) -> bytes:
     return "\n".join(linhas).encode("utf-8-sig")
 
 def gerar_integra_txt(df: pd.DataFrame, cod_empresa: str) -> bytes:
-    """Aba 'Plan1' — Todos os tipos 1-6"""
     HEADER = "\t".join([
         "Código da Empresa", "Centro de Custo",
         "Código Sequencial da Integração",
@@ -454,7 +407,6 @@ def gerar_integra_txt(df: pd.DataFrame, cod_empresa: str) -> bytes:
         ]))
     return "\n".join(linhas).encode("utf-8-sig")
 
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  HEADER PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════════════
@@ -466,8 +418,8 @@ st.markdown(
             📊 Rubricas Não Configuradas → Excel + TXT &nbsp;|&nbsp; {VERSAO}
         </h2>
         <p style="color:#DDDDDD; margin:6px 0 0 0; font-family:'Segoe UI',Arial,sans-serif;">
-            <strong>① Gerar Excel intermediário</strong> →
-            preencher contabilização →
+            <strong>① Gerar Excel intermediário</strong> (Tipo da Rubrica identificado pelo código do evento)
+            → preencher contabilização →
             <strong>② Gerar TXTs finais</strong>
         </p>
     </div>
@@ -480,10 +432,8 @@ st.markdown(
 # ══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown("### ⚙️ Configurações")
-    cod_empresa = st.text_input(
-        "Código da Empresa", value="1",
-        help="Preenchido nos arquivos TXT gerados.",
-    )
+    cod_empresa = st.text_input("Código da Empresa", value="1",
+                                help="Preenchido nos arquivos TXT gerados.")
     st.markdown("---")
     st.markdown("### 📋 Tipos de Integração")
     for cod, desc in TIPO_DESC.items():
@@ -508,32 +458,51 @@ with st.sidebar:
 with st.expander("📖 **Instruções de Uso** — clique para expandir", expanded=False):
     st.markdown("""
         <div class="instrucoes-box">
+
+        <h4>🔹 Como funciona a identificação do Tipo de Rubrica</h4>
+        <p>O sistema lê o <b>código do evento</b> do PDF de Rubricas Não Configuradas
+        e busca esse mesmo código no PDF de Cadastro (Plano e Acumuladores) para
+        identificar se é <b>Provento, Desconto, Informativa ou Inf. dedutora</b>.</p>
+
+        <h4>🔹 Qual PDF usar em cada campo</h4>
+        <table style="width:100%; border-collapse:collapse;">
+          <tr style="background:#FF8000; color:white;">
+            <th style="padding:6px;">Campo</th>
+            <th style="padding:6px;">PDF correto</th>
+          </tr>
+          <tr style="background:#FFF0E0;">
+            <td style="padding:6px;"><b>PDF 1</b></td>
+            <td style="padding:6px;"><b>RubricasItens não Configurados.pdf</b><br>
+            Título: <i>RELAÇÃO DE RUBRICAS/ITENS NÃO CONFIGURADOS</i></td>
+          </tr>
+          <tr>
+            <td style="padding:6px;"><b>PDF 2</b></td>
+            <td style="padding:6px;"><b>Rubricas.pdf</b><br>
+            Título: <i>EMPRESA PADRÃO - PLANO E ACUMULADORES</i></td>
+          </tr>
+        </table>
+
         <h4>🔹 Etapa 1 — Gerar Excel intermediário</h4>
         <ol>
-            <li>Informe o <b>Código da Empresa</b> na sidebar.</li>
-            <li>Faça upload do PDF <b>Rubricas/Itens Não Configurados</b>.</li>
-            <li>Faça upload do PDF <b>Cadastro de Eventos (Plano e Acumuladores)</b>.</li>
-            <li>Clique em <b>▶ Gerar Excel Intermediário</b>.</li>
-            <li>Baixe o Excel, preencha as colunas em <b>amarelo</b>.</li>
+          <li>Informe o <b>Código da Empresa</b> na sidebar.</li>
+          <li>Faça upload dos dois PDFs.</li>
+          <li>Clique em <b>▶ Gerar Excel Intermediário</b>.</li>
+          <li>Baixe o Excel e preencha as colunas em <b>amarelo</b>.</li>
         </ol>
+
         <h4>🔹 Etapa 2 — Gerar TXTs finais</h4>
         <ol>
-            <li>Faça upload do Excel preenchido.</li>
-            <li>Clique em <b>▶ Gerar TXTs Finais</b>.</li>
-            <li>Baixe <b>evento_exemplo.txt</b> e <b>integra_exemplo.txt</b>.</li>
+          <li>Faça upload do Excel preenchido.</li>
+          <li>Clique em <b>▶ Gerar TXTs Finais</b>.</li>
+          <li>Baixe <b>evento_exemplo.txt</b> e <b>integra_exemplo.txt</b>.</li>
         </ol>
+
         <h4>⚠️ Colunas a preencher no Excel (em amarelo)</h4>
         <ul>
-            <li><b>Código da Conta Débito</b></li>
-            <li><b>Código da Conta Crédito</b></li>
-            <li><b>Código do Histórico</b></li>
-            <li><b>Complemento / Histórico</b></li>
-        </ul>
-        <h4>ℹ️ Observações</h4>
-        <ul>
-            <li>O <b>Tipo Rubrica</b> vem automaticamente do PDF de Cadastro de Eventos.</li>
-            <li>Rubricas sem correspondência no cadastro aparecem como <b>—</b>.</li>
-            <li><b>evento_exemplo.txt</b>: Tipos 1, 2, 3, 4 | <b>integra_exemplo.txt</b>: Tipos 1 a 6.</li>
+          <li><b>Código da Conta Débito</b></li>
+          <li><b>Código da Conta Crédito</b></li>
+          <li><b>Código do Histórico</b></li>
+          <li><b>Complemento / Histórico</b></li>
         </ul>
         </div>
     """, unsafe_allow_html=True)
@@ -551,10 +520,10 @@ for k, v in {
     "etapa1_ok":     False,
     "etapa2_ok":     False,
     "log_parse":     [],
+    "catalog_size":  0,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ETAPA 1 — Upload PDFs + Gerar Excel intermediário
@@ -565,21 +534,62 @@ st.markdown("""
     </div>
 """, unsafe_allow_html=True)
 
+st.markdown("""
+    <div class="alert-box">
+        ⚠️ <b>Atenção aos arquivos:</b><br>
+        • <b>Campo 1</b> → <code>RubricasItens não Configurados.pdf</code>
+          (título: <i>RELAÇÃO DE RUBRICAS/ITENS NÃO CONFIGURADOS</i>)<br>
+        • <b>Campo 2</b> → <code>Rubricas.pdf</code>
+          (título: <i>EMPRESA PADRÃO - PLANO E ACUMULADORES</i>)
+    </div>
+""", unsafe_allow_html=True)
+
 col_up1, col_up2 = st.columns(2)
 with col_up1:
-    st.markdown("**📄 PDF — Rubricas/Itens Não Configurados**")
+    st.markdown("**📄 PDF 1 — Rubricas/Itens Não Configurados**")
+    st.caption("Título esperado: *RELAÇÃO DE RUBRICAS/ITENS NÃO CONFIGURADOS*")
     pdf_rubricas = st.file_uploader(
-        "Rubricas", type=["pdf"], key="up_rubricas",
+        "Rubricas Não Configuradas", type=["pdf"], key="up_rubricas",
         label_visibility="collapsed",
     )
 with col_up2:
-    st.markdown("**📄 PDF — Cadastro de Eventos (Plano e Acumuladores)**")
+    st.markdown("**📄 PDF 2 — Cadastro de Eventos (Plano e Acumuladores)**")
+    st.caption("Título esperado: *EMPRESA PADRÃO - PLANO E ACUMULADORES*")
     pdf_cadastro = st.file_uploader(
-        "Cadastro", type=["pdf"], key="up_cadastro",
+        "Cadastro de Eventos", type=["pdf"], key="up_cadastro",
         label_visibility="collapsed",
     )
 
-ambos_pdfs = pdf_rubricas is not None and pdf_cadastro is not None
+# Validação em tempo real
+pdf_rub_ok = pdf_cad_ok = False
+bytes_rub = bytes_cad = None
+
+if pdf_rubricas is not None:
+    bytes_rub = pdf_rubricas.read()
+    tipo_rub  = detectar_tipo_pdf(bytes_rub)
+    if tipo_rub == "rubricas_nao_config":
+        st.success("✅ PDF 1 identificado: **Relação de Rubricas/Itens Não Configurados**")
+        pdf_rub_ok = True
+    elif tipo_rub == "cadastro_eventos":
+        st.error("❌ **PDF 1 incorreto!** Você enviou o PDF de Plano e Acumuladores no campo errado.")
+    else:
+        st.warning("⚠️ PDF 1: tipo não identificado automaticamente. Verifique se é o arquivo correto.")
+        pdf_rub_ok = True
+
+if pdf_cadastro is not None:
+    bytes_cad = pdf_cadastro.read()
+    tipo_cad  = detectar_tipo_pdf(bytes_cad)
+    if tipo_cad == "cadastro_eventos":
+        st.success("✅ PDF 2 identificado: **Empresa Padrão — Plano e Acumuladores**")
+        pdf_cad_ok = True
+    elif tipo_cad == "rubricas_nao_config":
+        st.error("❌ **PDF 2 incorreto!** Você enviou o PDF de Rubricas Não Configuradas no campo errado.")
+    else:
+        st.warning("⚠️ PDF 2: tipo não identificado automaticamente. Verifique se é o arquivo correto.")
+        pdf_cad_ok = True
+
+ambos_pdfs = (pdf_rubricas is not None and pdf_cadastro is not None
+              and pdf_rub_ok and pdf_cad_ok)
 
 col_b1, col_b2 = st.columns([1, 1])
 with col_b1:
@@ -596,34 +606,42 @@ if limpar:
     for k in ["df_rubricas", "excel_interm", "evento_bytes",
               "integra_bytes", "log_parse"]:
         st.session_state[k] = [] if k == "log_parse" else None
-    st.session_state.etapa1_ok = False
-    st.session_state.etapa2_ok = False
+    st.session_state.etapa1_ok    = False
+    st.session_state.etapa2_ok    = False
+    st.session_state.catalog_size = 0
     st.rerun()
 
 if gerar_excel and ambos_pdfs:
     log = []
-    with st.spinner("🔄 Lendo PDF de Rubricas..."):
-        bytes_rub = pdf_rubricas.read()
+
+    with st.spinner("🔄 Lendo PDF de Rubricas Não Configuradas..."):
         df_rub = parse_rubricas_pdf(bytes_rub)
-        log.append(f"PDF Rubricas: {len(df_rub)} linhas extraídas.")
+        log.append(f"PDF 1 (Rubricas Não Config.): {len(df_rub)} linhas extraídas.")
 
     if df_rub.empty:
-        st.error("⚠️ Nenhum dado extraído do PDF de Rubricas. Verifique o arquivo.")
-        # Debug: mostra as primeiras linhas do PDF
+        st.error("⚠️ Nenhum dado extraído do PDF 1.")
         with pdfplumber.open(BytesIO(bytes_rub)) as pdf:
             txt = pdf.pages[0].extract_text() or ""
-        with st.expander("🔍 Debug — primeiras 40 linhas do PDF"):
+        with st.expander("🔍 Debug — primeiras 40 linhas do PDF 1"):
             st.code("\n".join(txt.splitlines()[:40]))
     else:
-        with st.spinner("🔄 Lendo PDF de Cadastro de Eventos..."):
-            catalog = parse_cadastro_eventos_pdf(pdf_cadastro.read())
-            log.append(f"Cadastro de Eventos: {len(catalog)} rubricas mapeadas.")
+        with st.spinner("🔄 Lendo PDF de Cadastro (identificando tipo por código)..."):
+            catalog = parse_cadastro_eventos_pdf(bytes_cad)
+            log.append(f"PDF 2 (Plano e Acumuladores): {len(catalog)} códigos mapeados.")
 
+        # Cruza pelo CÓDIGO DO EVENTO
         df_rub["Tipo Rubrica"] = df_rub["Cod Evento"].map(
             lambda c: catalog.get(str(c), "—")
         )
+
         encontrados = (df_rub["Tipo Rubrica"] != "—").sum()
-        log.append(f"Rubricas com Tipo identificado: {encontrados}/{len(df_rub)}")
+        nao_encontrados = (df_rub["Tipo Rubrica"] == "—").sum()
+        log.append(f"Cruzamento por código: {encontrados} identificados | {nao_encontrados} sem correspondência (—).")
+
+        if nao_encontrados > 0:
+            codigos_nao_encontrados = df_rub[df_rub["Tipo Rubrica"] == "—"]["Cod Evento"].unique()
+            log.append(f"Códigos sem tipo: {', '.join(codigos_nao_encontrados[:20])}"
+                       + (" ..." if len(codigos_nao_encontrados) > 20 else ""))
 
         for col in ["Código da Conta Débito", "Código da Conta Crédito",
                     "Código do Histórico", "Complemento / Histórico"]:
@@ -633,6 +651,7 @@ if gerar_excel and ambos_pdfs:
         st.session_state.excel_interm = gerar_excel_intermediario(df_rub)
         st.session_state.etapa1_ok    = True
         st.session_state.log_parse    = log
+        st.session_state.catalog_size = len(catalog)
         st.rerun()
 
 # ── Resultado Etapa 1 ─────────────────────────────────────────────────────────
@@ -641,7 +660,6 @@ if st.session_state.etapa1_ok and st.session_state.df_rubricas is not None:
 
     st.success(f"✅ **{len(df_rub)} registros** extraídos e cruzados com o cadastro!")
 
-    # Log do parse
     if st.session_state.log_parse:
         for msg in st.session_state.log_parse:
             st.caption(f"ℹ️ {msg}")
@@ -651,7 +669,7 @@ if st.session_state.etapa1_ok and st.session_state.df_rubricas is not None:
     m2.metric("🏢 Centros de Custo",  df_rub["Cód Centro de Custo"].nunique())
     m3.metric("🔢 Tipos Integração",  df_rub["Tipo da Integração"].nunique())
     m4.metric("🎯 Eventos Únicos",    df_rub["Cod Evento"].nunique())
-    m5.metric("🏷️ Com Tipo Rubrica", (df_rub["Tipo Rubrica"] != "—").sum())
+    m5.metric("🏷️ Tipo Identificado", (df_rub["Tipo Rubrica"] != "—").sum())
 
     # Prévia com destaque por tipo de rubrica
     with st.expander("👁️ Prévia dos dados (primeiros 30 registros)"):
@@ -662,7 +680,29 @@ if st.session_state.etapa1_ok and st.session_state.df_rubricas is not None:
             styled = df_prev.style.applymap(color_tipo_rubrica, subset=["Tipo Rubrica"])
         st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # Resumo por tipo
+    # Resumo por Tipo de Rubrica
+    with st.expander("📊 Resumo por Tipo de Rubrica"):
+        resumo_tr = (
+            df_rub.groupby("Tipo Rubrica")
+            .agg(Registros=("Cod Evento", "count"),
+                 Eventos_Únicos=("Cod Evento", "nunique"))
+            .reset_index()
+            .sort_values("Registros", ascending=False)
+        )
+        st.dataframe(resumo_tr, use_container_width=True, hide_index=True)
+
+    # Eventos sem tipo identificado
+    sem_tipo = df_rub[df_rub["Tipo Rubrica"] == "—"]
+    if not sem_tipo.empty:
+        with st.expander(f"⚠️ {len(sem_tipo)} registros sem Tipo Rubrica identificado"):
+            st.caption("Esses códigos não foram encontrados no PDF de Cadastro de Eventos.")
+            st.dataframe(
+                sem_tipo[["Cód Centro de Custo", "Desc. Centro de Custo",
+                           "Tipo da Integração", "Cod Evento", "Descrição Evento"]],
+                use_container_width=True, hide_index=True
+            )
+
+    # Resumo por Tipo de Integração
     with st.expander("📊 Resumo por Tipo de Integração"):
         resumo = (
             df_rub.groupby(["Tipo da Integração", "Desc. Tipo Integração"])
@@ -672,16 +712,6 @@ if st.session_state.etapa1_ok and st.session_state.df_rubricas is not None:
             .reset_index()
         )
         st.dataframe(resumo, use_container_width=True, hide_index=True)
-
-    # Resumo por Tipo Rubrica
-    with st.expander("📊 Resumo por Tipo de Rubrica"):
-        resumo_tr = (
-            df_rub.groupby("Tipo Rubrica")
-            .agg(Registros=("Cod Evento", "count"))
-            .reset_index()
-            .sort_values("Registros", ascending=False)
-        )
-        st.dataframe(resumo_tr, use_container_width=True, hide_index=True)
 
     st.markdown("#### ⬇️ Baixe o Excel, preencha as colunas em amarelo e siga para a Etapa 2")
     st.download_button(
