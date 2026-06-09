@@ -1,16 +1,20 @@
 # ============================================================
-# app_integracao_dominio.py – Integração Contábil Domínio V1.0
-# Dependências: streamlit, pandas, pdfplumber, openpyxl
-# pip install streamlit pandas pdfplumber openpyxl
+# app_integracao_dominio.py  –  Integração Contábil Domínio V2.0
+# Entradas:
+#   1. RubricasItens não Configurados.pdf  → eventos sem config contábil
+#   2. Rubricas.pdf                        → catálogo de tipos de rubrica
+#   3. evento exemplo.xlsx                 → contas contábeis já configuradas
+# Saída:
+#   arquivo TXT no formato Domínio Separador
 # ============================================================
 
 import streamlit as st
-import pandas as pd
 import pdfplumber
+import pandas as pd
 import re
 from io import BytesIO
 
-VERSAO = "V1.0"
+VERSAO = "V2.0"
 
 # ==============================
 # TEMA TR
@@ -51,9 +55,9 @@ def apply_tr_theme():
 
 
 # ==============================
-# LINHAS A IGNORAR NO PDF
+# LINHAS A IGNORAR NO PDF DE RUBRICAS
 # ==============================
-IGNORE_PATTERNS = [
+IGNORE_PATTERNS_RUBRICAS = [
     r"^EMPRESA PADR",
     r"^RUBRICAS",
     r"^Emiss",
@@ -61,66 +65,58 @@ IGNORE_PATTERNS = [
     r"^Pág",
     r"^Cód\.",
     r"^\s*$",
-    r"^A\.",
-    r"^B\.",
-    r"^C\.",
-    r"^D\.",
-    r"^E\.",
-    r"^F\.",
-    r"^G\.",
-    r"^H\.",
-    r"^I\.",
-    r"^J\.",
-    r"^K\.",
-    r"^L\.",
-    r"^M\.",
-    r"^N\.",
-    r"^O\.",
-    r"^P\.",
-    r"^Q\.",
-    r"^R\.",
-    r"^S\.",
-    r"^T\.",
-    r"^U\.",
-    r"^V\.",
-    r"^W\.",
-    r"^X\.",
-    r"^Z\.",
+    r"^[A-Z]\.\s",       # letras de acumuladores ex: "A. I.R.R.F"
     r"^Soma na base",
 ]
 
-def should_ignore_cad(line: str) -> bool:
-    for pat in IGNORE_PATTERNS:
+def should_ignore_rubricas(line: str) -> bool:
+    for pat in IGNORE_PATTERNS_RUBRICAS:
         if re.search(pat, line, re.IGNORECASE):
             return True
     return False
 
 
 # ==============================
-# PARSE DO PDF DE RUBRICAS
+# LINHAS A IGNORAR NO PDF DE ITENS NÃO CONFIGURADOS
 # ==============================
-def parse_cadastro_eventos_pdf(file_bytes: bytes) -> dict:
-    """
-    Retorna dict {codigo_evento (str): tipo_rubrica (str)}
+IGNORE_PATTERNS_NAO_CONFIG = [
+    r"^RELAÇÃO DE RUBRICAS",
+    r"^Página",
+    r"^Emissão",
+    r"^Hora:",
+    r"^Empresa:",
+    r"^Folha",
+    r"^Centro de Custo:",
+    r"^Código\s+Descrição",
+    r"^\s*$",
+    r"^Rescisão",
+    r"^Férias",
+    r"^Provisão",
+    r"^Empresa$",
+]
 
-    Captura TODAS as variações do tipo no PDF de Rubricas:
-      1. Tipo separado por espaço:   "208 REEMBOLSO DE QUILOMETRAGEM Provento Nenhuma..."
-      2. Tipo colado na descrição:   "836 INSS DIF FER DESC A MAIORProvento Nenhuma..."
-      3. Tipo colado na próx palavra:"813 FGTS FERIAS InformativaNenhuma..."
-      4. Tipo com ponto e espaço:    "243 CONVENIO MEDICO Inf. dedutora Nenhuma..."
+def should_ignore_nao_config(line: str) -> bool:
+    for pat in IGNORE_PATTERNS_NAO_CONFIG:
+        if re.search(pat, line, re.IGNORECASE):
+            return True
+    return False
+
+
+# ==============================
+# PARSE DO PDF DE RUBRICAS (catálogo de tipos)
+# ==============================
+def parse_rubricas_pdf(file_bytes: bytes, log: list) -> dict:
+    """
+    Lê o Rubricas.pdf e retorna dict {cod (str): tipo_norm (str)}
+    Captura tipos colados ou separados na linha.
     """
     catalog = {}
 
-    # Regex abrangente:
-    # - código numérico no início
-    # - descrição lazy até encontrar o tipo
-    # - \s* = zero ou mais espaços antes do tipo (captura colados)
-    # - tipo com variações: Provento, Desconto, Inf. ded(utora)?, Informativa
     RE_LINHA = re.compile(
-        r"^\s*(\d+)\s+"                                               # código
-        r"(.+?)"                                                      # descrição (lazy)
-        r"\s*(Provento|Desconto|Inf\.\s*ded(?:utora)?|Informativa)"   # tipo
-        r"[\s\w]",                                                    # seguido de espaço ou letra
+        r"^\s*(\d+)\s+"
+        r"(.+?)"
+        r"\s*(Provento|Desconto|Inf\.\s*ded(?:utora)?|Informativa)"
+        r"[\s\w]",
         re.IGNORECASE,
     )
 
@@ -131,235 +127,290 @@ def parse_cadastro_eventos_pdf(file_bytes: bytes) -> dict:
                 continue
             for raw in text.splitlines():
                 line = raw.strip()
-                if not line or should_ignore_cad(line):
+                if not line or should_ignore_rubricas(line):
                     continue
                 m = RE_LINHA.match(line)
                 if m:
                     cod      = m.group(1).strip()
                     tipo_raw = m.group(3).strip().lower()
-
-                    if "provento"   in tipo_raw:
-                        tipo_norm = "Provento"
-                    elif "desconto" in tipo_raw:
-                        tipo_norm = "Desconto"
+                    if "provento"   in tipo_raw: tipo_norm = "Provento"
+                    elif "desconto" in tipo_raw: tipo_norm = "Desconto"
                     elif "inf. ded" in tipo_raw or "inf.ded" in tipo_raw:
                         tipo_norm = "Inf. dedutora"
-                    elif "informat" in tipo_raw:
-                        tipo_norm = "Informativa"
-                    else:
-                        tipo_norm = m.group(3).strip()
-
-                    # Primeira ocorrência = mais confiável
+                    elif "informat" in tipo_raw: tipo_norm = "Informativa"
+                    else: tipo_norm = m.group(3).strip()
                     if cod not in catalog:
                         catalog[cod] = tipo_norm
 
+    log.append(f"Rubricas.pdf: {len(catalog)} tipo(s) identificado(s) no catálogo.")
     return catalog
 
 
 # ==============================
-# LEITURA DO EXCEL DE EVENTOS
+# PARSE DO PDF DE ITENS NÃO CONFIGURADOS
 # ==============================
-def ler_excel_eventos(file_bytes: bytes) -> tuple[pd.DataFrame | None, str]:
+def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
     """
-    Lê o Excel de eventos configurados.
-    Retorna (DataFrame, mensagem_erro).
-    Aceita abas 'evento' ou 'Plan1'.
+    Lê o PDF 'Rubricas/Itens não Configurados' e retorna lista de dicts:
+    [{ 'cod': str, 'descricao': str, 'tipo_folha': str, 'centro_custo': str }, ...]
+
+    Estrutura do PDF:
+      Folha Normal / Férias / Rescisão / Provisão de Férias / Provisão de 13º / Empresa
+      Centro de Custo: N NOME
+        Código  Descrição
+        208     REEMBOLSO DE QUILOMETRAGEM
+        ...
     """
+    eventos = []
+    vistos  = set()   # (cod, tipo_folha, centro_custo) para evitar duplicatas
+
+    # Mapeamento de seção para tipo_integ
+    SECAO_TIPO = {
+        "Folha Normal":       "1",
+        "Empresa":            "2",
+        "Férias":             "3",
+        "Rescisão":           "4",
+        "Provisão de Férias": "5",
+        "Provisão de 13º":    "6",
+        "Provisão de 13o":    "6",
+    }
+
+    # Regex para linha de evento: código numérico + descrição
+    RE_EVENTO = re.compile(r"^\s*(\d+)\s+(.+)$")
+
+    # Regex para linha de seção
+    RE_SECAO = re.compile(
+        r"^(Folha Normal|Empresa|Férias|Rescisão|"
+        r"Provisão de Férias|Provisão de 13º|Provisão de 13o)$",
+        re.IGNORECASE,
+    )
+
+    # Regex para Centro de Custo
+    RE_CC = re.compile(r"^Centro de Custo:\s*(\d+)\s+(.+)$", re.IGNORECASE)
+
+    tipo_folha_atual  = "1"
+    centro_custo_atual = ""
+
+    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+        for page in pdf.pages:
+            text = page.extract_text()
+            if not text:
+                continue
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line:
+                    continue
+
+                # Detecta seção (tipo de folha)
+                m_sec = RE_SECAO.match(line)
+                if m_sec:
+                    sec = m_sec.group(1).strip()
+                    # Normaliza
+                    for k, v in SECAO_TIPO.items():
+                        if k.lower() in sec.lower():
+                            tipo_folha_atual = v
+                            break
+                    continue
+
+                # Detecta Centro de Custo
+                m_cc = RE_CC.match(line)
+                if m_cc:
+                    centro_custo_atual = m_cc.group(1).strip()
+                    continue
+
+                # Ignora cabeçalhos e rodapés
+                if should_ignore_nao_config(line):
+                    continue
+
+                # Tenta capturar linha de evento
+                m_ev = RE_EVENTO.match(line)
+                if m_ev:
+                    cod  = m_ev.group(1).strip()
+                    desc = m_ev.group(2).strip()
+
+                    # Filtra falsos positivos (ex: "1/2 FERIAS" começa com dígito)
+                    # Código válido: puramente numérico
+                    if not cod.isdigit():
+                        continue
+
+                    chave = (cod, tipo_folha_atual, centro_custo_atual)
+                    if chave not in vistos:
+                        vistos.add(chave)
+                        eventos.append({
+                            "cod":          cod,
+                            "descricao":    desc,
+                            "tipo_folha":   tipo_folha_atual,
+                            "centro_custo": centro_custo_atual,
+                        })
+
+    log.append(
+        f"PDF Itens Não Configurados: {len(eventos)} evento(s) encontrado(s) "
+        f"(únicos por código + tipo + centro de custo)."
+    )
+    return eventos
+
+
+# ==============================
+# LEITURA DO EXCEL DE CONTAS CONTÁBEIS
+# ==============================
+def ler_excel_contas(file_bytes: bytes, log: list) -> dict:
+    """
+    Lê o Excel (aba 'evento') e retorna dict:
+    { (cod_seq, tipo_integ): { conta_debito, conta_credito, historico, complemento } }
+    """
+    contas = {}
     try:
         xls = pd.ExcelFile(BytesIO(file_bytes))
     except Exception as e:
-        return None, f"Erro ao abrir Excel: {e}"
+        log.append(f"AVISO: Não foi possível abrir o Excel: {e}")
+        return contas
 
-    sheet_name = None
-    for candidate in ["evento", "Evento", "EVENTO", "Plan1", "plan1"]:
+    sheet = None
+    for candidate in ["evento", "Evento", "EVENTO", "Plan1"]:
         if candidate in xls.sheet_names:
-            sheet_name = candidate
+            sheet = candidate
             break
 
-    if sheet_name is None:
-        return None, (
-            f"Aba 'evento' não encontrada. "
-            f"Abas disponíveis: {xls.sheet_names}"
-        )
+    if not sheet:
+        log.append(f"AVISO: Aba 'evento' não encontrada no Excel. Abas: {xls.sheet_names}")
+        return contas
 
     try:
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, dtype=str)
+        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, dtype=str)
     except Exception as e:
-        return None, f"Erro ao ler aba '{sheet_name}': {e}"
+        log.append(f"AVISO: Erro ao ler aba '{sheet}': {e}")
+        return contas
 
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how="all")
 
-    return df, ""
+    # Mapeia nomes de colunas
+    col_map = {}
+    for col in df.columns:
+        cl = col.lower()
+        if "sequencial" in cl or "seq" in cl:
+            col_map["seq"] = col
+        elif "tipo" in cl and "integr" in cl:
+            col_map["tipo"] = col
+        elif "débito" in cl or "debito" in cl:
+            col_map["debito"] = col
+        elif "crédito" in cl or "credito" in cl:
+            col_map["credito"] = col
+        elif "histórico" in cl or "historico" in cl:
+            col_map["historico"] = col
+        elif "complemento" in cl:
+            col_map["complemento"] = col
 
+    for _, row in df.iterrows():
+        seq  = str(row.get(col_map.get("seq",  ""), "") or "").strip()
+        tipo = str(row.get(col_map.get("tipo", ""), "") or "").strip()
+        deb  = str(row.get(col_map.get("debito",  ""), "") or "").strip()
+        cred = str(row.get(col_map.get("credito", ""), "") or "").strip()
+        hist = str(row.get(col_map.get("historico", ""), "") or "").strip()
+        comp = str(row.get(col_map.get("complemento", ""), "") or "").strip()
 
-def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame | None:
-    """
-    Mapeia nomes de colunas variados para nomes padronizados internos.
-    Retorna None se colunas obrigatórias não forem encontradas.
-    """
-    mapa = {
-        "cod_empresa":   ["código da empresa", "codigo da empresa", "cod. empresa",
-                          "cod_empresa", "empresa"],
-        "centro_custo":  ["centro de custo", "centro_custo", "cod centro de custo",
-                          "cód centro de custo"],
-        "seq":           ["código sequencial da integração",
-                          "codigo sequencial da integracao",
-                          "código sequencial", "seq", "sequencial"],
-        "tipo_integ":    ["tipo da integração (1 - folha mensal; 2 - empresa; "
-                          "3 - férias; 4 - rescisao; 5 - prov. férias; 6 - prov. 13)",
-                          "tipo da integração", "tipo integracao", "tipo_integ", "tipo"],
-        "descricao":     ["descrição", "descricao", "desc", "descrição evento",
-                          "descrição do evento"],
-        "conta_debito":  ["código da conta débito", "codigo da conta debito",
-                          "conta débito", "conta_debito", "débito"],
-        "conta_credito": ["código da conta crédito", "codigo da conta credito",
-                          "conta crédito", "conta_credito", "crédito"],
-        "historico":     ["código do histórico", "codigo do historico",
-                          "histórico", "historico"],
-    }
+        # Limpa "nan"
+        deb  = "" if deb.lower()  == "nan" else deb
+        cred = "" if cred.lower() == "nan" else cred
+        hist = "" if hist.lower() == "nan" else hist
+        comp = "" if comp.lower() == "nan" else comp
 
-    col_lower = {c.lower(): c for c in df.columns}
-    rename_map = {}
+        if seq and seq.lower() != "nan":
+            chave = (seq, tipo)
+            if chave not in contas:
+                contas[chave] = {
+                    "conta_debito":  deb,
+                    "conta_credito": cred,
+                    "historico":     hist,
+                    "complemento":   comp,
+                }
 
-    for campo, candidatos in mapa.items():
-        for cand in candidatos:
-            if cand.lower() in col_lower:
-                rename_map[col_lower[cand.lower()]] = campo
-                break
-
-    df = df.rename(columns=rename_map)
-
-    obrigatorias = ["seq", "tipo_integ", "descricao"]
-    faltando = [c for c in obrigatorias if c not in df.columns]
-    if faltando:
-        return None
-
-    return df
+    log.append(f"Excel: {len(contas)} configuração(ões) de contas carregada(s).")
+    return contas
 
 
 # ==============================
-# CRUZAMENTO E GERAÇÃO DO TXT
+# GERAÇÃO DO TXT DOMÍNIO
 # ==============================
 def gerar_txt_dominio(
-    df_eventos: pd.DataFrame,
-    catalog_pdf: dict,
+    eventos_nao_config: list,
+    catalog_tipos: dict,
+    contas_excel: dict,
     cod_empresa_padrao: str,
     log: list,
 ) -> tuple[str, pd.DataFrame]:
     """
-    Cruza os eventos do Excel com o catálogo do PDF e gera o TXT Domínio.
-
-    Formato de saída (leiaute Domínio Separador):
-      Aba 'integra':  cod_empresa|0|seq|tipo_integ|cod_rubrica|
-      Aba 'evento':   cod_empresa|centro_custo|seq|tipo_integ|descricao|
-                      conta_debito|conta_credito|historico|complemento|
-
-    Na prática, o sistema usa o arquivo de eventos (aba 'evento') para
-    configurar as contas contábeis. Aqui geramos o arquivo de integração
-    completo no formato esperado pelo Domínio.
+    Cruza eventos não configurados + tipos do catálogo + contas do Excel.
+    Gera o TXT no formato Domínio Separador.
     """
-    linhas_integra = []
-    linhas_evento  = []
-    dados_tabela   = []
+    linhas_txt   = []
+    dados_tabela = []
 
-    nao_identificados  = []
-    sem_conta          = []
-    gerados_ok         = 0
+    sem_tipo  = 0
+    sem_conta = 0
+    completos = 0
 
-    for _, row in df_eventos.iterrows():
-        seq         = str(row.get("seq",         "")).strip()
-        tipo_integ  = str(row.get("tipo_integ",  "")).strip()
-        descricao   = str(row.get("descricao",   "")).strip()
-        conta_deb   = str(row.get("conta_debito",  "")).strip()
-        conta_cred  = str(row.get("conta_credito", "")).strip()
-        historico   = str(row.get("historico",     "")).strip()
-        centro      = str(row.get("centro_custo",  "")).strip()
-        complemento = str(row.get("complemento",   "")).strip()
+    for ev in eventos_nao_config:
+        cod          = ev["cod"]
+        descricao    = ev["descricao"]
+        tipo_integ   = ev["tipo_folha"]
+        centro_custo = ev["centro_custo"]
 
-        # Código da empresa: usa coluna ou padrão informado
-        cod_emp_raw = str(row.get("cod_empresa", "")).strip()
-        cod_empresa = cod_emp_raw if cod_emp_raw and cod_emp_raw.lower() != "nan" \
-                      else cod_empresa_padrao
+        # Busca tipo no catálogo
+        tipo_rubrica = catalog_tipos.get(cod, "")
 
-        # Limpa NaN
-        for var_name, var_val in [
-            ("conta_deb",  conta_deb),
-            ("conta_cred", conta_cred),
-            ("historico",  historico),
-            ("centro",     centro),
-            ("complemento", complemento),
-        ]:
-            pass  # já são strings; nan vira "nan"
+        # Busca contas no Excel
+        conta_info = contas_excel.get((cod, tipo_integ), {})
+        # Tenta também sem o tipo (chave só pelo código)
+        if not conta_info:
+            for k, v in contas_excel.items():
+                if k[0] == cod:
+                    conta_info = v
+                    break
 
-        conta_deb   = "" if conta_deb.lower()   == "nan" else conta_deb
-        conta_cred  = "" if conta_cred.lower()  == "nan" else conta_cred
-        historico   = "" if historico.lower()   == "nan" else historico
-        centro      = "" if centro.lower()      == "nan" else centro
-        complemento = "" if complemento.lower() == "nan" else complemento
+        conta_deb  = conta_info.get("conta_debito",  "")
+        conta_cred = conta_info.get("conta_credito", "")
+        historico  = conta_info.get("historico",     "")
+        complemento = conta_info.get("complemento",  "")
 
-        if not seq or seq.lower() == "nan":
-            continue
-
-        # Busca tipo no catálogo do PDF
-        tipo_rubrica = catalog_pdf.get(seq, "")
-
-        status = ""
+        # Status
         if not tipo_rubrica:
-            nao_identificados.append(seq)
-            status = "⚠️ Não identificado no PDF"
-            log.append(
-                f"Evento {seq} ({descricao[:40]}) — "
-                f"tipo não encontrado no PDF de Rubricas."
-            )
+            status = "⚠️ Tipo não encontrado no catálogo"
+            sem_tipo += 1
+        elif not conta_deb and not conta_cred:
+            status = "ℹ️ Sem conta configurada no Excel"
+            sem_conta += 1
         else:
-            if not conta_deb and not conta_cred:
-                sem_conta.append(seq)
-                status = "ℹ️ Sem conta configurada"
-            else:
-                gerados_ok += 1
-                status = f"✅ {tipo_rubrica}"
+            status = f"✅ {tipo_rubrica}"
+            completos += 1
 
-        # Linha aba 'integra'
-        linhas_integra.append(
-            f"{cod_empresa}|0|{seq}|{tipo_integ}|{seq}|\n"
+        # Linha do TXT
+        linha = (
+            f"{cod_empresa_padrao}|{centro_custo}|{cod}|{tipo_integ}|"
+            f"{descricao}|{conta_deb}|{conta_cred}|{historico}|{complemento}|\n"
         )
-
-        # Linha aba 'evento'
-        linhas_evento.append(
-            f"{cod_empresa}|{centro}|{seq}|{tipo_integ}|{descricao}|"
-            f"{conta_deb}|{conta_cred}|{historico}|{complemento}|\n"
-        )
+        linhas_txt.append(linha)
 
         dados_tabela.append({
-            "Seq":            seq,
+            "Código":          cod,
+            "Descrição":       descricao,
             "Tipo Integração": tipo_integ,
-            "Descrição":      descricao,
-            "Tipo Rubrica":   tipo_rubrica or "—",
-            "Conta Débito":   conta_deb,
-            "Conta Crédito":  conta_cred,
-            "Histórico":      historico,
-            "Centro Custo":   centro,
-            "Status":         status,
+            "Centro Custo":    centro_custo,
+            "Tipo Rubrica":    tipo_rubrica or "—",
+            "Conta Débito":    conta_deb,
+            "Conta Crédito":   conta_cred,
+            "Histórico":       historico,
+            "Status":          status,
         })
-
-    # Monta arquivo final
-    conteudo = "".join(linhas_integra) + "".join(linhas_evento)
 
     log.append(
         f"Geração concluída → "
-        f"Gerados OK: {gerados_ok} | "
-        f"Sem tipo no PDF: {len(nao_identificados)} | "
-        f"Sem conta: {len(sem_conta)}"
+        f"Completos: {completos} | "
+        f"Sem tipo no catálogo: {sem_tipo} | "
+        f"Sem conta no Excel: {sem_conta}"
     )
 
-    if nao_identificados:
-        log.append(
-            f"Eventos sem tipo no PDF: {', '.join(nao_identificados[:20])}"
-            f"{'...' if len(nao_identificados) > 20 else ''}"
-        )
-
-    return conteudo, pd.DataFrame(dados_tabela)
+    return "".join(linhas_txt), pd.DataFrame(dados_tabela)
 
 
 # ==============================
@@ -381,13 +432,12 @@ def main():
                     margin-bottom:28px;">
             <h2 style="color:#FF8000; margin:0;
                        font-family:'Segoe UI',Arial,sans-serif;">
-                📊 Integração Contábil — Excel + PDF Rubricas → Domínio
+                📊 Integração Contábil — Itens Não Configurados → Domínio
                 &nbsp;|&nbsp; {VERSAO}
             </h2>
             <p style="color:#DDDDDD; margin:6px 0 0 0;
                       font-family:'Segoe UI',Arial,sans-serif;">
-                Faça upload do <b>Excel de eventos</b> e do
-                <b>PDF de Rubricas</b>, depois clique em
+                Faça upload dos 3 arquivos e clique em
                 <b>▶ Gerar arquivo Domínio</b>.
             </p>
         </div>
@@ -400,14 +450,13 @@ def main():
         st.markdown("### ⚙️ Configurações")
         cod_empresa_padrao = st.text_input(
             "Código da empresa (padrão)",
-            value="1",
-            help="Usado quando o Excel não tiver a coluna 'Código da Empresa'.",
+            value="45",
+            help="Código da empresa no Domínio.",
         )
         st.markdown("---")
         st.markdown("### ℹ Sobre")
         st.markdown(f"**Versão:** {VERSAO}")
-        st.markdown("**Thomson Reuters**")
-        st.markdown("**Domínio Sistemas**")
+        st.markdown("**Thomson Reuters | Domínio Sistemas**")
 
     # ── Instruções ────────────────────────────────────────────────────
     with st.expander("📖 **Instruções de Uso** — clique para expandir", expanded=False):
@@ -415,35 +464,28 @@ def main():
             """
             <div class="instrucoes-box">
 
-            <h4>🔹 Passo 1 — Prepare os arquivos</h4>
+            <h4>🔹 Arquivos necessários</h4>
+            <ol>
+                <li><b>Rubricas/Itens não Configurados.pdf</b>: relatório gerado no Domínio
+                    em <i>Plano e Acumuladores → Rubricas/Itens não Configurados</i>.</li>
+                <li><b>Rubricas.pdf</b>: relatório gerado no Domínio em
+                    <i>Plano e Acumuladores → Rubricas</i> (catálogo completo com tipos).</li>
+                <li><b>Excel de Contas (.xlsx)</b>: planilha com as contas contábeis
+                    já configuradas (aba <code>evento</code>).</li>
+            </ol>
+
+            <h4>🔹 O que o sistema faz</h4>
             <ul>
-                <li><b>Excel de Eventos</b>: aba <code>evento</code> com colunas
-                    Código da Empresa, Centro de Custo, Código Sequencial,
-                    Tipo da Integração, Descrição, Conta Débito, Conta Crédito,
-                    Histórico.</li>
-                <li><b>PDF de Rubricas</b>: relatório "Plano e Acumuladores → Rubricas"
-                    exportado do Domínio.</li>
+                <li>Lê todos os eventos sem configuração contábil do PDF 1.</li>
+                <li>Busca o <b>tipo de rubrica</b> (Provento/Desconto/Informativa/Inf. dedutora)
+                    de cada evento no PDF 2.</li>
+                <li>Busca as <b>contas contábeis</b> (débito/crédito/histórico) no Excel.</li>
+                <li>Gera o <b>arquivo TXT</b> no formato Domínio Separador.</li>
             </ul>
 
-            <h4>🔹 Passo 2 — Faça o upload</h4>
-            <p>Selecione os dois arquivos nos campos abaixo.</p>
-
-            <h4>🔹 Passo 3 — Gere e baixe</h4>
-            <p>Clique em <b>▶ Gerar arquivo Domínio</b> e depois em
-            <b>⬇ Baixar TXT</b>.</p>
-
-            <h4>🔹 Passo 4 — Importe no Domínio</h4>
+            <h4>🔹 Importar no Domínio</h4>
             <p><b>Utilitários → Importação → Importação Padrão →
             Leiaute Domínio Sistemas com Separador</b>.</p>
-
-            <h4>⚠ Observações</h4>
-            <ul>
-                <li>Eventos com tipo <b>colado</b> na descrição no PDF
-                    (ex: <code>InformativaNenhuma</code>) são detectados
-                    automaticamente.</li>
-                <li>Eventos marcados como <b>⚠️ Não identificado no PDF</b>
-                    precisam ser configurados manualmente.</li>
-            </ul>
 
             </div>
             """,
@@ -458,32 +500,39 @@ def main():
         "txt_gerado":   None,
         "nome_arquivo": "dominio_integracao.txt",
         "df_resultado": None,
-        "catalog_size": 0,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
     # ── Uploads ───────────────────────────────────────────────────────
-    col_up1, col_up2 = st.columns(2)
-    with col_up1:
-        arquivo_excel = st.file_uploader(
-            "📄 Excel de Eventos (.xlsx)",
-            type=["xlsx", "xls"],
-            help="Arquivo com os eventos a serem integrados.",
-        )
-    with col_up2:
-        arquivo_pdf = st.file_uploader(
-            "📋 PDF de Rubricas (.pdf)",
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        pdf_nao_config = st.file_uploader(
+            "1️⃣ PDF — Itens Não Configurados",
             type=["pdf"],
-            help="Relatório de Rubricas exportado do Domínio.",
+            help="Relatório 'Rubricas/Itens não Configurados' do Domínio.",
         )
+    with col2:
+        pdf_rubricas = st.file_uploader(
+            "2️⃣ PDF — Rubricas (catálogo)",
+            type=["pdf"],
+            help="Relatório 'Rubricas' completo do Domínio (com tipos).",
+        )
+    with col3:
+        excel_contas = st.file_uploader(
+            "3️⃣ Excel — Contas Contábeis (opcional)",
+            type=["xlsx", "xls"],
+            help="Planilha com contas débito/crédito já configuradas (aba 'evento').",
+        )
+
+    arquivos_ok = pdf_nao_config is not None and pdf_rubricas is not None
 
     col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
         gerar = st.button(
             "▶ Gerar arquivo Domínio",
-            disabled=(arquivo_excel is None or arquivo_pdf is None),
+            disabled=not arquivos_ok,
             use_container_width=True,
             type="primary",
         )
@@ -497,44 +546,32 @@ def main():
         st.rerun()
 
     # ── Processamento ─────────────────────────────────────────────────
-    if gerar and arquivo_excel and arquivo_pdf:
+    if gerar and arquivos_ok:
         log = ["Iniciando processamento..."]
 
-        # 1. Parse do PDF
-        with st.spinner("Lendo PDF de Rubricas..."):
-            catalog = parse_cadastro_eventos_pdf(arquivo_pdf.read())
-        log.append(
-            f"PDF lido: {len(catalog)} evento(s) identificado(s) no catálogo."
-        )
-        st.session_state.catalog_size = len(catalog)
+        # 1. Catálogo de tipos (Rubricas.pdf)
+        with st.spinner("Lendo Rubricas.pdf (catálogo de tipos)..."):
+            catalog_tipos = parse_rubricas_pdf(pdf_rubricas.read(), log)
 
-        # 2. Leitura do Excel
-        df_raw, erro = ler_excel_eventos(arquivo_excel.read())
-        if erro:
-            log.append(f"ERRO: {erro}")
-            st.session_state.log = log
-            st.rerun()
+        # 2. Eventos não configurados
+        with st.spinner("Lendo PDF de Itens Não Configurados..."):
+            eventos = parse_nao_configurados_pdf(pdf_nao_config.read(), log)
 
-        df = normalizar_colunas(df_raw)
-        if df is None:
-            log.append(
-                "ERRO: Colunas obrigatórias não encontradas no Excel. "
-                "Verifique se as colunas 'Código Sequencial', "
-                "'Tipo da Integração' e 'Descrição' existem."
-            )
-            st.session_state.log = log
-            st.rerun()
+        if not eventos:
+            log.append("AVISO: Nenhum evento encontrado no PDF de Itens Não Configurados.")
 
-        log.append(
-            f"Excel lido: {len(df)} linha(s) na aba de eventos."
+        # 3. Contas do Excel (opcional)
+        contas_excel = {}
+        if excel_contas is not None:
+            with st.spinner("Lendo Excel de contas..."):
+                contas_excel = ler_excel_contas(excel_contas.read(), log)
+
+        # 4. Geração do TXT
+        txt, df_resultado = gerar_txt_dominio(
+            eventos, catalog_tipos, contas_excel, cod_empresa_padrao, log
         )
 
-        # 3. Geração do TXT
-        conteudo, df_resultado = gerar_txt_dominio(
-            df, catalog, cod_empresa_padrao, log
-        )
-
-        st.session_state.txt_gerado   = conteudo.encode("latin-1", errors="replace")
+        st.session_state.txt_gerado   = txt.encode("latin-1", errors="replace")
         st.session_state.nome_arquivo = "dominio_integracao.txt"
         st.session_state.df_resultado = df_resultado
         st.session_state.log          = log
@@ -552,21 +589,18 @@ def main():
             type="primary",
         )
 
-        df_res = st.session_state.df_resultado
-        if df_res is not None and not df_res.empty:
-            # Métricas
-            total       = len(df_res)
-            ok          = len(df_res[df_res["Status"].str.startswith("✅")])
-            nao_id      = len(df_res[df_res["Status"].str.startswith("⚠️")])
-            sem_conta   = len(df_res[df_res["Status"].str.startswith("ℹ️")])
-            catalog_sz  = st.session_state.catalog_size
+        df = st.session_state.df_resultado
+        if df is not None and not df.empty:
+            total     = len(df)
+            completos = len(df[df["Status"].str.startswith("✅")])
+            sem_tipo  = len(df[df["Status"].str.startswith("⚠️")])
+            sem_conta = len(df[df["Status"].str.startswith("ℹ️")])
 
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("📋 Catálogo PDF",       catalog_sz)
-            m2.metric("📊 Total eventos",      total)
-            m3.metric("✅ Com tipo + conta",    ok)
-            m4.metric("⚠️ Sem tipo no PDF",    nao_id)
-            m5.metric("ℹ️ Sem conta",          sem_conta)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("📋 Total eventos", total)
+            m2.metric("✅ Completos",      completos)
+            m3.metric("⚠️ Sem tipo",       sem_tipo)
+            m4.metric("ℹ️ Sem conta",      sem_conta)
 
             # Tabela com highlight
             def highlight_row(row):
@@ -577,20 +611,32 @@ def main():
                 return [""] * len(row)
 
             st.dataframe(
-                df_res.style.apply(highlight_row, axis=1),
+                df.style.apply(highlight_row, axis=1),
                 use_container_width=True,
             )
 
-            # Expander: eventos não identificados
-            nao_id_df = df_res[df_res["Status"].str.startswith("⚠️")]
-            if not nao_id_df.empty:
+            # Expander: sem tipo no catálogo
+            sem_tipo_df = df[df["Status"].str.startswith("⚠️")]
+            if not sem_tipo_df.empty:
                 with st.expander(
-                    f"⚠️ Eventos não identificados no PDF ({len(nao_id_df)}) "
-                    f"— requerem configuração manual"
+                    f"⚠️ Eventos sem tipo no catálogo ({len(sem_tipo_df)}) "
+                    f"— verificar Rubricas.pdf"
                 ):
                     st.dataframe(
-                        nao_id_df[["Seq", "Tipo Integração",
-                                   "Descrição", "Centro Custo"]],
+                        sem_tipo_df[["Código", "Descrição", "Tipo Integração", "Centro Custo"]],
+                        use_container_width=True,
+                    )
+
+            # Expander: sem conta
+            sem_conta_df = df[df["Status"].str.startswith("ℹ️")]
+            if not sem_conta_df.empty:
+                with st.expander(
+                    f"ℹ️ Eventos sem conta configurada ({len(sem_conta_df)}) "
+                    f"— configurar no Excel"
+                ):
+                    st.dataframe(
+                        sem_conta_df[["Código", "Descrição", "Tipo Integração",
+                                      "Tipo Rubrica", "Centro Custo"]],
                         use_container_width=True,
                     )
 
@@ -607,7 +653,7 @@ def main():
     st.markdown("---")
     st.markdown("**Log de processamento**")
     log_texto = "\n".join(st.session_state.log)
-    tem_erro  = any(str(l).startswith("ERRO") for l in st.session_state.log)
+    tem_erro  = any(str(l).upper().startswith("ERRO") for l in st.session_state.log)
     cor_borda = "#D32F2F" if tem_erro else "#388E3C"
     st.markdown(
         f"""
