@@ -1,11 +1,11 @@
 # ============================================================
-# app_integracao_dominio.py  –  Integração Contábil Domínio V2.1
+# gerar_excel_configuracao.py
+# Gera Excel para preenchimento de contas contábeis
 # Entradas:
-#   1. RubricasItens não Configurados.pdf  → eventos sem config contábil
-#   2. rubricas.txt                        → catálogo de tipos de rubrica
-#   3. evento exemplo.xlsx                 → contas contábeis já configuradas
+#   1. RubricasItens não Configurados.pdf
+#   2. rubricas.txt
 # Saída:
-#   arquivo TXT no formato Domínio Separador
+#   Excel com colunas prontas para preenchimento
 # ============================================================
 
 import streamlit as st
@@ -14,7 +14,7 @@ import pandas as pd
 import re
 from io import BytesIO
 
-VERSAO = "V2.1"
+VERSAO = "V1.0"
 
 # ==============================
 # TEMA TR
@@ -38,105 +38,56 @@ def apply_tr_theme():
             border: none; border-radius: 4px; font-weight: bold;
         }
         .stDownloadButton > button:hover { background-color: #D64001; color: #FFFFFF; }
-        hr { border-color: #FF8000; }
-        [data-testid="metric-container"] {
-            background-color: #E9E9E9; border-left: 4px solid #FF8000;
-            border-radius: 4px; padding: 10px;
-        }
-        .instrucoes-box {
-            background-color: #E9E9E9; border-left: 4px solid #FF8000;
-            border-radius: 4px; padding: 16px 20px; margin: 12px 0;
-            color: #444444;
-        }
-        .instrucoes-box h4 { color: #FF8000; margin-top: 14px; margin-bottom: 6px; }
-        .instrucoes-box h4:first-child { margin-top: 0; }
         </style>
     """, unsafe_allow_html=True)
 
 
 # ==============================
-# PARSE DO TXT DE RUBRICAS (novo)
+# PARSE DO TXT DE RUBRICAS
 # ==============================
 def parse_rubricas_txt(file_bytes: bytes, log: list) -> dict:
     """
-    Lê o rubricas.txt (TSV exportado do Domínio) e retorna:
-        { cod_evento (str): tipo_norm (str) }
-
-    Estrutura das colunas (separadas por TAB):
-        [0]  cod_empresa_padrao   (ex: 9995)
-        [1]  cod_empresa          (ex: 45)
-        [2]  cod_evento           (ex: 1)
-        [3]  descricao            (ex: HORAS NORMAIS)
-        [4]  tipo_rubrica         P=Provento | D=Desconto | I=Informativa | ID=Inf.Dedutora
-        ...  demais campos ignorados
-
-    Mapeamento tipo_rubrica → tipo_norm:
-        P   → Provento
-        D   → Desconto
-        I   → Informativa
-        ID  → Inf. dedutora
+    Lê rubricas.txt e retorna:
+    { cod (str): {"tipo": str, "descricao": str} }
+    Tipos: P=Provento | D=Desconto | I=Informativa | ID=Inf.Dedutora
     """
     catalog = {}
     TIPO_MAP = {
         "P":  "Provento",
         "D":  "Desconto",
         "I":  "Informativa",
-        "ID": "Inf. dedutora",
+        "ID": "Inf. Dedutora",
     }
-
     try:
         texto = file_bytes.decode("latin-1", errors="replace")
     except Exception as e:
         log.append(f"ERRO ao decodificar rubricas.txt: {e}")
         return catalog
 
-    linhas_lidas    = 0
-    linhas_validas  = 0
-    tipos_ignorados = set()
-
     for raw in texto.splitlines():
         raw = raw.strip()
         if not raw:
             continue
-
-        linhas_lidas += 1
         partes = raw.split("\t")
-
-        # Precisa de pelo menos 5 colunas: [0..4]
         if len(partes) < 5:
             continue
-
-        cod   = partes[2].strip()
-        tipo  = partes[4].strip().upper()
-
+        cod       = partes[2].strip()
+        descricao = partes[3].strip()
+        tipo_raw  = partes[4].strip().upper()
         if not cod:
             continue
-
-        tipo_norm = TIPO_MAP.get(tipo)
+        tipo_norm = TIPO_MAP.get(tipo_raw)
         if tipo_norm is None:
-            tipos_ignorados.add(tipo)
             continue
-
-        # Primeira ocorrência de cada código = mais confiável
         if cod not in catalog:
-            catalog[cod] = tipo_norm
-            linhas_validas += 1
+            catalog[cod] = {"tipo": tipo_norm, "descricao": descricao}
 
-    log.append(
-        f"rubricas.txt: {linhas_lidas} linha(s) lida(s) | "
-        f"{linhas_validas} código(s) único(s) mapeado(s)."
-    )
-    if tipos_ignorados:
-        log.append(
-            f"  ↳ Tipos não mapeados encontrados (ignorados): "
-            f"{', '.join(sorted(tipos_ignorados))}"
-        )
-
+    log.append(f"rubricas.txt: {len(catalog)} código(s) mapeado(s).")
     return catalog
 
 
 # ==============================
-# LINHAS A IGNORAR NO PDF DE ITENS NÃO CONFIGURADOS
+# PARSE DO PDF DE ITENS NÃO CONFIGURADOS
 # ==============================
 IGNORE_PATTERNS_NAO_CONFIG = [
     r"^RELAÇÃO DE RUBRICAS",
@@ -144,54 +95,55 @@ IGNORE_PATTERNS_NAO_CONFIG = [
     r"^Emissão",
     r"^Hora:",
     r"^Empresa:",
-    r"^Folha",
-    r"^Centro de Custo:",
     r"^Código\s+Descrição",
     r"^\s*$",
-    r"^Rescisão",
-    r"^Férias",
-    r"^Provisão",
-    r"^Empresa$",
 ]
 
-def should_ignore_nao_config(line: str) -> bool:
+SECAO_TIPO_FOLHA = {
+    "Folha Normal":       "1",
+    "Empresa":            "2",
+    "Férias":             "3",
+    "Rescisão":           "4",
+    "Provisão de Férias": "5",
+    "Provisão de 13º":    "6",
+    "Provisão de 13o":    "6",
+}
+
+SECAO_TIPO_FOLHA_DESC = {
+    "1": "Folha Normal",
+    "2": "Empresa",
+    "3": "Férias",
+    "4": "Rescisão",
+    "5": "Provisão de Férias",
+    "6": "Provisão de 13º",
+}
+
+def should_ignore(line: str) -> bool:
     for pat in IGNORE_PATTERNS_NAO_CONFIG:
         if re.search(pat, line, re.IGNORECASE):
             return True
     return False
 
+RE_SECAO = re.compile(
+    r"^(Folha Normal|Empresa|Férias|Rescisão|"
+    r"Provisão de Férias|Provisão de 13º|Provisão de 13o)$",
+    re.IGNORECASE,
+)
+RE_CC    = re.compile(r"^Centro de Custo:\s*(\d+)\s+(.+)$", re.IGNORECASE)
+RE_EVENT = re.compile(r"^\s*(\d+)\s+(.+)$")
 
-# ==============================
-# PARSE DO PDF DE ITENS NÃO CONFIGURADOS
-# ==============================
+
 def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
     """
-    Lê o PDF 'Rubricas/Itens não Configurados' e retorna lista de dicts:
-    [{ 'cod': str, 'descricao': str, 'tipo_folha': str, 'centro_custo': str }, ...]
+    Retorna lista de dicts:
+    { cod, descricao_pdf, tipo_folha, tipo_folha_desc,
+      centro_custo_cod, centro_custo_nome }
     """
-    eventos = []
-    vistos  = set()
-
-    SECAO_TIPO = {
-        "Folha Normal":       "1",
-        "Empresa":            "2",
-        "Férias":             "3",
-        "Rescisão":           "4",
-        "Provisão de Férias": "5",
-        "Provisão de 13º":    "6",
-        "Provisão de 13o":    "6",
-    }
-
-    RE_EVENTO = re.compile(r"^\s*(\d+)\s+(.+)$")
-    RE_SECAO  = re.compile(
-        r"^(Folha Normal|Empresa|Férias|Rescisão|"
-        r"Provisão de Férias|Provisão de 13º|Provisão de 13o)$",
-        re.IGNORECASE,
-    )
-    RE_CC = re.compile(r"^Centro de Custo:\s*(\d+)\s+(.+)$", re.IGNORECASE)
-
+    eventos   = []
+    vistos    = set()
     tipo_folha_atual   = "1"
-    centro_custo_atual = ""
+    cc_cod_atual       = ""
+    cc_nome_atual      = ""
 
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -203,206 +155,255 @@ def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
                 if not line:
                     continue
 
+                # Seção de tipo de folha
                 m_sec = RE_SECAO.match(line)
                 if m_sec:
                     sec = m_sec.group(1).strip()
-                    for k, v in SECAO_TIPO.items():
+                    for k, v in SECAO_TIPO_FOLHA.items():
                         if k.lower() in sec.lower():
                             tipo_folha_atual = v
                             break
                     continue
 
+                # Centro de Custo
                 m_cc = RE_CC.match(line)
                 if m_cc:
-                    centro_custo_atual = m_cc.group(1).strip()
+                    cc_cod_atual  = m_cc.group(1).strip()
+                    cc_nome_atual = m_cc.group(2).strip()
                     continue
 
-                if should_ignore_nao_config(line):
+                if should_ignore(line):
                     continue
 
-                m_ev = RE_EVENTO.match(line)
+                # Evento
+                m_ev = RE_EVENT.match(line)
                 if m_ev:
                     cod  = m_ev.group(1).strip()
                     desc = m_ev.group(2).strip()
-
                     if not cod.isdigit():
                         continue
-
-                    chave = (cod, tipo_folha_atual, centro_custo_atual)
+                    chave = (cod, tipo_folha_atual, cc_cod_atual)
                     if chave not in vistos:
                         vistos.add(chave)
                         eventos.append({
-                            "cod":          cod,
-                            "descricao":    desc,
-                            "tipo_folha":   tipo_folha_atual,
-                            "centro_custo": centro_custo_atual,
+                            "cod":               cod,
+                            "descricao_pdf":     desc,
+                            "tipo_folha":        tipo_folha_atual,
+                            "tipo_folha_desc":   SECAO_TIPO_FOLHA_DESC.get(tipo_folha_atual, tipo_folha_atual),
+                            "centro_custo_cod":  cc_cod_atual,
+                            "centro_custo_nome": cc_nome_atual,
                         })
 
-    log.append(
-        f"PDF Itens Não Configurados: {len(eventos)} evento(s) encontrado(s) "
-        f"(únicos por código + tipo + centro de custo)."
-    )
+    log.append(f"PDF: {len(eventos)} evento(s) extraído(s) (únicos por código+tipo+CC).")
     return eventos
 
 
 # ==============================
-# LEITURA DO EXCEL DE CONTAS CONTÁBEIS
+# GERAÇÃO DO EXCEL
 # ==============================
-def ler_excel_contas(file_bytes: bytes, log: list) -> dict:
+def gerar_excel(eventos: list, catalog: dict, log: list) -> bytes:
     """
-    Lê o Excel (aba 'evento') e retorna dict:
-    { (cod_seq, tipo_integ): { conta_debito, conta_credito, historico, complemento } }
+    Gera Excel com:
+    - Aba "Configuração" → tabela principal para preenchimento
+    - Aba "Resumo"       → estatísticas
     """
-    contas = {}
-    try:
-        xls = pd.ExcelFile(BytesIO(file_bytes))
-    except Exception as e:
-        log.append(f"AVISO: Não foi possível abrir o Excel: {e}")
-        return contas
+    linhas = []
+    sem_tipo = []
 
-    sheet = None
-    for candidate in ["evento", "Evento", "EVENTO", "Plan1"]:
-        if candidate in xls.sheet_names:
-            sheet = candidate
-            break
+    for ev in eventos:
+        cod  = ev["cod"]
+        info = catalog.get(cod, {})
+        tipo = info.get("tipo", "")
+        desc_rubrica = info.get("descricao", ev["descricao_pdf"])
 
-    if not sheet:
-        log.append(f"AVISO: Aba 'evento' não encontrada. Abas: {xls.sheet_names}")
-        return contas
+        if not tipo:
+            sem_tipo.append(cod)
 
-    try:
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, dtype=str)
-    except Exception as e:
-        log.append(f"AVISO: Erro ao ler aba '{sheet}': {e}")
-        return contas
-
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.dropna(how="all")
-
-    col_map = {}
-    for col in df.columns:
-        cl = col.lower()
-        if "sequencial" in cl or "seq" in cl:
-            col_map["seq"] = col
-        elif "tipo" in cl and "integr" in cl:
-            col_map["tipo"] = col
-        elif "débito" in cl or "debito" in cl:
-            col_map["debito"] = col
-        elif "crédito" in cl or "credito" in cl:
-            col_map["credito"] = col
-        elif "histórico" in cl or "historico" in cl:
-            col_map["historico"] = col
-        elif "complemento" in cl:
-            col_map["complemento"] = col
-
-    for _, row in df.iterrows():
-        seq  = str(row.get(col_map.get("seq",  ""), "") or "").strip()
-        tipo = str(row.get(col_map.get("tipo", ""), "") or "").strip()
-        deb  = str(row.get(col_map.get("debito",  ""), "") or "").strip()
-        cred = str(row.get(col_map.get("credito", ""), "") or "").strip()
-        hist = str(row.get(col_map.get("historico", ""), "") or "").strip()
-        comp = str(row.get(col_map.get("complemento", ""), "") or "").strip()
-
-        deb  = "" if deb.lower()  == "nan" else deb
-        cred = "" if cred.lower() == "nan" else cred
-        hist = "" if hist.lower() == "nan" else hist
-        comp = "" if comp.lower() == "nan" else comp
-
-        if seq and seq.lower() != "nan":
-            chave = (seq, tipo)
-            if chave not in contas:
-                contas[chave] = {
-                    "conta_debito":  deb,
-                    "conta_credito": cred,
-                    "historico":     hist,
-                    "complemento":   comp,
-                }
-
-    log.append(f"Excel: {len(contas)} configuração(ões) de contas carregada(s).")
-    return contas
-
-
-# ==============================
-# GERAÇÃO DO TXT DOMÍNIO
-# ==============================
-def gerar_txt_dominio(
-    eventos_nao_config: list,
-    catalog_tipos: dict,
-    contas_excel: dict,
-    cod_empresa_padrao: str,
-    log: list,
-) -> tuple[str, pd.DataFrame]:
-    """
-    Cruza eventos não configurados + tipos do catálogo + contas do Excel.
-    Gera o TXT no formato Domínio Separador.
-    """
-    linhas_txt   = []
-    dados_tabela = []
-
-    sem_tipo  = 0
-    sem_conta = 0
-    completos = 0
-
-    for ev in eventos_nao_config:
-        cod          = ev["cod"]
-        descricao    = ev["descricao"]
-        tipo_integ   = ev["tipo_folha"]
-        centro_custo = ev["centro_custo"]
-
-        # Busca tipo no catálogo (rubricas.txt)
-        tipo_rubrica = catalog_tipos.get(cod, "")
-
-        # Busca contas no Excel — tenta chave exata (cod, tipo) ou só cod
-        conta_info = contas_excel.get((cod, tipo_integ), {})
-        if not conta_info:
-            for k, v in contas_excel.items():
-                if k[0] == cod:
-                    conta_info = v
-                    break
-
-        conta_deb   = conta_info.get("conta_debito",  "")
-        conta_cred  = conta_info.get("conta_credito", "")
-        historico   = conta_info.get("historico",     "")
-        complemento = conta_info.get("complemento",   "")
-
-        # Status
-        if not tipo_rubrica:
-            status = "⚠️ Tipo não encontrado no catálogo"
-            sem_tipo += 1
-        elif not conta_deb and not conta_cred:
-            status = "ℹ️ Sem conta configurada no Excel"
-            sem_conta += 1
-        else:
-            status = f"✅ {tipo_rubrica}"
-            completos += 1
-
-        # Linha do TXT
-        linha = (
-            f"{cod_empresa_padrao}|{centro_custo}|{cod}|{tipo_integ}|"
-            f"{descricao}|{conta_deb}|{conta_cred}|{historico}|{complemento}|\n"
-        )
-        linhas_txt.append(linha)
-
-        dados_tabela.append({
-            "Código":          cod,
-            "Descrição":       descricao,
-            "Tipo Integração": tipo_integ,
-            "Centro Custo":    centro_custo,
-            "Tipo Rubrica":    tipo_rubrica or "—",
-            "Conta Débito":    conta_deb,
-            "Conta Crédito":   conta_cred,
-            "Histórico":       historico,
-            "Status":          status,
+        linhas.append({
+            # ── Identificação ──────────────────────────────────────
+            "Código Evento":        cod,
+            "Descrição (PDF)":      ev["descricao_pdf"],
+            "Descrição (Rubricas)": desc_rubrica,
+            "Tipo Rubrica":         tipo or "⚠️ Não encontrado",
+            "Tipo Folha (Nº)":      ev["tipo_folha"],
+            "Tipo Folha":           ev["tipo_folha_desc"],
+            "Cód. Centro de Custo": ev["centro_custo_cod"],
+            "Centro de Custo":      ev["centro_custo_nome"],
+            # ── Campos para preenchimento ──────────────────────────
+            "Conta Débito":         "",
+            "Conta Crédito":        "",
+            "Cód. Histórico":       "",
+            "Histórico":            "",
+            "Observação":           "",
         })
 
-    log.append(
-        f"Geração concluída → "
-        f"Completos: {completos} | "
-        f"Sem tipo no catálogo: {sem_tipo} | "
-        f"Sem conta no Excel: {sem_conta}"
+    df = pd.DataFrame(linhas)
+
+    # ── Resumo ────────────────────────────────────────────────────
+    total   = len(df)
+    p_count = len(df[df["Tipo Rubrica"] == "Provento"])
+    d_count = len(df[df["Tipo Rubrica"] == "Desconto"])
+    i_count = len(df[df["Tipo Rubrica"] == "Informativa"])
+    id_count= len(df[df["Tipo Rubrica"] == "Inf. Dedutora"])
+    nf_count= len(df[df["Tipo Rubrica"].str.startswith("⚠️")])
+
+    resumo_data = {
+        "Tipo":       ["Provento", "Desconto", "Informativa", "Inf. Dedutora", "Não encontrado", "TOTAL"],
+        "Quantidade": [p_count, d_count, i_count, id_count, nf_count, total],
+    }
+    df_resumo = pd.DataFrame(resumo_data)
+
+    # ── Escrita no Excel ──────────────────────────────────────────
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Configuração", index=False)
+        df_resumo.to_excel(writer, sheet_name="Resumo", index=False)
+
+        # Formatação aba Configuração
+        ws = writer.sheets["Configuração"]
+        _formatar_planilha(ws, df)
+
+        # Formatação aba Resumo
+        ws_r = writer.sheets["Resumo"]
+        _formatar_resumo(ws_r)
+
+    output.seek(0)
+    if sem_tipo:
+        log.append(
+            f"⚠️ {len(sem_tipo)} código(s) não encontrado(s) no rubricas.txt: "
+            f"{', '.join(sorted(set(sem_tipo))[:20])}"
+            f"{'...' if len(sem_tipo) > 20 else ''}"
+        )
+    log.append(f"Excel gerado: {total} linha(s) | "
+               f"P={p_count} D={d_count} I={i_count} ID={id_count} NF={nf_count}")
+    return output.read()
+
+
+def _formatar_planilha(ws, df: pd.DataFrame):
+    """Aplica larguras, cores de cabeçalho e destaque nas colunas a preencher."""
+    from openpyxl.styles import (
+        PatternFill, Font, Alignment, Border, Side, numbers
+    )
+    from openpyxl.utils import get_column_letter
+
+    # Larguras das colunas
+    larguras = {
+        "A": 14,  # Código Evento
+        "B": 38,  # Descrição PDF
+        "C": 38,  # Descrição Rubricas
+        "D": 16,  # Tipo Rubrica
+        "E": 14,  # Tipo Folha Nº
+        "F": 20,  # Tipo Folha
+        "G": 18,  # Cód. CC
+        "H": 22,  # Centro de Custo
+        "I": 16,  # Conta Débito   ← PREENCHER
+        "J": 16,  # Conta Crédito  ← PREENCHER
+        "K": 14,  # Cód. Histórico ← PREENCHER
+        "L": 42,  # Histórico      ← PREENCHER
+        "M": 30,  # Observação     ← PREENCHER
+    }
+    for col, w in larguras.items():
+        ws.column_dimensions[col].width = w
+
+    # Cores
+    COR_HEADER_INFO    = "444444"  # cinza escuro  → colunas de identificação
+    COR_HEADER_FILL    = "FF8000"  # laranja TR     → colunas a preencher
+    COR_PROVENTO       = "D4EDDA"  # verde claro
+    COR_DESCONTO       = "F8D7DA"  # vermelho claro
+    COR_INFORMATIVA    = "CCE5FF"  # azul claro
+    COR_INF_DED        = "FFF3CD"  # amarelo claro
+    COR_NAO_ENCONTRADO = "E2E3E5"  # cinza claro
+    COR_FILL_PREENCHER = "FFF8F0"  # laranja muito claro → células a preencher
+
+    borda = Border(
+        left=Side(style="thin"),  right=Side(style="thin"),
+        top=Side(style="thin"),   bottom=Side(style="thin"),
     )
 
-    return "".join(linhas_txt), pd.DataFrame(dados_tabela)
+    # Cabeçalho
+    COLS_PREENCHER = {9, 10, 11, 12, 13}  # I, J, K, L, M (1-based)
+    for col_idx, cell in enumerate(ws[1], start=1):
+        if col_idx in COLS_PREENCHER:
+            cell.fill      = PatternFill("solid", fgColor=COR_HEADER_FILL)
+            cell.font      = Font(bold=True, color="FFFFFF", size=10)
+        else:
+            cell.fill      = PatternFill("solid", fgColor=COR_HEADER_INFO)
+            cell.font      = Font(bold=True, color="FFFFFF", size=10)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = borda
+
+    ws.row_dimensions[1].height = 32
+
+    # Mapa tipo → cor de fundo
+    TIPO_COR = {
+        "Provento":      COR_PROVENTO,
+        "Desconto":      COR_DESCONTO,
+        "Informativa":   COR_INFORMATIVA,
+        "Inf. Dedutora": COR_INF_DED,
+    }
+
+    # Dados
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
+        tipo_val = ws.cell(row=row_idx, column=4).value or ""
+        cor_linha = TIPO_COR.get(tipo_val, COR_NAO_ENCONTRADO)
+
+        for col_idx, cell in enumerate(row, start=1):
+            cell.border    = borda
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            if col_idx in COLS_PREENCHER:
+                cell.fill = PatternFill("solid", fgColor=COR_FILL_PREENCHER)
+                cell.font = Font(size=10)
+            else:
+                cell.fill = PatternFill("solid", fgColor=cor_linha)
+                cell.font = Font(size=10)
+
+        ws.row_dimensions[row_idx].height = 18
+
+    # Congela cabeçalho
+    ws.freeze_panes = "A2"
+
+    # Filtro automático
+    ws.auto_filter.ref = ws.dimensions
+
+
+def _formatar_resumo(ws):
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+
+    borda = Border(
+        left=Side(style="thin"),  right=Side(style="thin"),
+        top=Side(style="thin"),   bottom=Side(style="thin"),
+    )
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 14
+
+    CORES = {
+        "Provento":      "D4EDDA",
+        "Desconto":      "F8D7DA",
+        "Informativa":   "CCE5FF",
+        "Inf. Dedutora": "FFF3CD",
+        "Não encontrado":"E2E3E5",
+        "TOTAL":         "FF8000",
+    }
+
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.border    = borda
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.font      = Font(size=10)
+
+    # Cabeçalho
+    for cell in ws[1]:
+        cell.fill = PatternFill("solid", fgColor="444444")
+        cell.font = Font(bold=True, color="FFFFFF", size=10)
+
+    # Linhas de dados
+    for row in ws.iter_rows(min_row=2):
+        tipo = row[0].value or ""
+        cor  = CORES.get(tipo, "FFFFFF")
+        for cell in row:
+            cell.fill = PatternFill("solid", fgColor=cor)
+            if tipo == "TOTAL":
+                cell.font = Font(bold=True, color="FFFFFF", size=11)
 
 
 # ==============================
@@ -410,7 +411,7 @@ def gerar_txt_dominio(
 # ==============================
 def main():
     st.set_page_config(
-        page_title="Domínio Sistemas | Integração Contábil",
+        page_title="Domínio | Gerador de Excel de Configuração",
         page_icon="🟠",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -424,109 +425,78 @@ def main():
                     margin-bottom:28px;">
             <h2 style="color:#FF8000; margin:0;
                        font-family:'Segoe UI',Arial,sans-serif;">
-                📊 Integração Contábil — Itens Não Configurados → Domínio
+                📊 Gerador de Excel — Configuração Contábil de Rubricas
                 &nbsp;|&nbsp; {VERSAO}
             </h2>
             <p style="color:#DDDDDD; margin:6px 0 0 0;
                       font-family:'Segoe UI',Arial,sans-serif;">
-                Faça upload dos 3 arquivos e clique em
-                <b>▶ Gerar arquivo Domínio</b>.
+                Gera planilha Excel com todas as rubricas não configuradas,
+                já com o tipo (Provento/Desconto/Informativa/Inf.Dedutora),
+                pronta para preenchimento das contas contábeis.
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # ── Sidebar ───────────────────────────────────────────────────────
     with st.sidebar:
-        st.markdown("### ⚙️ Configurações")
-        cod_empresa_padrao = st.text_input(
-            "Código da empresa (padrão)",
-            value="45",
-            help="Código da empresa no Domínio.",
-        )
-        st.markdown("---")
         st.markdown("### ℹ Sobre")
         st.markdown(f"**Versão:** {VERSAO}")
         st.markdown("**Thomson Reuters | Domínio Sistemas**")
+        st.markdown("---")
+        st.markdown("### 🎨 Legenda de cores")
+        st.markdown("🟢 **Verde** → Provento")
+        st.markdown("🔴 **Vermelho** → Desconto")
+        st.markdown("🔵 **Azul** → Informativa")
+        st.markdown("🟡 **Amarelo** → Inf. Dedutora")
+        st.markdown("⚪ **Cinza** → Não encontrado")
+        st.markdown("🟠 **Laranja** → Colunas a preencher")
 
     # ── Instruções ────────────────────────────────────────────────────
-    with st.expander("📖 **Instruções de Uso** — clique para expandir", expanded=False):
-        st.markdown(
-            """
-            <div class="instrucoes-box">
+    with st.expander("📖 **Como usar** — clique para expandir", expanded=True):
+        st.markdown("""
+        **1.** Faça upload do **PDF de Itens Não Configurados** e do **rubricas.txt**
 
-            <h4>🔹 Arquivos necessários</h4>
-            <ol>
-                <li><b>Rubricas/Itens não Configurados.pdf</b>: relatório gerado no Domínio
-                    em <i>Plano e Acumuladores → Rubricas/Itens não Configurados</i>.</li>
-                <li><b>rubricas.txt</b>: arquivo exportado do Domínio em
-                    <i>Plano e Acumuladores → Rubricas</i> (formato TSV com todos os campos).
-                    A coluna 5 (índice 4) contém o tipo:
-                    <code>P</code>=Provento, <code>D</code>=Desconto,
-                    <code>I</code>=Informativa, <code>ID</code>=Inf. dedutora.</li>
-                <li><b>Excel de Contas (.xlsx)</b>: planilha com as contas contábeis
-                    já configuradas (aba <code>evento</code>).</li>
-            </ol>
+        **2.** Clique em **▶ Gerar Excel**
 
-            <h4>🔹 O que o sistema faz</h4>
-            <ul>
-                <li>Lê todos os eventos sem configuração contábil do PDF 1.</li>
-                <li>Busca o <b>tipo de rubrica</b> (Provento/Desconto/Informativa/Inf. dedutora)
-                    de cada evento no TXT 2 — leitura direta do campo, sem regex.</li>
-                <li>Busca as <b>contas contábeis</b> (débito/crédito/histórico) no Excel.</li>
-                <li>Gera o <b>arquivo TXT</b> no formato Domínio Separador.</li>
-            </ul>
+        **3.** Baixe o Excel e preencha as colunas destacadas em **laranja**:
+        - **Conta Débito** — código da conta contábil a débito
+        - **Conta Crédito** — código da conta contábil a crédito
+        - **Cód. Histórico** — código do histórico padrão
+        - **Histórico** — texto do histórico (ex: `<<Competência>> - <<Descrição>>`)
+        - **Observação** — campo livre para anotações
 
-            <h4>🔹 Importar no Domínio</h4>
-            <p><b>Utilitários → Importação → Importação Padrão →
-            Leiaute Domínio Sistemas com Separador</b>.</p>
-
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        **4.** Use o Excel preenchido como referência para configurar no Domínio
+        ou importe via a ferramenta de integração contábil.
+        """)
 
     st.markdown("---")
 
     # ── Session state ─────────────────────────────────────────────────
-    defaults = {
-        "log":          [f"Aplicação pronta. Versão: {VERSAO}"],
-        "txt_gerado":   None,
-        "nome_arquivo": "dominio_integracao.txt",
-        "df_resultado": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+    if "log"          not in st.session_state: st.session_state.log          = [f"Pronto. Versão {VERSAO}"]
+    if "excel_gerado" not in st.session_state: st.session_state.excel_gerado = None
+    if "nome_arquivo" not in st.session_state: st.session_state.nome_arquivo = "configuracao_rubricas.xlsx"
+    if "df_preview"   not in st.session_state: st.session_state.df_preview   = None
 
     # ── Uploads ───────────────────────────────────────────────────────
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
-        pdf_nao_config = st.file_uploader(
-            "1️⃣ PDF — Itens Não Configurados",
+        pdf_file = st.file_uploader(
+            "1️⃣ PDF — Rubricas/Itens Não Configurados",
             type=["pdf"],
-            help="Relatório 'Rubricas/Itens não Configurados' do Domínio.",
         )
     with col2:
-        txt_rubricas = st.file_uploader(
-            "2️⃣ TXT — Rubricas (catálogo)",
+        txt_file = st.file_uploader(
+            "2️⃣ TXT — Rubricas (catálogo de tipos)",
             type=["txt"],
-            help="Arquivo rubricas.txt exportado do Domínio (TSV com tipo na coluna 5).",
-        )
-    with col3:
-        excel_contas = st.file_uploader(
-            "3️⃣ Excel — Contas Contábeis (opcional)",
-            type=["xlsx", "xls"],
-            help="Planilha com contas débito/crédito já configuradas (aba 'evento').",
         )
 
-    arquivos_ok = pdf_nao_config is not None and txt_rubricas is not None
+    arquivos_ok = pdf_file is not None and txt_file is not None
 
     col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
         gerar = st.button(
-            "▶ Gerar arquivo Domínio",
+            "▶ Gerar Excel",
             disabled=not arquivos_ok,
             use_container_width=True,
             type="primary",
@@ -535,110 +505,93 @@ def main():
         limpar = st.button("🗑 Limpar", use_container_width=True)
 
     if limpar:
-        for k, v in defaults.items():
-            st.session_state[k] = v
-        st.session_state.log = ["Campos limpos."]
+        st.session_state.log          = ["Campos limpos."]
+        st.session_state.excel_gerado = None
+        st.session_state.df_preview   = None
         st.rerun()
 
     # ── Processamento ─────────────────────────────────────────────────
     if gerar and arquivos_ok:
         log = ["Iniciando processamento..."]
 
-        # 1. Catálogo de tipos (rubricas.txt)
-        with st.spinner("Lendo rubricas.txt (catálogo de tipos)..."):
-            catalog_tipos = parse_rubricas_txt(txt_rubricas.read(), log)
+        with st.spinner("Lendo rubricas.txt..."):
+            catalog = parse_rubricas_txt(txt_file.read(), log)
 
-        # 2. Eventos não configurados (PDF)
         with st.spinner("Lendo PDF de Itens Não Configurados..."):
-            eventos = parse_nao_configurados_pdf(pdf_nao_config.read(), log)
+            eventos = parse_nao_configurados_pdf(pdf_file.read(), log)
 
         if not eventos:
-            log.append("AVISO: Nenhum evento encontrado no PDF de Itens Não Configurados.")
+            log.append("AVISO: Nenhum evento encontrado no PDF.")
+            st.session_state.log = log
+            st.rerun()
 
-        # 3. Contas do Excel (opcional)
-        contas_excel = {}
-        if excel_contas is not None:
-            with st.spinner("Lendo Excel de contas..."):
-                contas_excel = ler_excel_contas(excel_contas.read(), log)
+        with st.spinner("Gerando Excel..."):
+            excel_bytes = gerar_excel(eventos, catalog, log)
 
-        # 4. Geração do TXT
-        txt, df_resultado = gerar_txt_dominio(
-            eventos, catalog_tipos, contas_excel, cod_empresa_padrao, log
-        )
-
-        st.session_state.txt_gerado   = txt.encode("latin-1", errors="replace")
-        st.session_state.nome_arquivo = "dominio_integracao.txt"
-        st.session_state.df_resultado = df_resultado
+        st.session_state.excel_gerado = excel_bytes
+        st.session_state.nome_arquivo = "configuracao_rubricas_dominio.xlsx"
         st.session_state.log          = log
+
+        # Preview
+        linhas_preview = []
+        for ev in eventos:
+            cod  = ev["cod"]
+            info = catalog.get(cod, {})
+            linhas_preview.append({
+                "Código":        cod,
+                "Descrição":     ev["descricao_pdf"],
+                "Tipo":          info.get("tipo", "⚠️ Não encontrado"),
+                "Tipo Folha":    ev["tipo_folha_desc"],
+                "Centro Custo":  ev["centro_custo_nome"],
+            })
+        st.session_state.df_preview = pd.DataFrame(linhas_preview)
         st.rerun()
 
-    # ── Resultados ────────────────────────────────────────────────────
-    if st.session_state.txt_gerado is not None:
-        st.success("✅ Arquivo gerado com sucesso!")
+    # ── Resultado ─────────────────────────────────────────────────────
+    if st.session_state.excel_gerado is not None:
+        st.success("✅ Excel gerado com sucesso!")
         st.download_button(
-            label="⬇ Baixar TXT (Domínio Separador)",
-            data=st.session_state.txt_gerado,
+            label="⬇ Baixar Excel — Configuração Contábil",
+            data=st.session_state.excel_gerado,
             file_name=st.session_state.nome_arquivo,
-            mime="text/plain",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             type="primary",
         )
 
-        df = st.session_state.df_resultado
-        if df is not None and not df.empty:
+        if st.session_state.df_preview is not None:
+            df = st.session_state.df_preview
             total     = len(df)
-            completos = len(df[df["Status"].str.startswith("✅")])
-            sem_tipo  = len(df[df["Status"].str.startswith("⚠️")])
-            sem_conta = len(df[df["Status"].str.startswith("ℹ️")])
+            p_count   = len(df[df["Tipo"] == "Provento"])
+            d_count   = len(df[df["Tipo"] == "Desconto"])
+            i_count   = len(df[df["Tipo"] == "Informativa"])
+            id_count  = len(df[df["Tipo"] == "Inf. Dedutora"])
+            nf_count  = len(df[df["Tipo"].str.startswith("⚠️", na=False)])
 
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("📋 Total eventos", total)
-            m2.metric("✅ Completos",      completos)
-            m3.metric("⚠️ Sem tipo",       sem_tipo)
-            m4.metric("ℹ️ Sem conta",      sem_conta)
+            m1, m2, m3, m4, m5, m6 = st.columns(6)
+            m1.metric("📋 Total",         total)
+            m2.metric("🟢 Proventos",     p_count)
+            m3.metric("🔴 Descontos",     d_count)
+            m4.metric("🔵 Informativas",  i_count)
+            m5.metric("🟡 Inf. Dedutora", id_count)
+            m6.metric("⚪ Não encontrado",nf_count)
 
-            def highlight_row(row):
-                s = str(row.get("Status", ""))
-                if s.startswith("✅"):  return ["background-color:#d4edda"] * len(row)
-                if s.startswith("⚠️"): return ["background-color:#fff3cd"] * len(row)
-                if s.startswith("ℹ️"): return ["background-color:#cce5ff"] * len(row)
-                return [""] * len(row)
+            st.markdown("**Prévia dos dados (primeiras 50 linhas):**")
+
+            def highlight_tipo(row):
+                t = str(row.get("Tipo", ""))
+                if t == "Provento":      return ["background-color:#d4edda"] * len(row)
+                if t == "Desconto":      return ["background-color:#f8d7da"] * len(row)
+                if t == "Informativa":   return ["background-color:#cce5ff"] * len(row)
+                if t == "Inf. Dedutora": return ["background-color:#fff3cd"] * len(row)
+                return ["background-color:#e2e3e5"] * len(row)
 
             st.dataframe(
-                df.style.apply(highlight_row, axis=1),
+                df.head(50).style.apply(highlight_tipo, axis=1),
                 use_container_width=True,
             )
-
-            sem_tipo_df = df[df["Status"].str.startswith("⚠️")]
-            if not sem_tipo_df.empty:
-                with st.expander(
-                    f"⚠️ Eventos sem tipo no catálogo ({len(sem_tipo_df)}) "
-                    f"— código não encontrado no rubricas.txt"
-                ):
-                    st.dataframe(
-                        sem_tipo_df[["Código", "Descrição", "Tipo Integração", "Centro Custo"]],
-                        use_container_width=True,
-                    )
-
-            sem_conta_df = df[df["Status"].str.startswith("ℹ️")]
-            if not sem_conta_df.empty:
-                with st.expander(
-                    f"ℹ️ Eventos sem conta configurada ({len(sem_conta_df)}) "
-                    f"— configurar no Excel"
-                ):
-                    st.dataframe(
-                        sem_conta_df[["Código", "Descrição", "Tipo Integração",
-                                      "Tipo Rubrica", "Centro Custo"]],
-                        use_container_width=True,
-                    )
-
-            with st.expander("👁️ Prévia do arquivo gerado (primeiras 30 linhas)"):
-                preview = "".join(
-                    st.session_state.txt_gerado
-                    .decode("latin-1", errors="replace")
-                    .splitlines(True)[:30]
-                )
-                st.code(preview, language="text")
+            if len(df) > 50:
+                st.caption(f"Mostrando 50 de {len(df)} linhas. Baixe o Excel para ver todas.")
 
     # ── Log ───────────────────────────────────────────────────────────
     st.markdown("---")
@@ -651,7 +604,7 @@ def main():
         <div style="background:#FCFCFC; border:1px solid {cor_borda};
                     border-radius:6px; padding:14px;
                     font-family:Consolas,monospace; font-size:13px;
-                    white-space:pre-wrap; max-height:340px;
+                    white-space:pre-wrap; max-height:300px;
                     overflow-y:auto; color:#1F1F1F;">
 {log_texto}
         </div>
