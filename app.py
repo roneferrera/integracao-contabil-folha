@@ -1,8 +1,9 @@
 # ============================================================
-# app_integracao_dominio.py  –  Integração Contábil Domínio V3.0
+# app_integracao_dominio.py  –  Integração Contábil Domínio V3.1
 # Entradas:
 #   1. RubricasItens não Configurados.pdf  → eventos sem config contábil
 #   2. rubricas.txt                        → catálogo de tipos de rubrica
+#   3. Contas.xls (NOVO)                   → plano de contas para lookup
 # Fluxo:
 #   ETAPA 1 → Gera Excel para preenchimento das contas
 #   ETAPA 2 → Importa Excel preenchido → gera evento exemplo.xlsx + integra exemplo.xls
@@ -16,7 +17,7 @@ from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSAO = "V3.0"
+VERSAO = "V3.1"
 
 # ==============================
 # TEMA TR
@@ -40,6 +41,13 @@ def apply_tr_theme():
             border: none; border-radius: 4px; font-weight: bold;
         }
         .stDownloadButton > button:hover { background-color: #D64001; color: #FFFFFF; }
+        .conta-card {
+            background: #FFF8F0;
+            border: 1px solid #FF8000;
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+        }
         </style>
     """, unsafe_allow_html=True)
 
@@ -74,6 +82,99 @@ def parse_rubricas_txt(file_bytes: bytes, log: list) -> dict:
             catalog[cod] = {"tipo": tipo_norm, "descricao": descricao}
     log.append(f"rubricas.txt: {len(catalog)} código(s) mapeado(s).")
     return catalog
+
+
+# ==============================
+# PARSE DO PLANO DE CONTAS (XLS/XLSX)
+# ==============================
+def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
+    """
+    Lê o arquivo de Plano de Contas e retorna DataFrame normalizado com:
+    codigo_conta, classificacao, nome_conta, tipo (S=sintética, A=analítica)
+    """
+    try:
+        xls = pd.ExcelFile(BytesIO(file_bytes))
+    except Exception as e:
+        log.append(f"ERRO ao abrir Plano de Contas: {e}")
+        return pd.DataFrame()
+
+    sheet = xls.sheet_names[0]
+    try:
+        df_raw = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, header=None, dtype=str)
+    except Exception as e:
+        log.append(f"ERRO ao ler Plano de Contas: {e}")
+        return pd.DataFrame()
+
+    # O arquivo tem estrutura peculiar - vamos extrair classificação e nome
+    # Identificar linhas de dados reais (com classificação numérica)
+    registros = []
+    
+    for _, row in df_raw.iterrows():
+        row_vals = [str(v).strip() if pd.notna(v) and str(v).strip() not in ("nan", "None", "") else "" for v in row]
+        
+        # Buscar classificação (padrão X.X.X.XX.XXXXXX)
+        classificacao = ""
+        nome_conta = ""
+        tipo_conta = ""
+        
+        for val in row_vals:
+            if re.match(r'^\d+(\.\d+)+$', val) and not classificacao:
+                classificacao = val
+            elif val == "S" or val == "A":
+                tipo_conta = val
+        
+        # Nome da conta: último valor não vazio que não seja classificação nem tipo
+        vals_nao_vazios = [v for v in row_vals if v and v not in ("S", "A") 
+                          and not re.match(r'^\d+(\.\d+)*\.?$', v)
+                          and not re.match(r'^\d+\.\d+$', v)]
+        
+        if vals_nao_vazios:
+            nome_conta = vals_nao_vazios[-1]
+        
+        if classificacao and nome_conta:
+            registros.append({
+                "classificacao": classificacao,
+                "nome_conta": nome_conta,
+                "tipo": tipo_conta,
+                "nivel": len(classificacao.split(".")),
+            })
+    
+    df_contas = pd.DataFrame(registros).drop_duplicates(subset=["classificacao"])
+    
+    # Filtrar apenas contas analíticas (nível mais profundo / sem S)
+    # Contas analíticas são as que podem receber lançamentos
+    df_analiticas = df_contas[df_contas["tipo"] != "S"].copy() if not df_contas.empty else df_contas
+    
+    log.append(f"Plano de Contas: {len(df_contas)} conta(s) total, {len(df_analiticas)} analítica(s).")
+    return df_contas
+
+
+def get_contas_para_select(df_contas: pd.DataFrame, filtro: str = "") -> list:
+    """Retorna lista formatada 'CLASSIFICACAO - NOME' para selectbox."""
+    if df_contas.empty:
+        return ["(Sem plano de contas)"]
+    
+    df_filtrado = df_contas[df_contas["tipo"] != "S"].copy()
+    
+    if filtro:
+        mask = (
+            df_filtrado["classificacao"].str.contains(filtro, case=False, na=False) |
+            df_filtrado["nome_conta"].str.contains(filtro, case=False, na=False)
+        )
+        df_filtrado = df_filtrado[mask]
+    
+    opcoes = [""] + [
+        f"{row['classificacao']} - {row['nome_conta']}"
+        for _, row in df_filtrado.iterrows()
+    ]
+    return opcoes
+
+
+def extrair_classificacao(opcao_str: str) -> str:
+    """Extrai só a classificação de uma string 'CLASSIF - NOME'."""
+    if not opcao_str or " - " not in opcao_str:
+        return opcao_str or ""
+    return opcao_str.split(" - ")[0].strip()
 
 
 # ==============================
@@ -178,15 +279,111 @@ def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
 
 
 # ==============================
+# CLASSIFICAÇÃO DE GRUPOS POR CENTRO DE CUSTO (COM SEPARADOR)
+# ==============================
+GRUPOS_DESPESA_PADRAO = [
+    "Custo Direto de Produção",
+    "Custo Direto de Serviços",
+    "Custo Indireto de Produção",
+    "Despesa Administrativa",
+    "Despesa com Vendas",
+    "Despesa Financeira",
+    "Despesa Não Operacional",
+    "Outro",
+]
+
+# Mapeamento de grupo → prefixos de conta sugeridos no plano de contas
+GRUPO_CONTA_PREFIXO = {
+    "Custo Direto de Produção":   ["4.1.1", "4.1.2"],
+    "Custo Direto de Serviços":   ["4.1.3"],
+    "Custo Indireto de Produção": ["4.1.2"],
+    "Despesa Administrativa":     ["4.2.2"],
+    "Despesa com Vendas":         ["4.2.1"],
+    "Despesa Financeira":         ["4.2.2.06"],
+    "Despesa Não Operacional":    ["4.3"],
+    "Outro":                      [],
+}
+
+
+def get_contas_por_grupo(df_contas: pd.DataFrame, grupo: str) -> list:
+    """Filtra contas analíticas pelo prefixo do grupo selecionado."""
+    if df_contas.empty:
+        return [""]
+    
+    prefixos = GRUPO_CONTA_PREFIXO.get(grupo, [])
+    df_anal = df_contas[df_contas["tipo"] != "S"].copy()
+    
+    if not prefixos:
+        # Retorna todas as analíticas
+        opcoes = [""] + [
+            f"{r['classificacao']} - {r['nome_conta']}"
+            for _, r in df_anal.iterrows()
+        ]
+        return opcoes
+    
+    mask = df_anal["classificacao"].apply(
+        lambda c: any(c.startswith(p) for p in prefixos)
+    )
+    df_filtrado = df_anal[mask]
+    
+    if df_filtrado.empty:
+        # fallback: todas
+        df_filtrado = df_anal
+    
+    opcoes = [""] + [
+        f"{r['classificacao']} - {r['nome_conta']}"
+        for _, r in df_filtrado.iterrows()
+    ]
+    return opcoes
+
+
+def get_centros_custo_unicos(eventos: list) -> list:
+    """Retorna lista de (cod, nome) únicos dos centros de custo."""
+    vistos = {}
+    for ev in eventos:
+        cod = ev["centro_custo_cod"]
+        nome = ev["centro_custo_nome"]
+        if cod and cod not in vistos:
+            vistos[cod] = nome
+    return [(cod, nome) for cod, nome in vistos.items()]
+
+
+# ==============================
 # ETAPA 1 — GERA EXCEL PARA PREENCHIMENTO
 # ==============================
-def gerar_excel_configuracao(eventos: list, catalog: dict, cod_empresa: str, log: list) -> bytes:
+def gerar_excel_configuracao(
+    eventos: list,
+    catalog: dict,
+    cod_empresa: str,
+    log: list,
+    usa_separador: bool = False,
+    config_cc: dict = None,   # {cc_cod: {"grupo": str, "conta_debito": str, "conta_credito": str, "historico": str}}
+    df_contas: pd.DataFrame = None,
+) -> bytes:
+    """
+    config_cc: dict com configurações por centro de custo quando usa_separador=True
+    """
     linhas = []
     for ev in eventos:
         cod = ev["cod"]
         info = catalog.get(cod, {})
         tipo = info.get("tipo", "⚠️ Não encontrado")
         desc_rubrica = info.get("descricao", ev["descricao_pdf"])
+        cc_cod = ev["centro_custo_cod"]
+        
+        # Preencher contas automaticamente se usa_separador e há config para este CC
+        conta_deb_auto = ""
+        conta_cred_auto = ""
+        historico_auto = ""
+        grupo_auto = ""
+        
+        if usa_separador and config_cc and cc_cod in config_cc:
+            cfg = config_cc[cc_cod]
+            conta_deb_auto = cfg.get("conta_debito", "")
+            conta_cred_auto = cfg.get("conta_credito", "")
+            historico_auto = cfg.get("historico", "")
+            grupo_auto = cfg.get("grupo", "")
+        
         linhas.append({
             # Identificação (somente leitura)
             "Cód. Empresa":          cod_empresa,
@@ -196,13 +393,15 @@ def gerar_excel_configuracao(eventos: list, catalog: dict, cod_empresa: str, log
             "Tipo Rubrica":          tipo,
             "Tipo Folha (Nº)":       ev["tipo_folha"],
             "Tipo Folha":            ev["tipo_folha_desc"],
-            "Cód. Centro de Custo":  ev["centro_custo_cod"],
+            "Cód. Centro de Custo":  cc_cod,
             "Centro de Custo":       ev["centro_custo_nome"],
-            # Campos a preencher
-            "Conta Débito":          "",
-            "Conta Crédito":         "",
+            "Grupo de Despesa":      grupo_auto,
+            "Usa Separador":         "Sim" if usa_separador else "Não",
+            # Campos a preencher (pré-preenchidos se usa_separador)
+            "Conta Débito":          conta_deb_auto,
+            "Conta Crédito":         conta_cred_auto,
             "Cód. Histórico":        "",
-            "Histórico":             "",
+            "Histórico":             historico_auto,
             "Observação":            "",
         })
 
@@ -213,9 +412,17 @@ def gerar_excel_configuracao(eventos: list, catalog: dict, cod_empresa: str, log
         df.to_excel(writer, sheet_name="Configuração", index=False)
         ws = writer.sheets["Configuração"]
         _formatar_planilha_config(ws, df)
+        
+        # Se há plano de contas, exportar como aba de referência
+        if df_contas is not None and not df_contas.empty:
+            df_contas_exp = df_contas[["classificacao", "nome_conta", "tipo"]].copy()
+            df_contas_exp.columns = ["Classificação", "Nome da Conta", "Tipo (S/A)"]
+            df_contas_exp.to_excel(writer, sheet_name="Plano de Contas", index=False)
+            ws_pc = writer.sheets["Plano de Contas"]
+            _formatar_planilha_saida(ws_pc)
 
     output.seek(0)
-    log.append(f"Excel de configuração gerado: {len(linhas)} linha(s).")
+    log.append(f"Excel de configuração gerado: {len(linhas)} linha(s). Separador: {'Sim' if usa_separador else 'Não'}.")
     return output.read()
 
 
@@ -226,16 +433,19 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
     )
     larguras = {
         "A": 12, "B": 12, "C": 38, "D": 38, "E": 16,
-        "F": 14, "G": 20, "H": 18, "I": 22,
-        "J": 16, "K": 16, "L": 14, "M": 42, "N": 30,
+        "F": 14, "G": 20, "H": 18, "I": 22, "J": 22,
+        "K": 14, "L": 16, "M": 16, "N": 14, "O": 42, "P": 30,
     }
     for col, w in larguras.items():
         ws.column_dimensions[col].width = w
 
-    COR_HEADER_INFO  = "444444"
-    COR_HEADER_FILL  = "FF8000"
+    COR_HEADER_INFO   = "444444"
+    COR_HEADER_FILL   = "FF8000"
     COR_FILL_PREENCHER = "FFF8F0"
-    COLS_PREENCHER = {10, 11, 12, 13, 14}  # J-N (1-based)
+    # Colunas a preencher: L(12), M(13), N(14), O(15), P(16)
+    COLS_PREENCHER = {12, 13, 14, 15, 16}
+    # Coluna grupo e separador: J(10), K(11) - informativas
+    COLS_INFO_EXTRA = {10, 11}
 
     TIPO_COR = {
         "Provento":      "D4EDDA",
@@ -247,6 +457,9 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
     for col_idx, cell in enumerate(ws[1], start=1):
         if col_idx in COLS_PREENCHER:
             cell.fill = PatternFill("solid", fgColor=COR_HEADER_FILL)
+            cell.font = Font(bold=True, color="FFFFFF", size=10)
+        elif col_idx in COLS_INFO_EXTRA:
+            cell.fill = PatternFill("solid", fgColor="6C757D")
             cell.font = Font(bold=True, color="FFFFFF", size=10)
         else:
             cell.fill = PatternFill("solid", fgColor=COR_HEADER_INFO)
@@ -311,24 +524,6 @@ def _limpa(val) -> str:
 
 
 def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) -> tuple[bytes, bytes]:
-    """
-    Retorna (evento_exemplo_xlsx, integra_exemplo_xls)
-
-    Formato evento exemplo.xlsx (aba 'evento'):
-      Código da Empresa | Centro de custo | Código Sequencial da Integração |
-      Tipo da Integração | Descrição | Código da Conta Débito |
-      Código da Conta Crédito | Código do Histórico | Complemento
-
-    Formato evento exemplo.xlsx (aba 'integra'):
-      Código da Empresa | Separador | Código Sequencial da Integração |
-      Tipo da Integração | Código da Rúbrica Selecionada
-
-    Formato integra exemplo.xls (Plan1):
-      Código da Empresa | Centro de Custo | Código Sequencial da Integração |
-      Tipo da Integração | Descrição | Código da Conta Crédito |
-      Código da Conta Débito | Código do Histórico
-    """
-    # Mapeamento de colunas do Excel preenchido
     col_map = {}
     for col in df.columns:
         cl = col.lower()
@@ -354,6 +549,8 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
             col_map["historico_texto"] = col
         elif "observação" in cl:
             col_map["observacao"] = col
+        elif "usa separador" in cl:
+            col_map["usa_separador"] = col
 
     linhas_evento = []
     linhas_integra = []
@@ -372,16 +569,19 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
         credito  = _limpa(row.get(col_map.get("credito", ""), ""))
         historico = _limpa(row.get(col_map.get("historico", ""), ""))
         complemento = _limpa(row.get(col_map.get("historico_texto", ""), ""))
+        usa_sep  = _limpa(row.get(col_map.get("usa_separador", ""), ""))
 
         if not seq:
             continue
+
+        # Determinar separador
+        separador_val = "1" if usa_sep.lower() == "sim" else "0"
 
         if debito or credito:
             com_conta += 1
         else:
             sem_conta += 1
 
-        # ── Aba 'evento' do evento exemplo.xlsx ──────────────────────────
         linhas_evento.append({
             "Código da Empresa": empresa,
             "Centro de custo": cc,
@@ -394,16 +594,14 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
             "Complemento": complemento,
         })
 
-        # ── Aba 'integra' do evento exemplo.xlsx ─────────────────────────
         linhas_integra.append({
             "Código da Empresa": empresa,
-            "Separador": "0",
+            "Separador": separador_val,
             "Código Sequencial da Integração": seq,
             "Tipo da Integração (1 - Folha mensal; 2 - Empresa; 3 - Férias; 4 - Rescisao; 5 - Prov. Férias; 6 - Prov. 13)": tipo,
             "Código da Rúbrica Selecionada": seq,
         })
 
-        # ── Plan1 do integra exemplo.xls ─────────────────────────────────
         linhas_integra_xls.append({
             "Código da Empresa": empresa,
             "Centro de Custo": cc,
@@ -415,22 +613,17 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
             "Código do Histórico": historico,
         })
 
-    log.append(
-        f"Arquivos gerados → Com conta: {com_conta} | Sem conta: {sem_conta}"
-    )
+    log.append(f"Arquivos gerados → Com conta: {com_conta} | Sem conta: {sem_conta}")
 
-    # ── Gera evento exemplo.xlsx (2 abas: integra + evento) ──────────────
     buf_evento = BytesIO()
     with pd.ExcelWriter(buf_evento, engine="openpyxl") as writer:
         pd.DataFrame(linhas_integra).to_excel(writer, sheet_name="integra", index=False)
         pd.DataFrame(linhas_evento).to_excel(writer, sheet_name="evento", index=False)
-        # Formata ambas as abas
         for sheet_name in ["integra", "evento"]:
             ws = writer.sheets[sheet_name]
             _formatar_planilha_saida(ws)
     buf_evento.seek(0)
 
-    # ── Gera integra exemplo.xls (Plan1) ─────────────────────────────────
     buf_integra = BytesIO()
     with pd.ExcelWriter(buf_integra, engine="openpyxl") as writer:
         pd.DataFrame(linhas_integra_xls).to_excel(writer, sheet_name="Plan1", index=False)
@@ -446,7 +639,6 @@ def _formatar_planilha_saida(ws):
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin"),
     )
-    # Cabeçalho
     for cell in ws[1]:
         cell.fill = PatternFill("solid", fgColor="444444")
         cell.font = Font(bold=True, color="FFFFFF", size=10)
@@ -454,14 +646,12 @@ def _formatar_planilha_saida(ws):
         cell.border = borda
     ws.row_dimensions[1].height = 32
 
-    # Dados
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             cell.border = borda
             cell.alignment = Alignment(vertical="center")
             cell.font = Font(size=10)
 
-    # Larguras automáticas
     for col in ws.columns:
         max_len = 0
         col_letter = get_column_letter(col[0].column)
@@ -522,14 +712,18 @@ def main():
         st.markdown("**Thomson Reuters | Domínio Sistemas**")
 
     # ── Session state ─────────────────────────────────────────────────────
-    for k, v in {
+    defaults = {
         "log": [f"Pronto. Versão {VERSAO}"],
         "excel_config": None,
         "evento_xlsx": None,
         "integra_xls": None,
         "df_preview": None,
         "n_eventos": 0,
-    }.items():
+        "df_contas": None,
+        "eventos_parsed": None,
+        "config_cc": {},
+    }
+    for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -538,7 +732,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     st.markdown("## 📋 Etapa 1 — Gerar Excel para Preenchimento")
 
-    col1, col2 = st.columns(2)
+    col1, col2, col3 = st.columns(3)
     with col1:
         pdf_file = st.file_uploader(
             "1️⃣ PDF — Rubricas/Itens Não Configurados",
@@ -551,7 +745,157 @@ def main():
             type=["txt"],
             key="txt_etapa1",
         )
+    with col3:
+        contas_file = st.file_uploader(
+            "3️⃣ XLS/XLSX — Plano de Contas (opcional)",
+            type=["xls", "xlsx"],
+            key="contas_etapa1",
+        )
 
+    # Carregar plano de contas ao fazer upload
+    if contas_file is not None and st.session_state.df_contas is None:
+        log_temp = []
+        df_c = parse_plano_contas(contas_file.read(), log_temp)
+        if not df_c.empty:
+            st.session_state.df_contas = df_c
+            st.session_state.log.extend(log_temp)
+            st.rerun()
+
+    if contas_file is None:
+        st.session_state.df_contas = None
+
+    # Mostrar info do plano de contas carregado
+    if st.session_state.df_contas is not None:
+        df_pc = st.session_state.df_contas
+        n_analiticas = len(df_pc[df_pc["tipo"] != "S"])
+        st.success(f"✅ Plano de Contas carregado: **{len(df_pc)}** contas ({n_analiticas} analíticas)")
+
+    st.markdown("---")
+
+    # ── Configuração de Separador ─────────────────────────────────────────
+    st.markdown("### ⚙️ Configuração de Separador")
+
+    col_sep1, col_sep2 = st.columns([1, 2])
+    with col_sep1:
+        usa_separador = st.radio(
+            "Os lançamentos usam separador por Centro de Custo?",
+            options=["Não", "Sim"],
+            index=0,
+            horizontal=True,
+            help="Com separador: cada Centro de Custo recebe um grupo de despesa e contas específicas.",
+        )
+    usa_sep_bool = (usa_separador == "Sim")
+
+    # ── Configuração por CC quando separador ativo ────────────────────────
+    if usa_sep_bool:
+        # Precisa ter eventos parseados para mostrar os CCs
+        if st.session_state.eventos_parsed:
+            ccs = get_centros_custo_unicos(st.session_state.eventos_parsed)
+            
+            if ccs:
+                st.markdown("#### 🏢 Classificação por Centro de Custo")
+                st.info(
+                    "Para cada Centro de Custo, selecione o **Grupo de Despesa** e as **contas contábeis** "
+                    "que serão aplicadas aos eventos desse CC."
+                )
+
+                df_contas_atual = st.session_state.df_contas
+
+                for cc_cod, cc_nome in ccs:
+                    with st.expander(f"🏢 CC {cc_cod} — {cc_nome}", expanded=True):
+                        col_g, col_d, col_c, col_h = st.columns([2, 3, 3, 2])
+                        
+                        cfg_atual = st.session_state.config_cc.get(cc_cod, {})
+                        
+                        with col_g:
+                            grupo_sel = st.selectbox(
+                                "Grupo de Despesa",
+                                options=GRUPOS_DESPESA_PADRAO,
+                                index=GRUPOS_DESPESA_PADRAO.index(cfg_atual.get("grupo", "Outro"))
+                                      if cfg_atual.get("grupo") in GRUPOS_DESPESA_PADRAO else 0,
+                                key=f"grupo_{cc_cod}",
+                            )
+                        
+                        # Filtrar contas pelo grupo selecionado
+                        if df_contas_atual is not None and not df_contas_atual.empty:
+                            opcoes_contas = get_contas_por_grupo(df_contas_atual, grupo_sel)
+                        else:
+                            opcoes_contas = ["(Carregue o Plano de Contas para sugestões)"]
+                        
+                        with col_d:
+                            deb_atual = cfg_atual.get("conta_debito", "")
+                            # Tentar encontrar índice atual
+                            idx_deb = 0
+                            for i, op in enumerate(opcoes_contas):
+                                if deb_atual and (deb_atual in op or op.startswith(deb_atual)):
+                                    idx_deb = i
+                                    break
+                            conta_deb_sel = st.selectbox(
+                                "Conta Débito",
+                                options=opcoes_contas,
+                                index=idx_deb,
+                                key=f"debito_{cc_cod}",
+                            )
+                        
+                        with col_c:
+                            cred_atual = cfg_atual.get("conta_credito", "")
+                            idx_cred = 0
+                            for i, op in enumerate(opcoes_contas):
+                                if cred_atual and (cred_atual in op or op.startswith(cred_atual)):
+                                    idx_cred = i
+                                    break
+                            conta_cred_sel = st.selectbox(
+                                "Conta Crédito",
+                                options=opcoes_contas,
+                                index=idx_cred,
+                                key=f"credito_{cc_cod}",
+                            )
+                        
+                        with col_h:
+                            hist_sel = st.text_input(
+                                "Histórico",
+                                value=cfg_atual.get("historico", ""),
+                                key=f"hist_{cc_cod}",
+                                placeholder="Ex: 001",
+                            )
+                        
+                        # Salvar config no session_state
+                        st.session_state.config_cc[cc_cod] = {
+                            "grupo": grupo_sel,
+                            "conta_debito": extrair_classificacao(conta_deb_sel),
+                            "conta_credito": extrair_classificacao(conta_cred_sel),
+                            "historico": hist_sel,
+                        }
+                        
+                        # Preview das contas selecionadas
+                        deb_exib = extrair_classificacao(conta_deb_sel)
+                        cred_exib = extrair_classificacao(conta_cred_sel)
+                        if deb_exib or cred_exib:
+                            st.markdown(
+                                f"<small>✅ <b>Débito:</b> {deb_exib or '—'} &nbsp;|&nbsp; "
+                                f"<b>Crédito:</b> {cred_exib or '—'} &nbsp;|&nbsp; "
+                                f"<b>Grupo:</b> {grupo_sel}</small>",
+                                unsafe_allow_html=True,
+                            )
+            else:
+                st.warning("Nenhum Centro de Custo encontrado. Processe o PDF primeiro.")
+        else:
+            st.info("⬆️ Faça upload do PDF e clique em **▶ Processar PDF** para configurar os Centros de Custo.")
+            
+            # Botão para processar só o PDF (sem gerar Excel ainda)
+            if pdf_file and txt_file:
+                if st.button("🔍 Processar PDF (pré-visualizar CCs)", use_container_width=False):
+                    log = list(st.session_state.log)
+                    with st.spinner("Lendo arquivos..."):
+                        catalog = parse_rubricas_txt(txt_file.read(), log)
+                        eventos = parse_nao_configurados_pdf(pdf_file.read(), log)
+                    st.session_state.eventos_parsed = eventos
+                    st.session_state.log = log
+                    st.rerun()
+
+    st.markdown("---")
+
+    # ── Botões principais ─────────────────────────────────────────────────
     col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
         gerar_excel = st.button(
@@ -562,9 +906,16 @@ def main():
         )
     with col_btn2:
         if st.button("🗑 Limpar tudo", use_container_width=True):
-            for k in ["log", "excel_config", "evento_xlsx", "integra_xls", "df_preview", "n_eventos"]:
-                st.session_state[k] = [] if k == "log" else None if k != "n_eventos" else 0
-            st.session_state.log = ["Campos limpos."]
+            for k in ["log", "excel_config", "evento_xlsx", "integra_xls",
+                      "df_preview", "n_eventos", "df_contas", "eventos_parsed", "config_cc"]:
+                if k == "log":
+                    st.session_state[k] = ["Campos limpos."]
+                elif k == "n_eventos":
+                    st.session_state[k] = 0
+                elif k == "config_cc":
+                    st.session_state[k] = {}
+                else:
+                    st.session_state[k] = None
             st.rerun()
 
     if gerar_excel and pdf_file and txt_file:
@@ -573,25 +924,40 @@ def main():
             catalog = parse_rubricas_txt(txt_file.read(), log)
         with st.spinner("Lendo PDF de Itens Não Configurados..."):
             eventos = parse_nao_configurados_pdf(pdf_file.read(), log)
+        
+        st.session_state.eventos_parsed = eventos
+        
         if not eventos:
             log.append("AVISO: Nenhum evento encontrado no PDF.")
         else:
             with st.spinner("Gerando Excel..."):
-                excel_bytes = gerar_excel_configuracao(eventos, catalog, cod_empresa, log)
+                excel_bytes = gerar_excel_configuracao(
+                    eventos,
+                    catalog,
+                    cod_empresa,
+                    log,
+                    usa_separador=usa_sep_bool,
+                    config_cc=st.session_state.config_cc if usa_sep_bool else None,
+                    df_contas=st.session_state.df_contas,
+                )
             st.session_state.excel_config = excel_bytes
             st.session_state.n_eventos = len(eventos)
 
-            # Preview
             linhas_prev = []
             for ev in eventos:
-                cod = ev["cod"]
-                info = catalog.get(cod, {})
+                cod_ev = ev["cod"]
+                info = catalog.get(cod_ev, {})
+                cc_cod = ev["centro_custo_cod"]
+                cfg_cc = st.session_state.config_cc.get(cc_cod, {}) if usa_sep_bool else {}
                 linhas_prev.append({
-                    "Código": cod,
+                    "Código": cod_ev,
                     "Descrição": ev["descricao_pdf"],
                     "Tipo": info.get("tipo", "⚠️"),
                     "Tipo Folha": ev["tipo_folha_desc"],
                     "Centro Custo": ev["centro_custo_nome"],
+                    "Grupo": cfg_cc.get("grupo", "—"),
+                    "Conta Débito": cfg_cc.get("conta_debito", ""),
+                    "Conta Crédito": cfg_cc.get("conta_credito", ""),
                 })
             st.session_state.df_preview = pd.DataFrame(linhas_prev)
         st.session_state.log = log
@@ -612,11 +978,12 @@ def main():
         if st.session_state.df_preview is not None:
             df = st.session_state.df_preview
             total = len(df)
-            p = len(df[df["Tipo"] == "Provento"])
-            d = len(df[df["Tipo"] == "Desconto"])
-            i = len(df[df["Tipo"] == "Informativa"])
+            p  = len(df[df["Tipo"] == "Provento"])
+            d  = len(df[df["Tipo"] == "Desconto"])
+            i  = len(df[df["Tipo"] == "Informativa"])
             id_ = len(df[df["Tipo"] == "Inf. Dedutora"])
             nf = len(df[df["Tipo"].str.startswith("⚠️", na=False)])
+            
             m1, m2, m3, m4, m5, m6 = st.columns(6)
             m1.metric("📋 Total", total)
             m2.metric("🟢 Proventos", p)
@@ -648,7 +1015,7 @@ def main():
     """)
 
     excel_preenchido = st.file_uploader(
-        "3️⃣ Excel Preenchido (.xlsx)",
+        "4️⃣ Excel Preenchido (.xlsx)",
         type=["xlsx", "xls"],
         key="excel_etapa2",
     )
@@ -663,7 +1030,7 @@ def main():
         )
 
     if gerar_finais and excel_preenchido:
-        log = st.session_state.log or []
+        log = list(st.session_state.log) or []
         log.append("[Etapa 2] Iniciando...")
         with st.spinner("Lendo Excel preenchido..."):
             df_preen = ler_excel_preenchido(excel_preenchido.read(), log)
@@ -675,7 +1042,6 @@ def main():
         st.session_state.log = log
         st.rerun()
 
-    # Resultado Etapa 2
     if st.session_state.evento_xlsx is not None:
         st.success("✅ Arquivos finais gerados!")
 
@@ -705,7 +1071,7 @@ def main():
         with col_i1:
             st.markdown("""
             **evento exemplo.xlsx**
-            - Aba `integra`: Código Empresa | 0 | Seq | Tipo | Rúbrica
+            - Aba `integra`: Empresa | Separador | Seq | Tipo | Rúbrica
             - Aba `evento`: Empresa | CC | Seq | Tipo | Descrição | Débito | Crédito | Histórico | Complemento
             """)
         with col_i2:
