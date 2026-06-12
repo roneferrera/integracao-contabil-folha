@@ -1,5 +1,5 @@
 # ============================================================
-# app_integracao_dominio.py  –  Integração Contábil Domínio V4.1
+# app_integracao_dominio.py  –  Integração Contábil Domínio V4.2
 # ============================================================
 
 import streamlit as st
@@ -10,7 +10,7 @@ from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSAO = "V4.1"
+VERSAO = "V4.2"
 
 # ══════════════════════════════════════════════════════════════════════════
 # TEMA
@@ -41,39 +41,74 @@ def apply_tr_theme():
 
 # ══════════════════════════════════════════════════════════════════════════
 # PARSE DO PLANO DE CONTAS
-# Estrutura exportação Domínio (Contas.xls):
-#   col[0] = Empresa   col[1] = Reduzido
-#   col[2] = Classificação (numérico)   col[3] = Tipo S/A   col[4] = Descrição
+# Estrutura real do Contas.xls (Domínio):
+#   Linha 0 = cabeçalho: "Plano de Contas - Completo", "Unnamed:1"(Reduzido),
+#             "Unnamed:2"(Classificação), "Unnamed:3"(Tipo), "Unnamed:4"(Descrição)...
+#   col[0] = Empresa  |  col[1] = Reduzido  |  col[2] = Classificação
+#   col[3] = Tipo S/A |  col[4] = Descrição
+#   Última linha pode ser "Total de : NNN" → ignorar
 # ══════════════════════════════════════════════════════════════════════════
 def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
-    try:
-        df_raw = pd.read_excel(BytesIO(file_bytes), sheet_name=0, header=0, dtype=str)
-    except Exception as e:
-        log.append(f"ERRO ao abrir Plano de Contas: {e}")
+    # Tenta ler como XLS (xlrd) e como XLSX (openpyxl)
+    df_raw = None
+    for engine in [None, "xlrd", "openpyxl"]:
+        try:
+            kwargs = {"sheet_name": 0, "header": 0, "dtype": str}
+            if engine:
+                kwargs["engine"] = engine
+            df_raw = pd.read_excel(BytesIO(file_bytes), **kwargs)
+            break
+        except Exception:
+            continue
+
+    if df_raw is None:
+        log.append("ERRO: Não foi possível abrir o Plano de Contas. "
+                   "Tente salvar como .xlsx no Excel e importe novamente.")
         return pd.DataFrame()
 
+    log.append(f"Plano de Contas: arquivo aberto — {len(df_raw)} linhas brutas, "
+               f"{len(df_raw.columns)} colunas.")
+
     if len(df_raw.columns) < 5:
-        log.append("ERRO: Plano de Contas com menos de 5 colunas.")
+        log.append("ERRO: Plano de Contas com menos de 5 colunas. "
+                   "Verifique se o arquivo está correto.")
         return pd.DataFrame()
 
     registros = []
-    for _, row in df_raw.iterrows():
-        classif = str(row.iloc[2]).strip()
-        tipo    = str(row.iloc[3]).strip().upper()
-        nome    = str(row.iloc[4]).strip()
+    ignorados = 0
 
-        # Ignora linhas sem classificação numérica ou sem nome
+    for _, row in df_raw.iterrows():
+        # Lê os campos pelas posições fixas
+        empresa  = str(row.iloc[0]).strip()
+        classif  = str(row.iloc[2]).strip()
+        tipo_raw = str(row.iloc[3]).strip().upper()
+        nome     = str(row.iloc[4]).strip()
+
+        # Ignora linhas de rodapé / totalizador / vazias
+        if empresa.lower().startswith("total") or classif.lower().startswith("total"):
+            ignorados += 1
+            continue
+
+        # Classificação deve ser puramente numérica
         if not re.match(r'^\d+$', classif):
+            ignorados += 1
             continue
-        if tipo not in ("S", "A"):
+
+        # Tipo deve ser S ou A
+        if tipo_raw not in ("S", "A"):
+            ignorados += 1
             continue
+
+        # Nome não pode ser vazio / nan
         if not nome or nome.lower() in ("nan", "none", ""):
+            ignorados += 1
             continue
 
         registros.append({
             "classificacao": classif,
-            "nome_conta":    nome.upper(),   # normaliza p/ comparação
-            "tipo":          tipo,
+            "nome_conta":    nome.upper(),   # MAIÚSCULAS para comparação uniforme
+            "nome_original": nome,           # preserva original para exibição
+            "tipo":          tipo_raw,
         })
 
     df = (
@@ -84,10 +119,17 @@ def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
 
     n_a = len(df[df["tipo"] == "A"])
     n_s = len(df[df["tipo"] == "S"])
-    log.append(f"Plano de Contas: {len(df)} contas ({n_a} analíticas · {n_s} sintéticas).")
+
+    log.append(
+        f"Plano de Contas: {len(df)} contas válidas "
+        f"({n_a} analíticas · {n_s} sintéticas · {ignorados} linhas ignoradas)."
+    )
 
     if n_a == 0:
-        log.append("AVISO: Nenhuma conta analítica encontrada. Verifique o arquivo.")
+        log.append(
+            "AVISO: Nenhuma conta analítica encontrada. "
+            "Verifique se a coluna 'Tipo' contém os valores 'A' e 'S'."
+        )
 
     return df
 
@@ -95,49 +137,49 @@ def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
 # ══════════════════════════════════════════════════════════════════════════
 # CLASSIFICADOR SEMÂNTICO UNIVERSAL
 #
-# Funciona com QUALQUER plano de contas.
-# Usa palavras-chave nos NOMES das contas (não em prefixos numéricos).
-# Os nomes são normalizados para MAIÚSCULAS sem acento antes da comparação.
+# Compara palavras-chave com os NOMES das contas (em MAIÚSCULAS, sem acento).
+# Funciona com qualquer plano de contas — não depende de prefixos numéricos.
 # ══════════════════════════════════════════════════════════════════════════
 
 def _norm(texto: str) -> str:
-    """Normaliza: maiúsculas, remove acentos."""
+    """Maiúsculas + remove acentos para comparação."""
     t = texto.upper()
-    for a, b in [
-        ("Ã","A"),("Á","A"),("Â","A"),("À","A"),
-        ("É","E"),("Ê","E"),("È","E"),
-        ("Í","I"),("Ï","I"),
-        ("Ó","O"),("Ô","O"),("Õ","O"),
-        ("Ú","U"),("Ü","U"),
-        ("Ç","C"),
+    for orig, sub in [
+        ("Ã","A"),("Á","A"),("Â","A"),("À","A"),("Ä","A"),
+        ("É","E"),("Ê","E"),("È","E"),("Ë","E"),
+        ("Í","I"),("Î","I"),("Ï","I"),
+        ("Ó","O"),("Ô","O"),("Õ","O"),("Ö","O"),
+        ("Ú","U"),("Û","U"),("Ü","U"),
+        ("Ç","C"),("Ñ","N"),
     ]:
-        t = t.replace(a, b)
+        t = t.replace(orig, sub)
     return t
 
 
-# Palavras-chave para identificar contas de DÉBITO (despesa/custo) por grupo
-# Baseadas nos nomes REAIS do Contas.xls fornecido
+# ── Palavras-chave DÉBITO por grupo ───────────────────────────────────────
+# Baseadas nos nomes REAIS do Contas.xls (já em maiúsculas / sem acento)
 KWORDS_DEBITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
         "MATERIA-PRIMA", "MATERIAL APLICADO", "MAO-DE-OBRA DIRETA",
-        "SALARIOS E ORDENADOS",  "PRO-LABORE", "PREMIOS DE GRATIFICACOES",
-        "13 SALARIO", "FERIAS", "INSS", "FGTS", "INDENIZACOES",
-        "ASSISTENCIA MEDICA", "VALE TRANSPORTE", "PIS S/ FOLHA",
-        "ALIMENTACAO", "VALE REFEICAO", "HORAS EXTRAS", "SEGURO DE VIDA",
-        "TREINAMENTO", "BOLSA AUXILIO", "CONTRIBUICAO ASSISTENCIAL",
-        "SERVICOS PESSOAL PJ", "INDUSTRIALIZACAO",
-        # Classificações que começam com 411xx
-    ],
-    "Custo Direto de Serviços": [
-        "CUSTOS DIRETOS DA PRODUCAO DE SERVICOS",
-        "MAO-DE-OBRA DIRETA",
         "SALARIOS E ORDENADOS", "PRO-LABORE", "PREMIOS DE GRATIFICACOES",
         "13 SALARIO", "FERIAS", "INSS", "FGTS", "INDENIZACOES",
         "ASSISTENCIA MEDICA", "VALE TRANSPORTE", "PIS S/ FOLHA",
         "ALIMENTACAO", "VALE REFEICAO", "HORAS EXTRAS", "SEGURO DE VIDA",
         "TREINAMENTO", "BOLSA AUXILIO", "CONTRIBUICAO ASSISTENCIAL",
-        "SERVICOS PESSOAL PJ", "ROYALTIES", "DESPESAS - KM OP",
-        "ESTACIONAMENTOS E PEDAGIOS",
+        "SERVICOS PESSOAL PJ", "INDUSTRIALIZACAO",
+        "CUSTOS DIRETOS DE PRODUCAO",
+    ],
+    "Custo Direto de Serviços": [
+        "CUSTOS DIRETOS DA PRODUCAO DE SERVICOS",
+        "MAO-DE-OBRA DIRETA", "SALARIOS E ORDENADOS", "PRO-LABORE",
+        "PREMIOS DE GRATIFICACOES", "13 SALARIO", "FERIAS", "INSS", "FGTS",
+        "INDENIZACOES", "ASSISTENCIA MEDICA", "VALE TRANSPORTE",
+        "PIS S/ FOLHA", "ALIMENTACAO", "VALE REFEICAO", "HORAS EXTRAS",
+        "SEGURO DE VIDA", "TREINAMENTO", "BOLSA AUXILIO",
+        "CONTRIBUICAO ASSISTENCIAL", "SERVICOS PESSOAL PJ",
+        "ROYALTIES", "DESPESAS - KM OP", "ESTACIONAMENTOS E PEDAGIOS",
+        "ASSISTENCIA ODONTOLOGICA", "SEGUROS DE ACIDENTES",
+        "BENEFICIOS CONCEDIDOS",
     ],
     "Custo Indireto de Produção": [
         "MAO-DE-OBRA INDIRETA", "MATERIAIS DE CONSUMO INDIRETO",
@@ -146,9 +188,10 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "COMBUSTIVEIS", "ENERGIA ELETRICA", "AUDITORIA E CONSULTORIA",
         "LOCACAO DE MAQUINAS", "OUTROS SERVICOS TOMADOS",
         "ASSESSORIA EM INFORMATICA", "CONDOMINIO",
+        "CUSTOS INDIRETOS DE PRODUCAO",
     ],
     "Despesa Administrativa": [
-        "DESPESAS COM PESSOAL", "DESPESAS ADMINISTRATIVAS",
+        "DESPESAS ADMINISTRATIVAS", "DESPESAS COM PESSOAL",
         "SALARIOS E ORDENADOS", "PRO-LABORE", "PREMIOS E GRATIFICACOES",
         "13 SALARIO", "FERIAS", "INSS", "FGTS", "INDENIZACOES",
         "ASSISTENCIA MEDICA", "VALE TRANSPORTE", "PIS S/ FOLHA",
@@ -164,7 +207,7 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "REPRODUCOES", "DESPESAS LEGAIS", "LIVROS, JORNAIS",
         "COMBUSTIVEIS E LUBRIFICANTES", "MATERIAIS DE CONSUMO",
         "CONDOMINIOS", "CELULAR", "CONSELHOS DE CLASSE",
-        "ESTACIONAMENTOS E PEDAGIOS", "CARTORIO", "GAS", "CONDUCES",
+        "ESTACIONAMENTOS E PEDAGIOS", "CARTORIO", "GAS", "CONDUCOES",
         "REFEICOES", "MANUTENCAO E REPARO", "VIAGENS",
         "MANUTENCAO DE VEICULOS", "FRETES E CARRETOS",
         "SERVICOS TOMADOS DE PJ", "SERVS. DE PUBLICIDADE",
@@ -181,10 +224,10 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "REEMBOLSO DE DESPESAS", "DESPESAS - KM ADM",
         "ASSISTENCIA ODONTOLOGICA", "SEGUROS DE ACIDENTES",
         "BENEFICIOS CONCEDIDOS", "COMISSOES",
+        "DESPESAS GERAIS",
     ],
     "Despesa com Vendas": [
-        "DESPESAS COM VENDAS", "DESPESAS COM PESSOAL",
-        "COMISSOES SOBRE VENDAS", "COMISSOES",
+        "DESPESAS COM VENDAS", "COMISSOES SOBRE VENDAS", "COMISSOES",
         "PROPAGANDA E PUBLICIDADE", "AMOSTRAS GRATIS",
         "DESPESAS COM ENTREGA", "FRETES E CARRETOS",
         "MANUTENCAO DE VEICULOS", "DESPESAS COM VIAGENS",
@@ -205,7 +248,7 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "DESPESAS FINANCEIRAS", "JUROS PASSIVOS",
         "VARIACOES MONETARIAS PASSIVAS", "VARIACOES CAMBIAIS PASSIVAS",
         "DESCONTOS FINANCEIROS CONCEDIDOS", "JUROS DE MORA",
-        "JUROS SOBRE CAPITAL PROPRIO", "JUROS E COMISSOES BANCARIAS",
+        "JUROS E COMISSOES BANCARIAS",
         "JUROS SOBRE EMPRESTIMOS E FINANCIAMENTOS",
         "MULTAS PASSIVAS", "MULTAS DE MORA",
         "TARIFA BANCARIA", "EMPRESTIMO / FINANCIAMENTO",
@@ -226,17 +269,15 @@ KWORDS_DEBITO: dict[str, list[str]] = {
     ],
 }
 
-# Palavras-chave para contas de CRÉDITO (passivo/obrigação) por grupo
+# ── Palavras-chave CRÉDITO por grupo ──────────────────────────────────────
 KWORDS_CREDITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
         "SALARIOS E ORDENADOS A PAGAR", "PRO-LABORE A PAGAR",
         "GRATIFICACOES A PAGAR", "FERIAS A PAGAR", "RESCISOES A PAGAR",
-        "13 SALARIO A PAGAR", "PENSAO ALIMENTICIA",
-        "INDENIZACOES A PAGAR",
+        "13 SALARIO A PAGAR", "PENSAO ALIMENTICIA", "INDENIZACOES A PAGAR",
         "INSS A RECOLHER", "FGTS A RECOLHER", "PIS S/ FOLHA A RECOLHER",
         "PROVISOES PARA FERIAS", "PROVISOES PARA 13",
         "INSS SOBRE PROVISOES", "FGTS SOBRE PROVISOES",
-        "PIS SOBRE PROVISOES",
         "OBRIGACOES COM O PESSOAL", "OBRIGACOES SOCIAIS", "PROVISOES",
         "OBRIGACOES TRABALHISTA",
     ],
@@ -288,8 +329,7 @@ KWORDS_CREDITO: dict[str, list[str]] = {
     "Despesa Financeira": [
         "CONTAS A PAGAR", "OUTRAS OBRIGACOES",
         "EMPRESTIMO BANCO", "EMPRESTIMOS PAGAR", "FINANCIAMENTO",
-        "IMPOSTOS E CONTRIBUICOES A RECOLHER",
-        "HONORARIOS CONTABEIS",
+        "IMPOSTOS E CONTRIBUICOES A RECOLHER", "HONORARIOS CONTABEIS",
     ],
     "Despesa Não Operacional": [
         "CONTAS A PAGAR", "OUTRAS OBRIGACOES",
@@ -304,11 +344,11 @@ KWORDS_CREDITO: dict[str, list[str]] = {
 GRUPOS_LISTA = list(KWORDS_DEBITO.keys()) + ["Outro"]
 
 
-def _conta_bate(nome_conta_norm: str, keywords: list[str]) -> bool:
-    """Verifica se o nome (já normalizado) contém alguma palavra-chave."""
+def _conta_bate(nome_conta_upper: str, keywords: list[str]) -> bool:
+    """Verifica se o nome (já em MAIÚSCULAS normalizadas) contém alguma keyword."""
+    nome_norm = _norm(nome_conta_upper)
     for kw in keywords:
-        kw_n = _norm(kw)
-        if kw_n in nome_conta_norm:
+        if _norm(kw) in nome_norm:
             return True
     return False
 
@@ -317,20 +357,19 @@ def _analiticas(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["tipo"] == "A"].copy() if not df.empty else df
 
 
-def _fmt_opcoes(df_filtrado: pd.DataFrame) -> list[str]:
+def _fmt_opcoes(df_f: pd.DataFrame) -> list[str]:
+    """Formata lista de opções para selectbox: 'CLASSIF - nome_original'."""
+    col_nome = "nome_original" if "nome_original" in df_f.columns else "nome_conta"
     return [""] + [
-        f"{r['classificacao']} - {r['nome_conta']}"
-        for _, r in df_filtrado.iterrows()
+        f"{r['classificacao']} - {r[col_nome]}"
+        for _, r in df_f.iterrows()
     ]
 
 
-def classificar_contas(
-    df_contas: pd.DataFrame, grupo: str
-) -> tuple[list[str], list[str]]:
+def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], list[str]]:
     """
-    Retorna (opcoes_debito, opcoes_credito) para o grupo dado.
-    Filtra por palavras-chave nos nomes das contas analíticas.
-    Se não encontrar nada → retorna TODAS as analíticas (fallback).
+    Retorna (opcoes_debito, opcoes_credito) filtradas por keywords do grupo.
+    Fallback para todas as analíticas se nenhuma conta for encontrada.
     """
     df_a = _analiticas(df_contas)
     if df_a.empty:
@@ -341,7 +380,7 @@ def classificar_contas(
 
     if kw_d and grupo != "Outro":
         mask_d = df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_d))
-        df_d = df_a[mask_d]
+        df_d   = df_a[mask_d]
         if df_d.empty:
             df_d = df_a   # fallback
     else:
@@ -349,7 +388,7 @@ def classificar_contas(
 
     if kw_c and grupo != "Outro":
         mask_c = df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_c))
-        df_c = df_a[mask_c]
+        df_c   = df_a[mask_c]
         if df_c.empty:
             df_c = df_a   # fallback
     else:
@@ -359,14 +398,14 @@ def classificar_contas(
 
 
 def sugerir_contas(df_contas: pd.DataFrame, grupo: str) -> dict:
-    """Retorna sugestão automática (primeira conta de cada lado)."""
+    """Sugestão automática: primeira conta de cada lado."""
     ops_d, ops_c = classificar_contas(df_contas, grupo)
     return {
         "ops_deb":       ops_d,
         "ops_cred":      ops_c,
-        "conta_debito":  extrair_codigo(ops_d[1]) if len(ops_d) > 1 else "",
+        "conta_debito":  extrair_codigo(ops_d[1])  if len(ops_d)  > 1 else "",
         "conta_credito": extrair_codigo(ops_c[1]) if len(ops_c) > 1 else "",
-        "n_deb":  len(ops_d) - 1,
+        "n_deb":  len(ops_d)  - 1,
         "n_cred": len(ops_c) - 1,
     }
 
@@ -561,7 +600,8 @@ def gerar_excel_configuracao(
         _formatar_planilha_config(writer.sheets["Configuração"], df)
 
         if df_contas is not None and not df_contas.empty:
-            df_exp = df_contas[["classificacao", "nome_conta", "tipo"]].copy()
+            col_nome = "nome_original" if "nome_original" in df_contas.columns else "nome_conta"
+            df_exp = df_contas[["classificacao", col_nome, "tipo"]].copy()
             df_exp.columns = ["Classificação", "Nome da Conta", "Tipo (S/A)"]
             df_exp.to_excel(writer, sheet_name="Plano de Contas", index=False)
             _formatar_planilha_saida(writer.sheets["Plano de Contas"])
@@ -859,9 +899,8 @@ def main():
             df_c = parse_plano_contas(contas_file.read(), log_tmp)
             st.session_state.df_contas   = df_c if not df_c.empty else None
             st.session_state._contas_fid = fid
+            st.session_state.config_cc   = {}   # reset ao trocar plano
             st.session_state.log.extend(log_tmp)
-            # Limpa config de CC para reclassificar com novo plano
-            st.session_state.config_cc = {}
     else:
         if st.session_state._contas_fid is not None:
             st.session_state.df_contas   = None
@@ -870,22 +909,25 @@ def main():
 
     df_pc = st.session_state.df_contas
 
-    if df_pc is not None:
+    if df_pc is not None and not df_pc.empty:
         n_a = len(df_pc[df_pc["tipo"] == "A"])
         n_s = len(df_pc[df_pc["tipo"] == "S"])
         st.success(
             f"✅ Plano de Contas carregado: **{len(df_pc)}** contas "
             f"({n_a} analíticas · {n_s} sintéticas)"
         )
-
-        # ── Diagnóstico: mostra amostra das analíticas carregadas ──────────
-        with st.expander("🔍 Ver amostra do Plano de Contas carregado", expanded=False):
-            df_amostra = df_pc[df_pc["tipo"] == "A"].head(20)
+        with st.expander("🔍 Ver amostra das contas analíticas carregadas", expanded=False):
+            col_nome = "nome_original" if "nome_original" in df_pc.columns else "nome_conta"
+            df_amostra = df_pc[df_pc["tipo"] == "A"][["classificacao", col_nome]].head(30)
+            df_amostra.columns = ["Classificação", "Nome da Conta"]
             st.dataframe(df_amostra, use_container_width=True)
-            st.caption(f"Mostrando 20 de {n_a} contas analíticas.")
-    else:
-        if contas_file is not None:
-            st.warning("⚠️ Plano de Contas não pôde ser carregado. Verifique o arquivo.")
+            st.caption(f"Exibindo 30 de {n_a} contas analíticas.")
+    elif contas_file is not None:
+        st.error(
+            "❌ Plano de Contas não pôde ser carregado. "
+            "Verifique o log abaixo para detalhes. "
+            "Se o arquivo for .xls antigo, abra no Excel e salve como .xlsx."
+        )
 
     st.markdown("---")
 
@@ -904,7 +946,6 @@ def main():
             if ccs:
                 st.markdown("#### 🏢 Classificação por Centro de Custo")
 
-                # ── Painel de não classificados ───────────────────────────
                 nao_classif = [
                     f"CC {cc} — {nm}"
                     for cc, nm in ccs
@@ -925,7 +966,6 @@ def main():
 
                 st.markdown("---")
 
-                # ── Expander por CC ───────────────────────────────────────
                 for cc_cod, cc_nome in ccs:
                     cfg_atual = st.session_state.config_cc.get(cc_cod, {})
                     deb_ok    = bool(cfg_atual.get("conta_debito"))
@@ -936,7 +976,6 @@ def main():
                         f"{status} CC {cc_cod} — {cc_nome}",
                         expanded=not (deb_ok and cred_ok),
                     ):
-                        # Seleção de grupo
                         grupo_idx = (
                             GRUPOS_LISTA.index(cfg_atual.get("grupo", "Outro"))
                             if cfg_atual.get("grupo") in GRUPOS_LISTA
@@ -949,7 +988,6 @@ def main():
                             key=f"grupo_{cc_cod}",
                         )
 
-                        # Gera opções filtradas pelo grupo
                         if df_pc is not None and not df_pc.empty:
                             ops_deb, ops_cred = classificar_contas(df_pc, grupo_sel)
                             n_deb  = len(ops_deb)  - 1
@@ -959,7 +997,6 @@ def main():
                             ops_cred = [""]
                             n_deb = n_cred = 0
 
-                        # Métricas de cobertura
                         col_m1, col_m2, col_m3 = st.columns(3)
                         col_m1.metric("Contas Débito encontradas",  n_deb)
                         col_m2.metric("Contas Crédito encontradas", n_cred)
@@ -969,19 +1006,14 @@ def main():
                         )
 
                         if df_pc is not None and n_deb == 0:
-                            st.warning(
-                                f"⚠️ Nenhuma conta de Débito encontrada para **{grupo_sel}**. "
-                                "Selecione manualmente ou escolha outro grupo."
-                            )
+                            st.warning(f"⚠️ Nenhuma conta de Débito para **{grupo_sel}**. "
+                                       "Selecione manualmente ou mude o grupo.")
                         if df_pc is not None and n_cred == 0:
-                            st.warning(
-                                f"⚠️ Nenhuma conta de Crédito encontrada para **{grupo_sel}**. "
-                                "Selecione manualmente ou escolha outro grupo."
-                            )
+                            st.warning(f"⚠️ Nenhuma conta de Crédito para **{grupo_sel}**. "
+                                       "Selecione manualmente ou mude o grupo.")
                         if df_pc is None:
                             st.info("💡 Carregue o Plano de Contas para sugestões automáticas.")
 
-                        # Selectboxes
                         col_d, col_c, col_h = st.columns([3, 3, 2])
                         with col_d:
                             deb_sel = st.selectbox(
@@ -1005,15 +1037,15 @@ def main():
                                 placeholder="Ex: 001",
                             )
 
-                        # Preview
                         deb_cod  = extrair_codigo(deb_sel)
                         cred_cod = extrair_codigo(cred_sel)
 
                         def _nome_conta(cod):
                             if not cod or df_pc is None:
                                 return "—"
+                            col_n = "nome_original" if "nome_original" in df_pc.columns else "nome_conta"
                             r = df_pc[df_pc["classificacao"] == cod]
-                            return r.iloc[0]["nome_conta"] if not r.empty else cod
+                            return r.iloc[0][col_n] if not r.empty else cod
 
                         if deb_cod or cred_cod:
                             cor = "#e8f5e9" if (deb_cod and cred_cod) else "#fff3e0"
@@ -1031,7 +1063,6 @@ def main():
                                 unsafe_allow_html=True,
                             )
 
-                        # Persiste
                         st.session_state.config_cc[cc_cod] = {
                             "grupo":         grupo_sel,
                             "conta_debito":  deb_cod,
@@ -1066,17 +1097,14 @@ def main():
 
     if gerar_excel and pdf_file and txt_file:
         log: list[str] = ["[Etapa 1] Iniciando..."]
-
         with st.spinner("Lendo rubricas.txt..."):
             catalog = parse_rubricas_txt(txt_file.read(), log)
-
         with st.spinner("Lendo PDF..."):
             eventos = parse_nao_configurados_pdf(pdf_file.read(), log)
-
         st.session_state.eventos_parsed = eventos
 
-        # Classificação automática para CCs novos (se há plano de contas)
-        if df_pc is not None and usa_sep_bool:
+        # Classificação automática para CCs novos
+        if df_pc is not None and not df_pc.empty and usa_sep_bool:
             ccs_novos = get_centros_custo_unicos(eventos)
             for cc_cod, _ in ccs_novos:
                 if cc_cod not in st.session_state.config_cc or \
@@ -1091,8 +1119,8 @@ def main():
                     }
                     log.append(
                         f"CC {cc_cod}: sugestão automática → "
-                        f"D:{auto['conta_debito']} C:{auto['conta_credito']} "
-                        f"({auto['n_deb']} opções débito, {auto['n_cred']} crédito)"
+                        f"D:{auto['conta_debito']} ({auto['n_deb']} opções) | "
+                        f"C:{auto['conta_credito']} ({auto['n_cred']} opções)"
                     )
 
         if not eventos:
@@ -1108,7 +1136,6 @@ def main():
             st.session_state.excel_config = excel_bytes
             st.session_state.n_eventos    = len(eventos)
 
-            # Preview
             linhas_prev = []
             for ev in eventos:
                 cod_ev = ev["cod"]
@@ -1163,7 +1190,6 @@ def main():
             ], [total, p, d, i, id_, nf, ok, nok]):
                 col_m.metric(lbl, val)
 
-            # Tabela de não classificados
             if nok > 0 and usa_sep_bool and "Classif." in df.columns:
                 df_nok = df[df["Classif."] == "⚠️"][
                     ["Código","Descrição","Centro Custo","Conta Débito","Conta Crédito"]
