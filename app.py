@@ -1,5 +1,5 @@
 # ============================================================
-# app_integracao_dominio.py  –  Integração Contábil Domínio V4.2
+# app_integracao_dominio.py  –  Integração Contábil Domínio V4.3
 # ============================================================
 
 import streamlit as st
@@ -10,7 +10,7 @@ from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSAO = "V4.2"
+VERSAO = "V4.3"
 
 # ══════════════════════════════════════════════════════════════════════════
 # TEMA
@@ -41,51 +41,81 @@ def apply_tr_theme():
 
 # ══════════════════════════════════════════════════════════════════════════
 # PARSE DO PLANO DE CONTAS
-# Estrutura real do Contas.xls (Domínio):
-#   Linha 0 = cabeçalho: "Plano de Contas - Completo", "Unnamed:1"(Reduzido),
-#             "Unnamed:2"(Classificação), "Unnamed:3"(Tipo), "Unnamed:4"(Descrição)...
-#   col[0] = Empresa  |  col[1] = Reduzido  |  col[2] = Classificação
-#   col[3] = Tipo S/A |  col[4] = Descrição
-#   Última linha pode ser "Total de : NNN" → ignorar
+#
+# Estrutura REAL confirmada do Contas.xls (Domínio):
+#   col[0] = Empresa          ex: 45
+#   col[1] = Reduzido         ex: 1, 2, 3 ...
+#   col[2] = Classificação    ex: 1, 11, 111, 11101, 11101000001
+#   col[3] = Tipo             S ou A
+#   col[4] = Descrição        ex: ATIVO, CAIXA GERAL, SALÁRIOS E ORDENADOS
+#   col[5..] = outros campos ignorados
+#
+# Última linha: "Total de : 945" → ignorada
 # ══════════════════════════════════════════════════════════════════════════
-def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
-    # Tenta ler como XLS (xlrd) e como XLSX (openpyxl)
+def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFrame:
+    """
+    Lê Contas.xls ou Contas.xlsx e devolve DataFrame com:
+        classificacao | nome_conta | nome_original | tipo (S/A)
+    """
+    ext = filename.lower().split(".")[-1] if "." in filename else "xls"
+
     df_raw = None
-    for engine in [None, "xlrd", "openpyxl"]:
+
+    if ext == "xlsx":
+        # XLSX → openpyxl
         try:
-            kwargs = {"sheet_name": 0, "header": 0, "dtype": str}
-            if engine:
-                kwargs["engine"] = engine
-            df_raw = pd.read_excel(BytesIO(file_bytes), **kwargs)
-            break
-        except Exception:
-            continue
+            df_raw = pd.read_excel(
+                BytesIO(file_bytes), sheet_name=0, header=0, dtype=str, engine="openpyxl"
+            )
+            log.append("Plano de Contas: lido como .xlsx (openpyxl).")
+        except Exception as e:
+            log.append(f"ERRO ao abrir .xlsx: {e}")
+            return pd.DataFrame()
+    else:
+        # XLS → tenta xlrd primeiro, depois openpyxl
+        for engine in ["xlrd", "openpyxl"]:
+            try:
+                df_raw = pd.read_excel(
+                    BytesIO(file_bytes), sheet_name=0, header=0,
+                    dtype=str, engine=engine
+                )
+                log.append(f"Plano de Contas: lido como .xls (engine={engine}).")
+                break
+            except Exception as e:
+                log.append(f"  engine={engine} falhou: {e}")
+                df_raw = None
 
     if df_raw is None:
-        log.append("ERRO: Não foi possível abrir o Plano de Contas. "
-                   "Tente salvar como .xlsx no Excel e importe novamente.")
+        log.append(
+            "ERRO: Não foi possível abrir o Plano de Contas com nenhum engine disponível. "
+            "Abra o arquivo no Excel, salve como .xlsx e tente novamente."
+        )
         return pd.DataFrame()
 
-    log.append(f"Plano de Contas: arquivo aberto — {len(df_raw)} linhas brutas, "
-               f"{len(df_raw.columns)} colunas.")
+    log.append(
+        f"Plano de Contas: {len(df_raw)} linhas brutas, "
+        f"{len(df_raw.columns)} colunas."
+    )
 
     if len(df_raw.columns) < 5:
-        log.append("ERRO: Plano de Contas com menos de 5 colunas. "
-                   "Verifique se o arquivo está correto.")
+        log.append(
+            f"ERRO: Esperado mínimo 5 colunas, encontrado {len(df_raw.columns)}. "
+            "Verifique o arquivo."
+        )
         return pd.DataFrame()
 
     registros = []
     ignorados = 0
 
     for _, row in df_raw.iterrows():
-        # Lê os campos pelas posições fixas
-        empresa  = str(row.iloc[0]).strip()
-        classif  = str(row.iloc[2]).strip()
-        tipo_raw = str(row.iloc[3]).strip().upper()
-        nome     = str(row.iloc[4]).strip()
+        # Lê pelo índice posicional (independente do nome da coluna)
+        empresa_val = str(row.iloc[0]).strip()
+        classif     = str(row.iloc[2]).strip()
+        tipo_raw    = str(row.iloc[3]).strip().upper()
+        nome        = str(row.iloc[4]).strip()
 
-        # Ignora linhas de rodapé / totalizador / vazias
-        if empresa.lower().startswith("total") or classif.lower().startswith("total"):
+        # Ignora linha de totalizador ("Total de : 945")
+        if empresa_val.lower().startswith("total"):
             ignorados += 1
             continue
 
@@ -106,8 +136,8 @@ def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
 
         registros.append({
             "classificacao": classif,
-            "nome_conta":    nome.upper(),   # MAIÚSCULAS para comparação uniforme
-            "nome_original": nome,           # preserva original para exibição
+            "nome_conta":    _norm(nome),   # MAIÚSCULAS sem acento para comparação
+            "nome_original": nome,          # original para exibição
             "tipo":          tipo_raw,
         })
 
@@ -119,16 +149,15 @@ def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
 
     n_a = len(df[df["tipo"] == "A"])
     n_s = len(df[df["tipo"] == "S"])
-
     log.append(
-        f"Plano de Contas: {len(df)} contas válidas "
-        f"({n_a} analíticas · {n_s} sintéticas · {ignorados} linhas ignoradas)."
+        f"Plano de Contas OK: {len(df)} contas válidas "
+        f"({n_a} analíticas · {n_s} sintéticas · {ignorados} ignoradas)."
     )
 
     if n_a == 0:
         log.append(
-            "AVISO: Nenhuma conta analítica encontrada. "
-            "Verifique se a coluna 'Tipo' contém os valores 'A' e 'S'."
+            "AVISO: Nenhuma conta analítica (tipo=A) encontrada. "
+            "Verifique se a coluna 'Tipo' do arquivo contém 'A' e 'S'."
         )
 
     return df
@@ -136,13 +165,11 @@ def parse_plano_contas(file_bytes: bytes, log: list) -> pd.DataFrame:
 
 # ══════════════════════════════════════════════════════════════════════════
 # CLASSIFICADOR SEMÂNTICO UNIVERSAL
-#
-# Compara palavras-chave com os NOMES das contas (em MAIÚSCULAS, sem acento).
-# Funciona com qualquer plano de contas — não depende de prefixos numéricos.
+# Usa palavras-chave nos NOMES das contas (MAIÚSCULAS sem acento).
+# Funciona com QUALQUER plano de contas.
 # ══════════════════════════════════════════════════════════════════════════
-
 def _norm(texto: str) -> str:
-    """Maiúsculas + remove acentos para comparação."""
+    """Converte para MAIÚSCULAS e remove acentos."""
     t = texto.upper()
     for orig, sub in [
         ("Ã","A"),("Á","A"),("Â","A"),("À","A"),("Ä","A"),
@@ -156,8 +183,7 @@ def _norm(texto: str) -> str:
     return t
 
 
-# ── Palavras-chave DÉBITO por grupo ───────────────────────────────────────
-# Baseadas nos nomes REAIS do Contas.xls (já em maiúsculas / sem acento)
+# Palavras-chave DÉBITO por grupo (baseadas nos nomes REAIS do Contas.xls)
 KWORDS_DEBITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
         "MATERIA-PRIMA", "MATERIAL APLICADO", "MAO-DE-OBRA DIRETA",
@@ -223,8 +249,7 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "LOCACAO DE MAQUINAS E EQUIPAMENTOS", "LOCACAO DE VEICULOS",
         "REEMBOLSO DE DESPESAS", "DESPESAS - KM ADM",
         "ASSISTENCIA ODONTOLOGICA", "SEGUROS DE ACIDENTES",
-        "BENEFICIOS CONCEDIDOS", "COMISSOES",
-        "DESPESAS GERAIS",
+        "BENEFICIOS CONCEDIDOS", "COMISSOES", "DESPESAS GERAIS",
     ],
     "Despesa com Vendas": [
         "DESPESAS COM VENDAS", "COMISSOES SOBRE VENDAS", "COMISSOES",
@@ -269,7 +294,7 @@ KWORDS_DEBITO: dict[str, list[str]] = {
     ],
 }
 
-# ── Palavras-chave CRÉDITO por grupo ──────────────────────────────────────
+# Palavras-chave CRÉDITO por grupo
 KWORDS_CREDITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
         "SALARIOS E ORDENADOS A PAGAR", "PRO-LABORE A PAGAR",
@@ -344,11 +369,9 @@ KWORDS_CREDITO: dict[str, list[str]] = {
 GRUPOS_LISTA = list(KWORDS_DEBITO.keys()) + ["Outro"]
 
 
-def _conta_bate(nome_conta_upper: str, keywords: list[str]) -> bool:
-    """Verifica se o nome (já em MAIÚSCULAS normalizadas) contém alguma keyword."""
-    nome_norm = _norm(nome_conta_upper)
+def _conta_bate(nome_conta_norm: str, keywords: list[str]) -> bool:
     for kw in keywords:
-        if _norm(kw) in nome_norm:
+        if _norm(kw) in nome_conta_norm:
             return True
     return False
 
@@ -358,7 +381,6 @@ def _analiticas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fmt_opcoes(df_f: pd.DataFrame) -> list[str]:
-    """Formata lista de opções para selectbox: 'CLASSIF - nome_original'."""
     col_nome = "nome_original" if "nome_original" in df_f.columns else "nome_conta"
     return [""] + [
         f"{r['classificacao']} - {r[col_nome]}"
@@ -367,10 +389,6 @@ def _fmt_opcoes(df_f: pd.DataFrame) -> list[str]:
 
 
 def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], list[str]]:
-    """
-    Retorna (opcoes_debito, opcoes_credito) filtradas por keywords do grupo.
-    Fallback para todas as analíticas se nenhuma conta for encontrada.
-    """
     df_a = _analiticas(df_contas)
     if df_a.empty:
         return [""], [""]
@@ -380,17 +398,13 @@ def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], 
 
     if kw_d and grupo != "Outro":
         mask_d = df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_d))
-        df_d   = df_a[mask_d]
-        if df_d.empty:
-            df_d = df_a   # fallback
+        df_d   = df_a[mask_d] if mask_d.any() else df_a
     else:
         df_d = df_a
 
     if kw_c and grupo != "Outro":
         mask_c = df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_c))
-        df_c   = df_a[mask_c]
-        if df_c.empty:
-            df_c = df_a   # fallback
+        df_c   = df_a[mask_c] if mask_c.any() else df_a
     else:
         df_c = df_a
 
@@ -398,7 +412,6 @@ def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], 
 
 
 def sugerir_contas(df_contas: pd.DataFrame, grupo: str) -> dict:
-    """Sugestão automática: primeira conta de cada lado."""
     ops_d, ops_c = classificar_contas(df_contas, grupo)
     return {
         "ops_deb":       ops_d,
@@ -870,6 +883,7 @@ def main():
         "eventos_parsed": None,
         "config_cc":      {},
         "_contas_fid":    None,
+        "_contas_name":   None,
     }
     for k, v in _defaults.items():
         if k not in st.session_state:
@@ -888,24 +902,31 @@ def main():
         txt_file = st.file_uploader("2️⃣ TXT — Rubricas (catálogo de tipos)",
                                     type=["txt"], key="txt_etapa1")
     with col3:
-        contas_file = st.file_uploader("3️⃣ XLS/XLSX — Plano de Contas (opcional)",
-                                       type=["xls", "xlsx"], key="contas_etapa1")
+        contas_file = st.file_uploader(
+            "3️⃣ XLS/XLSX — Plano de Contas (opcional)",
+            type=["xls", "xlsx"], key="contas_etapa1",
+            help="Arquivo exportado pelo Domínio: Plano de Contas Completo"
+        )
 
     # ── Carrega plano de contas ────────────────────────────────────────────
     if contas_file is not None:
-        fid = getattr(contas_file, "file_id", id(contas_file))
+        fid  = getattr(contas_file, "file_id", id(contas_file))
+        fname = contas_file.name
         if st.session_state._contas_fid != fid:
             log_tmp: list[str] = []
-            df_c = parse_plano_contas(contas_file.read(), log_tmp)
-            st.session_state.df_contas   = df_c if not df_c.empty else None
-            st.session_state._contas_fid = fid
-            st.session_state.config_cc   = {}   # reset ao trocar plano
+            raw_bytes = contas_file.read()
+            df_c = parse_plano_contas(raw_bytes, fname, log_tmp)
+            st.session_state.df_contas    = df_c if not df_c.empty else None
+            st.session_state._contas_fid  = fid
+            st.session_state._contas_name = fname
+            st.session_state.config_cc    = {}
             st.session_state.log.extend(log_tmp)
     else:
         if st.session_state._contas_fid is not None:
-            st.session_state.df_contas   = None
-            st.session_state._contas_fid = None
-            st.session_state.config_cc   = {}
+            st.session_state.df_contas    = None
+            st.session_state._contas_fid  = None
+            st.session_state._contas_name = None
+            st.session_state.config_cc    = {}
 
     df_pc = st.session_state.df_contas
 
@@ -913,20 +934,20 @@ def main():
         n_a = len(df_pc[df_pc["tipo"] == "A"])
         n_s = len(df_pc[df_pc["tipo"] == "S"])
         st.success(
-            f"✅ Plano de Contas carregado: **{len(df_pc)}** contas "
-            f"({n_a} analíticas · {n_s} sintéticas)"
+            f"✅ Plano de Contas **{st.session_state._contas_name}** carregado: "
+            f"**{len(df_pc)}** contas ({n_a} analíticas · {n_s} sintéticas)"
         )
-        with st.expander("🔍 Ver amostra das contas analíticas carregadas", expanded=False):
+        with st.expander("🔍 Ver amostra das contas analíticas", expanded=False):
             col_nome = "nome_original" if "nome_original" in df_pc.columns else "nome_conta"
-            df_amostra = df_pc[df_pc["tipo"] == "A"][["classificacao", col_nome]].head(30)
-            df_amostra.columns = ["Classificação", "Nome da Conta"]
-            st.dataframe(df_amostra, use_container_width=True)
+            df_am = df_pc[df_pc["tipo"] == "A"][["classificacao", col_nome]].head(30)
+            df_am.columns = ["Classificação", "Nome da Conta"]
+            st.dataframe(df_am, use_container_width=True)
             st.caption(f"Exibindo 30 de {n_a} contas analíticas.")
     elif contas_file is not None:
         st.error(
-            "❌ Plano de Contas não pôde ser carregado. "
-            "Verifique o log abaixo para detalhes. "
-            "Se o arquivo for .xls antigo, abra no Excel e salve como .xlsx."
+            "❌ Não foi possível carregar o Plano de Contas. "
+            "Verifique o log abaixo. Se o arquivo for .xls, "
+            "abra no Excel → Salvar Como → .xlsx e tente novamente."
         )
 
     st.markdown("---")
@@ -1006,11 +1027,9 @@ def main():
                         )
 
                         if df_pc is not None and n_deb == 0:
-                            st.warning(f"⚠️ Nenhuma conta de Débito para **{grupo_sel}**. "
-                                       "Selecione manualmente ou mude o grupo.")
+                            st.warning(f"⚠️ Nenhuma conta de Débito para **{grupo_sel}**.")
                         if df_pc is not None and n_cred == 0:
-                            st.warning(f"⚠️ Nenhuma conta de Crédito para **{grupo_sel}**. "
-                                       "Selecione manualmente ou mude o grupo.")
+                            st.warning(f"⚠️ Nenhuma conta de Crédito para **{grupo_sel}**.")
                         if df_pc is None:
                             st.info("💡 Carregue o Plano de Contas para sugestões automáticas.")
 
@@ -1076,7 +1095,7 @@ def main():
 
     st.markdown("---")
 
-    # ── Botões principais ──────────────────────────────────────────────────
+    # ── Botões ────────────────────────────────────────────────────────────
     col_btn1, col_btn2 = st.columns([1, 1])
     with col_btn1:
         gerar_excel = st.button(
@@ -1088,7 +1107,7 @@ def main():
         if st.button("🗑 Limpar tudo", use_container_width=True):
             for k in ["log", "excel_config", "evento_xlsx", "integra_xls",
                       "df_preview", "n_eventos", "df_contas", "eventos_parsed",
-                      "config_cc", "_contas_fid"]:
+                      "config_cc", "_contas_fid", "_contas_name"]:
                 if k == "log":         st.session_state[k] = ["Campos limpos."]
                 elif k == "n_eventos": st.session_state[k] = 0
                 elif k == "config_cc": st.session_state[k] = {}
@@ -1103,7 +1122,6 @@ def main():
             eventos = parse_nao_configurados_pdf(pdf_file.read(), log)
         st.session_state.eventos_parsed = eventos
 
-        # Classificação automática para CCs novos
         if df_pc is not None and not df_pc.empty and usa_sep_bool:
             ccs_novos = get_centros_custo_unicos(eventos)
             for cc_cod, _ in ccs_novos:
