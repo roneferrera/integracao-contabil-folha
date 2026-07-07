@@ -1,8 +1,10 @@
 # ============================================================
-# app.py  –  Integração Contábil Domínio V5.0
+# app.py  –  Integração Contábil Domínio V6.0
 # Classificação: Evento vs Conta Contábil por Grupo de Despesa
-# Tipo Folha "Empresa" = INSS Patronal com mapeamento específico
-# Sistema de pontuação positivo/negativo para contas de folha
+# Regras de Negócio: Proventos / Descontos / Informativos
+# Anti Curto-Circuito: Débito ≠ Crédito
+# FGTS Dinâmico por Tipo de Folha
+# Empréstimo Consignado com regra específica
 # ============================================================
 
 import streamlit as st
@@ -13,7 +15,7 @@ from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSAO = "V5.0"
+VERSAO = "V6.0"
 
 # ══════════════════════════════════════════════════════════════════════════
 # TEMA
@@ -60,14 +62,23 @@ def _norm(texto: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# SISTEMA DE PONTUAÇÃO PARA FILTRAR CONTAS DE FOLHA DE PAGAMENTO
-# Positivo = relacionado a folha/pessoal
-# Negativo = bloqueia contas de fornecedores/comercial
+# REGRA 1: ANTI CURTO-CIRCUITO
+# Débito nunca pode ser igual ao Crédito
 # ══════════════════════════════════════════════════════════════════════════
+def validar_par_contas(conta_debito: str, conta_credito: str) -> bool:
+    """
+    Retorna True se o par é válido (Débito ≠ Crédito).
+    Retorna False se ambas as contas são iguais (curto-circuito).
+    """
+    if not conta_debito or not conta_credito:
+        return True  # Par incompleto — não é curto-circuito, é apenas incompleto
+    return str(conta_debito).strip() != str(conta_credito).strip()
 
-# Palavras que CONFIRMAM que a conta é de folha de pagamento (peso positivo)
+
+# ══════════════════════════════════════════════════════════════════════════
+# SISTEMA DE PONTUAÇÃO PARA FILTRAR CONTAS DE FOLHA DE PAGAMENTO
+# ══════════════════════════════════════════════════════════════════════════
 PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
-    # Obrigações com pessoal - peso alto
     ("SALARIOS E ORDENADOS A PAGAR", 10),
     ("SALARIOS A PAGAR", 10),
     ("PRO-LABORE A PAGAR", 10),
@@ -80,7 +91,6 @@ PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
     ("AUTONOMOS A PAGAR", 10),
     ("INDENIZACOES A PAGAR", 10),
     ("PREMIOS E BONIFICACOES", 10),
-    # Encargos sociais - peso alto
     ("INSS A RECOLHER", 10),
     ("INSS SOBRE PROVISOES", 10),
     ("FGTS A RECOLHER", 10),
@@ -88,20 +98,17 @@ PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
     ("PIS S/ FOLHA A RECOLHER", 10),
     ("IRRF S/ FOLHA", 10),
     ("CONTRIBUICOES SINDICAIS", 10),
-    # Provisões trabalhistas - peso alto
     ("PROVISOES PARA FERIAS", 10),
     ("PROVISOES PARA 13", 10),
     ("INSS SOBRE PROVISOES PARA FERIAS", 10),
     ("INSS SOBRE PROVISOES PARA 13", 10),
     ("FGTS SOBRE PROVISOES PARA FERIAS", 10),
     ("FGTS SOBRE PROVISOES PARA 13", 10),
-    # Agrupadores de obrigações trabalhistas - peso alto
     ("OBRIGACOES COM O PESSOAL", 10),
     ("OBRIGACOES SOCIAIS", 10),
     ("OBRIGACOES TRABALHISTA", 10),
     ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 10),
     ("PROVISOES", 8),
-    # Despesas com pessoal (débito) - peso alto
     ("DESPESAS COM PESSOAL", 10),
     ("SALARIOS E ORDENADOS", 8),
     ("PRO-LABORE", 8),
@@ -117,7 +124,6 @@ PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
     ("COMISSOES", 7),
     ("HORAS EXTRAS", 7),
     ("PIS S/ FOLHA", 7),
-    # Custos de mão de obra - peso alto
     ("MAO-DE-OBRA DIRETA", 10),
     ("MAO-DE-OBRA INDIRETA", 10),
     ("SALARIOS E ORDENADOS CUSTOS", 10),
@@ -125,7 +131,6 @@ PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
     ("FERIAS CUSTOS", 10),
     ("INSS CUSTOS", 10),
     ("FGTS CUSTOS", 10),
-    # INSS Patronal específico - peso máximo
     ("INSS EMPRESA", 10),
     ("INSS TERCEIROS", 10),
     ("INSS ACIDENTE", 10),
@@ -133,13 +138,11 @@ PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
     ("ENCARGOS SOCIAIS", 10),
     ("CONTRIBUICAO PREVIDENCIARIA", 10),
     ("CONTRIBUICAO PATRONAL", 10),
-    # Impostos sobre folha - peso médio
     ("IMPOSTO DE RENDA A RECOLHER", 6),
     ("IMPOSTO DE RENDA RETIDO", 6),
     ("IRRF", 6),
     ("INSS", 5),
     ("FGTS", 5),
-    # Termos gerais de folha - peso médio
     ("FOLHA DE PAGAMENTO", 8),
     ("REMUNERACAO", 6),
     ("PESSOAL", 5),
@@ -150,26 +153,21 @@ PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
     ("FUNCIONARIOS", 5),
 ]
 
-# Palavras que BLOQUEIAM a conta (relacionadas a fornecedores/comercial)
 PALAVRAS_FOLHA_NEGATIVO: list[tuple[str, int]] = [
-    # Fornecedores - bloqueio total
     ("FORNECEDORES NACIONAIS", -50),
     ("FORNECEDORES ESTRANGEIROS", -50),
     ("FORNECEDORES DO GRUPO", -50),
     ("FORNECEDORES", -40),
-    # Clientes - bloqueio total
     ("CLIENTES NACIONAIS", -50),
     ("CLIENTES ESTRANGEIROS", -50),
     ("CLIENTES RELACIONADOS", -50),
     ("CLIENTES", -40),
-    # Estoques/mercadorias - bloqueio total
     ("MERCADORIAS PARA REVENDA", -50),
-    ("MATERIA-PRIMA", -30),  # pode ser custo, reduz mas não bloqueia totalmente
+    ("MATERIA-PRIMA", -30),
     ("ESTOQUE", -40),
     ("ALMOXARIFADO", -30),
     ("PRODUTOS ACABADOS", -40),
     ("PRODUTOS SEMI ACABADOS", -40),
-    # Imobilizado - bloqueio
     ("IMOVEIS", -40),
     ("MAQUINAS E EQUIPAMENTOS", -40),
     ("VEICULOS", -40),
@@ -183,7 +181,6 @@ PALAVRAS_FOLHA_NEGATIVO: list[tuple[str, int]] = [
     ("DEPRECIACAO DE MOVEIS", -30),
     ("DEPRECIACAO DE MAQUINAS", -30),
     ("DEPRECIACAO DE VEICULOS", -30),
-    # Financeiro - bloqueio parcial
     ("BANCO DO BRASIL", -30),
     ("BANCO ITAU", -30),
     ("BANCO BRADESCO", -30),
@@ -201,62 +198,389 @@ PALAVRAS_FOLHA_NEGATIVO: list[tuple[str, int]] = [
     ("CHEQUE ESPECIAL", -30),
     ("EMPRESTIMOS BANCOS", -30),
     ("FINANCIAMENTO BANCO", -30),
-    # Tributos sobre venda - bloqueio
     ("IPI A RECOLHER", -30),
     ("ICMS A RECOLHER", -30),
     ("ISS A RECOLHER", -30),
     ("PIS A RECOLHER", -30),
     ("COFINS A RECOLHER", -30),
     ("SIMPLES NACIONAL A RECOLHER", -30),
-    # Receitas - bloqueio total
     ("VENDA DE PRODUTOS", -50),
     ("VENDA DE MERCADORIAS", -50),
     ("SERVICOS PRESTADOS", -40),
     ("RECEITA", -40),
-    # Patrimônio líquido - bloqueio
     ("CAPITAL SOCIAL", -50),
     ("RESERVAS", -40),
     ("LUCROS OU PREJUIZOS", -40),
     ("DIVIDENDOS", -40),
-    # Contas de apuração - bloqueio
     ("RESULTADO DO EXERCICIO", -40),
     ("APURACAO DO RESULTADO", -40),
-    # Outros ativos - bloqueio
     ("ADIANTAMENTO A SOCIOS", -30),
     ("ADIANTAMENTO A FORNECEDORES", -20),
     ("TITULOS A RECEBER", -30),
     ("DEPOSITOS JUDICIAIS", -30),
     ("INVESTIMENTOS", -30),
     ("PARTICIPACOES SOCIETARIAS", -30),
-    # Tributos a recuperar - bloqueio
     ("IPI A RECUPERAR", -30),
     ("ICMS A RECUPERAR", -30),
     ("PIS A RECUPERAR", -30),
     ("COFINS A RECUPERAR", -30),
 ]
 
-# Score mínimo para uma conta ser considerada "de folha"
 SCORE_MINIMO_FOLHA = 5
 
 
 def calcular_score_folha(nome_conta_norm: str) -> int:
-    """
-    Calcula o score de relevância de uma conta para folha de pagamento.
-    Positivo = conta de folha. Negativo = conta de fornecedor/comercial.
-    """
     score = 0
     for termo, peso in PALAVRAS_FOLHA_POSITIVO:
         if _norm(termo) in nome_conta_norm:
             score += peso
     for termo, peso in PALAVRAS_FOLHA_NEGATIVO:
         if _norm(termo) in nome_conta_norm:
-            score += peso  # peso já é negativo
+            score += peso
     return score
 
 
 def conta_e_de_folha(nome_conta_norm: str) -> bool:
-    """Retorna True se a conta tem score mínimo para ser considerada de folha."""
     return calcular_score_folha(nome_conta_norm) >= SCORE_MINIMO_FOLHA
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# REGRA 2: MATRIZ DE CLASSIFICAÇÃO DINÂMICA
+# Tabelas SEPARADAS para Débito e Crédito por tipo de rubrica
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── PROVENTOS ─────────────────────────────────────────────────────────────
+# Débito: conta de Resultado/DRE ou Provisão (gasto)
+PROVENTO_DEBITO_POSITIVO = [
+    ("DESPESAS COM PESSOAL", 100),
+    ("SALARIOS E ORDENADOS", 90),
+    ("PRO-LABORE", 80),
+    ("PREMIOS E GRATIFICACOES", 80),
+    ("13 SALARIO", 80),
+    ("FERIAS", 80),
+    ("INSS CUSTOS", 80),
+    ("FGTS CUSTOS", 80),
+    ("INDENIZACOES E AVISO PREVIO", 80),
+    ("ASSISTENCIA MEDICA E SOCIAL", 70),
+    ("VALE TRANSPORTE", 70),
+    ("VALE REFEICAO", 70),
+    ("ALIMENTACAO", 70),
+    ("CESTA BASICA", 70),
+    ("PENSAO ALIMENTICIA", 70),
+    ("COMISSOES", 70),
+    ("HORAS EXTRAS", 70),
+    ("PIS S/ FOLHA", 70),
+    ("MAO-DE-OBRA DIRETA", 90),
+    ("MAO-DE-OBRA INDIRETA", 90),
+    ("PROVISOES PARA FERIAS", 85),
+    ("PROVISOES PARA 13", 85),
+    ("DESPESA", 50),
+    ("CUSTO", 50),
+    ("PROVISAO", 60),
+]
+PROVENTO_DEBITO_NEGATIVO = [
+    ("A PAGAR", -100),
+    ("A RECOLHER", -100),
+    ("FORNECEDORES", -100),
+    ("RETENCOES", -100),
+    ("OBRIGACOES", -80),
+    ("PASSIVO", -80),
+    ("CLIENTES", -100),
+    ("RECEITA", -100),
+    ("BANCO", -80),
+]
+
+# Crédito: conta centralizada de Salários a Pagar (passivo)
+PROVENTO_CREDITO_POSITIVO = [
+    ("SALARIOS E ORDENADOS A PAGAR", 200),
+    ("SALARIOS A PAGAR", 200),
+    ("ORDENADOS A PAGAR", 200),
+    ("FOLHA A PAGAR", 200),
+    ("OBRIGACOES COM O PESSOAL", 150),
+    ("PRO-LABORE A PAGAR", 150),
+    ("GRATIFICACOES A PAGAR", 120),
+    ("RESCISOES A PAGAR", 120),
+    ("FERIAS A PAGAR", 120),
+    ("13 SALARIO A PAGAR", 120),
+    ("PENSAO ALIMENTICIA A PAGAR", 120),
+    ("COMISSOES A PAGAR", 120),
+    ("AUTONOMOS A PAGAR", 120),
+    ("INDENIZACOES A PAGAR", 120),
+    ("PREMIOS E BONIFICACOES", 100),
+]
+PROVENTO_CREDITO_NEGATIVO = [
+    ("DESPESA", -100),
+    ("CUSTO", -100),
+    ("INSS", -80),
+    ("FGTS", -80),
+    ("PROVISAO", -60),
+    ("RECEITA", -100),
+    ("BANCO", -80),
+    ("FORNECEDORES", -100),
+]
+
+# ── DESCONTOS ─────────────────────────────────────────────────────────────
+# Débito: conta centralizada de Salários a Pagar (reduz o líquido)
+DESCONTO_DEBITO_POSITIVO = [
+    ("SALARIOS E ORDENADOS A PAGAR", 200),
+    ("SALARIOS A PAGAR", 200),
+    ("ORDENADOS A PAGAR", 200),
+    ("FOLHA A PAGAR", 200),
+    ("OBRIGACOES COM O PESSOAL", 150),
+    ("PRO-LABORE A PAGAR", 150),
+    ("GRATIFICACOES A PAGAR", 120),
+    ("RESCISOES A PAGAR", 120),
+]
+DESCONTO_DEBITO_NEGATIVO = [
+    ("DESPESA", -100),
+    ("CUSTO", -100),
+    ("INSS", -80),
+    ("FGTS", -80),
+    ("PROVISAO", -60),
+    ("RECEITA", -100),
+    ("BANCO", -80),
+    ("FORNECEDORES", -100),
+]
+
+# Crédito: conta de recolhimento/passivo específico do desconto
+DESCONTO_CREDITO_POSITIVO = [
+    ("INSS A RECOLHER", 200),
+    ("FGTS A RECOLHER", 200),
+    ("IRRF S/ FOLHA", 200),
+    ("IRRF A RECOLHER", 180),
+    ("PIS S/ FOLHA A RECOLHER", 180),
+    ("CONTRIBUICOES SINDICAIS", 160),
+    ("OBRIGACOES SOCIAIS", 150),
+    ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 150),
+    ("PENSAO ALIMENTICIA A PAGAR", 140),
+    ("COPARTICIPACAO", 130),
+    ("MENSALIDADE SINDICAL", 130),
+    ("EMPRESTIMOS CONSIGNADOS", 200),
+    ("CONSIGNADOS A PAGAR", 200),
+    ("CREDITO TRABALHO", 180),
+    ("EMPRESTIMOS DE FUNCIONARIOS", 180),
+    ("A RECOLHER", 80),
+    ("A PAGAR", 80),
+    ("RETIDO", 70),
+    ("PASSIVO", 50),
+]
+DESCONTO_CREDITO_NEGATIVO = [
+    ("DESPESA", -100),
+    ("CUSTO", -100),
+    ("SALARIOS A PAGAR", -80),
+    ("ORDENADOS A PAGAR", -80),
+    ("FORNECEDORES", -100),
+    ("RECEITA", -100),
+    ("BANCO", -80),
+]
+
+# ── INFORMATIVOS / ENCARGO PATRONAL ──────────────────────────────────────
+# Débito: conta de Resultado/DRE ou Provisão (gasto da empresa)
+INFORMATIVO_DEBITO_POSITIVO = [
+    ("DESPESAS COM PESSOAL", 100),
+    ("INSS CUSTOS", 100),
+    ("FGTS CUSTOS", 100),
+    ("ENCARGOS SOCIAIS", 100),
+    ("CONTRIBUICAO PATRONAL", 100),
+    ("CONTRIBUICAO PREVIDENCIARIA", 100),
+    ("INSS EMPRESA", 90),
+    ("INSS TERCEIROS", 90),
+    ("INSS ACIDENTE", 90),
+    ("PATRONAL", 90),
+    ("PROVISOES PARA FERIAS", 85),
+    ("PROVISOES PARA 13", 85),
+    ("INSS SOBRE PROVISOES", 85),
+    ("FGTS SOBRE PROVISOES", 85),
+    ("DESPESA", 50),
+    ("CUSTO", 50),
+    ("PROVISAO", 60),
+]
+INFORMATIVO_DEBITO_NEGATIVO = [
+    ("A RECOLHER", -100),
+    ("A PAGAR", -100),
+    ("FORNECEDORES", -100),
+    ("RECEITA", -100),
+    ("BANCO", -80),
+]
+
+# Crédito: conta de recolhimento/passivo da empresa
+INFORMATIVO_CREDITO_POSITIVO = [
+    ("INSS A RECOLHER", 200),
+    ("FGTS A RECOLHER", 200),
+    ("OBRIGACOES SOCIAIS", 150),
+    ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 150),
+    ("CONTRIBUICOES SINDICAIS", 120),
+    ("PIS S/ FOLHA A RECOLHER", 110),
+    ("A RECOLHER", 80),
+    ("PASSIVO", 50),
+]
+INFORMATIVO_CREDITO_NEGATIVO = [
+    ("DESPESA", -100),
+    ("CUSTO", -100),
+    ("SALARIOS A PAGAR", -80),
+    ("ORDENADOS A PAGAR", -80),
+    ("FORNECEDORES", -100),
+    ("RECEITA", -100),
+    ("BANCO", -80),
+]
+
+# ── FGTS DINÂMICO POR TIPO DE FOLHA ──────────────────────────────────────
+# Crédito sempre = FGTS a Recolher (passivo)
+FGTS_CREDITO_POSITIVO = [
+    ("FGTS A RECOLHER", 300),
+    ("FGTS A PAGAR", 280),
+    ("FUNDO DE GARANTIA", 200),
+    ("OBRIGACOES SOCIAIS", 100),
+]
+FGTS_CREDITO_NEGATIVO = [
+    ("DESPESA", -100),
+    ("CUSTO", -100),
+    ("PROVISAO", -80),
+    ("SALARIOS A PAGAR", -80),
+    ("INSS", -60),
+    ("FORNECEDOR", -100),
+]
+
+# Débito Folha Normal: conta de Resultado (DRE)
+FGTS_DEBITO_NORMAL_POSITIVO = [
+    ("FGTS CUSTOS", 200),
+    ("FGTS", 150),
+    ("ENCARGOS SOCIAIS", 120),
+    ("DESPESAS COM PESSOAL", 100),
+    ("DESPESA", 80),
+    ("CUSTO", 80),
+]
+FGTS_DEBITO_NORMAL_NEGATIVO = [
+    ("A RECOLHER", -100),
+    ("A PAGAR", -100),
+    ("PROVISAO", -80),
+    ("FORNECEDOR", -100),
+]
+
+# Débito Férias/13º: conta de Provisão (passivo)
+FGTS_DEBITO_PROVISAO_POSITIVO = [
+    ("FGTS SOBRE PROVISOES PARA FERIAS", 300),
+    ("FGTS SOBRE PROVISOES PARA 13", 300),
+    ("PROVISOES PARA FERIAS", 200),
+    ("PROVISOES PARA 13", 200),
+    ("FGTS SOBRE PROVISOES", 200),
+    ("PROVISAO", 100),
+]
+FGTS_DEBITO_PROVISAO_NEGATIVO = [
+    ("A RECOLHER", -100),
+    ("A PAGAR", -80),
+    ("DESPESA", -60),
+    ("CUSTO", -60),
+    ("FORNECEDOR", -100),
+]
+
+# Débito Rescisão: conta de Resultado (DRE) — multa rescisória
+FGTS_DEBITO_RESCISAO_POSITIVO = [
+    ("FGTS RESCISORIO", 300),
+    ("MULTA RESCISORIA", 300),
+    ("GRRF", 300),
+    ("DESPESA COM RESCISAO", 200),
+    ("FGTS CUSTOS", 150),
+    ("DESPESAS COM PESSOAL", 100),
+    ("DESPESA", 80),
+    ("CUSTO", 80),
+]
+FGTS_DEBITO_RESCISAO_NEGATIVO = [
+    ("A RECOLHER", -100),
+    ("A PAGAR", -100),
+    ("PROVISAO", -80),
+    ("FORNECEDOR", -100),
+]
+
+# ── EMPRÉSTIMO CONSIGNADO ─────────────────────────────────────────────────
+# Débito: Salários a Pagar (reduz o líquido)
+CONSIGNADO_DEBITO_POSITIVO = [
+    ("SALARIOS E ORDENADOS A PAGAR", 200),
+    ("SALARIOS A PAGAR", 200),
+    ("ORDENADOS A PAGAR", 200),
+    ("FOLHA A PAGAR", 200),
+    ("OBRIGACOES COM O PESSOAL", 150),
+]
+CONSIGNADO_DEBITO_NEGATIVO = [
+    ("DESPESA", -100),
+    ("CUSTO", -100),
+    ("BANCOS", -100),
+    ("FORNECEDORES", -100),
+    ("EMPRESTIMOS", -80),
+    ("CONSIGNADO", -80),
+    ("RECEITA", -100),
+]
+
+# Crédito: conta de repasse dos consignados (passivo)
+CONSIGNADO_CREDITO_POSITIVO = [
+    ("EMPRESTIMOS CONSIGNADOS", 300),
+    ("CONSIGNADOS A PAGAR", 300),
+    ("CREDITO TRABALHO", 280),
+    ("EMPRESTIMOS DE FUNCIONARIOS", 250),
+    ("EMPRESTIMO / CONSIGNADO", 250),
+    ("EMPRESTIMO", 150),
+    ("CONSIGNADO", 150),
+]
+CONSIGNADO_CREDITO_NEGATIVO = [
+    ("DESPESA", -100),
+    ("CUSTO", -100),
+    ("SALARIOS A PAGAR", -80),
+    ("ORDENADOS A PAGAR", -80),
+    ("FORNECEDORES", -100),
+    ("RECEITA", -100),
+    ("BANCO", -60),  # banco conta movimento — não é o destino
+]
+
+
+def _score_conta(
+    nome_conta_norm: str,
+    positivos: list[tuple[str, int]],
+    negativos: list[tuple[str, int]],
+) -> int:
+    """Calcula score de uma conta contra listas de termos positivos e negativos."""
+    score = 0
+    for termo, peso in positivos:
+        if _norm(termo) in nome_conta_norm:
+            score += peso
+    for termo, peso in negativos:
+        if _norm(termo) in nome_conta_norm:
+            score += peso  # peso já é negativo
+    return score
+
+
+def _melhor_conta_por_score(
+    df_contas: pd.DataFrame,
+    positivos: list[tuple[str, int]],
+    negativos: list[tuple[str, int]],
+    score_minimo: int = 1,
+) -> tuple[str, str]:
+    """
+    Retorna (reduzido, nome_original) da conta analítica com maior score.
+    Respeita score_minimo para evitar matches ruins.
+    """
+    if df_contas is None or df_contas.empty:
+        return "", ""
+
+    df_a = df_contas[df_contas["tipo"] == "A"].copy()
+    if df_a.empty:
+        return "", ""
+
+    melhor_score = -9999
+    melhor_reduzido = ""
+    melhor_nome = ""
+
+    for _, row in df_a.iterrows():
+        nome_n = row["nome_conta"]
+        s = _score_conta(nome_n, positivos, negativos)
+        if s > melhor_score:
+            melhor_score = s
+            melhor_reduzido = row["reduzido"]
+            melhor_nome = row["nome_original"]
+
+    if melhor_score < score_minimo:
+        return "", ""
+
+    return melhor_reduzido, melhor_nome
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -308,7 +632,6 @@ KWORDS_RUBRICA: dict[str, list[str]] = {
         "DIAS NORMAIS","HORAS NORMAIS","SALDO SALARIO",
         "ESTOURO","TROCO","FECHAMENTO","DIAS FERIAS",
     ],
-    # Grupo específico para INSS Patronal (Tipo Folha = Empresa)
     "Encargo Patronal": [
         "INSS EMPRESA","INSS TERCEIROS","INSS ACID","INSS ACIDENTE",
         "INSS PATRONAL","ENCARGO PATRONAL","CONTRIBUICAO PATRONAL",
@@ -320,13 +643,27 @@ KWORDS_RUBRICA: dict[str, list[str]] = {
 
 TIPOS_NAO_CUSTO = {"Desconto", "Informativa", "Inf. Dedutora"}
 
+# Mapeamento de palavras-chave de rubricas de consignado
+PALAVRAS_CONSIGNADO = [
+    "EMPRESTIMO CONSIGNADO", "CONSIGNADO", "CREDITO TRABALHO",
+    "EMP CRED TRAB", "EMPRESTIMO TRABALHADOR", "CONSIG",
+]
+
+
+def _e_rubrica_consignado(nome_rubrica_norm: str) -> bool:
+    """Verifica se a rubrica é de empréstimo consignado."""
+    for p in PALAVRAS_CONSIGNADO:
+        if _norm(p) in nome_rubrica_norm:
+            return True
+    return False
+
+
+def _e_rubrica_fgts(nome_rubrica_norm: str) -> bool:
+    """Verifica se a rubrica é de FGTS."""
+    return "FGTS" in nome_rubrica_norm or "F.G.T.S" in nome_rubrica_norm
+
 
 def classificar_rubrica_local(nome_rubrica: str, tipo_rubrica: str, tipo_folha: str = "1") -> dict:
-    """
-    Classifica a rubrica em um grupo de despesa.
-    Quando tipo_folha == "2" (Empresa), força o grupo "Encargo Patronal".
-    """
-    # Tipo Folha "Empresa" = INSS Patronal — grupo fixo
     if tipo_folha == "2":
         return {"grupo": "Encargo Patronal", "confianca": "alta"}
 
@@ -443,8 +780,6 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
     df = pd.DataFrame(registros).drop_duplicates(subset=["classificacao"]).reset_index(drop=True)
     n_a = len(df[df["tipo"] == "A"])
     n_s = len(df[df["tipo"] == "S"])
-
-    # Log das contas filtradas por score
     n_folha = len(df[(df["tipo"] == "A") & (df["score_folha"] >= SCORE_MINIMO_FOLHA)])
     log.append(
         f"Plano de Contas OK: {len(df)} contas ({n_a} analíticas · {n_s} sintéticas · "
@@ -454,7 +789,142 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# KEYWORDS POR GRUPO — DÉBITO E CRÉDITO
+# MOTOR PRINCIPAL DE DE/PARA — V6
+# Aplica as regras de negócio por tipo de rubrica e tipo de folha
+# ══════════════════════════════════════════════════════════════════════════
+def gerar_depara_evento_conta(
+    evento_cod:    str,
+    evento_nome:   str,
+    evento_tipo:   str,  # "Provento", "Desconto", "Informativa", "Inf. Dedutora"
+    grupo:         str,
+    df_contas:     pd.DataFrame,
+    tipo_folha:    str = "1",
+) -> dict:
+    """
+    Determina Conta Débito e Conta Crédito com base nas regras de negócio V6.
+    Garante que Débito ≠ Crédito (anti curto-circuito).
+    """
+    resultado_vazio = {
+        "conta_debito": "", "conta_credito": "",
+        "desc_debito": "", "desc_credito": "",
+    }
+
+    if df_contas is None or df_contas.empty:
+        return resultado_vazio
+
+    nome_norm = _norm(evento_nome)
+
+    # ── Detecta casos especiais ─────────────────────────────────────────
+    e_consignado = _e_rubrica_consignado(nome_norm)
+    e_fgts       = _e_rubrica_fgts(nome_norm)
+    e_encargo    = (tipo_folha == "2") or (grupo == "Encargo Patronal")
+
+    # ── CASO 1: Empréstimo Consignado ───────────────────────────────────
+    if e_consignado and evento_tipo in ("Desconto", "Inf. Dedutora"):
+        cod_deb, desc_deb = _melhor_conta_por_score(
+            df_contas, CONSIGNADO_DEBITO_POSITIVO, CONSIGNADO_DEBITO_NEGATIVO, score_minimo=50
+        )
+        cod_cred, desc_cred = _melhor_conta_por_score(
+            df_contas, CONSIGNADO_CREDITO_POSITIVO, CONSIGNADO_CREDITO_NEGATIVO, score_minimo=50
+        )
+        if validar_par_contas(cod_deb, cod_cred):
+            return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                    "desc_debito": desc_deb, "desc_credito": desc_cred}
+
+    # ── CASO 2: FGTS Dinâmico ───────────────────────────────────────────
+    if e_fgts and evento_tipo in ("Informativa", "Inf. Dedutora"):
+        # Crédito sempre = FGTS a Recolher
+        cod_cred, desc_cred = _melhor_conta_por_score(
+            df_contas, FGTS_CREDITO_POSITIVO, FGTS_CREDITO_NEGATIVO, score_minimo=50
+        )
+        # Débito varia por tipo de folha
+        if tipo_folha in ("3", "6"):  # Férias ou Provisão de 13º
+            cod_deb, desc_deb = _melhor_conta_por_score(
+                df_contas, FGTS_DEBITO_PROVISAO_POSITIVO, FGTS_DEBITO_PROVISAO_NEGATIVO, score_minimo=30
+            )
+        elif tipo_folha == "4":  # Rescisão
+            cod_deb, desc_deb = _melhor_conta_por_score(
+                df_contas, FGTS_DEBITO_RESCISAO_POSITIVO, FGTS_DEBITO_RESCISAO_NEGATIVO, score_minimo=30
+            )
+        else:  # Folha Normal (1), Empresa (2), Provisão Férias (5)
+            cod_deb, desc_deb = _melhor_conta_por_score(
+                df_contas, FGTS_DEBITO_NORMAL_POSITIVO, FGTS_DEBITO_NORMAL_NEGATIVO, score_minimo=30
+            )
+        if validar_par_contas(cod_deb, cod_cred):
+            return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                    "desc_debito": desc_deb, "desc_credito": desc_cred}
+
+    # ── CASO 3: Encargo Patronal (Tipo Folha = Empresa) ─────────────────
+    if e_encargo:
+        cod_deb, desc_deb = _melhor_conta_por_score(
+            df_contas, INFORMATIVO_DEBITO_POSITIVO, INFORMATIVO_DEBITO_NEGATIVO, score_minimo=30
+        )
+        cod_cred, desc_cred = _melhor_conta_por_score(
+            df_contas, INFORMATIVO_CREDITO_POSITIVO, INFORMATIVO_CREDITO_NEGATIVO, score_minimo=30
+        )
+        if validar_par_contas(cod_deb, cod_cred):
+            return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                    "desc_debito": desc_deb, "desc_credito": desc_cred}
+
+    # ── CASO 4: Proventos ────────────────────────────────────────────────
+    if evento_tipo == "Provento":
+        cod_deb, desc_deb = _melhor_conta_por_score(
+            df_contas, PROVENTO_DEBITO_POSITIVO, PROVENTO_DEBITO_NEGATIVO, score_minimo=30
+        )
+        cod_cred, desc_cred = _melhor_conta_por_score(
+            df_contas, PROVENTO_CREDITO_POSITIVO, PROVENTO_CREDITO_NEGATIVO, score_minimo=50
+        )
+        if validar_par_contas(cod_deb, cod_cred):
+            return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                    "desc_debito": desc_deb, "desc_credito": desc_cred}
+        # Curto-circuito detectado: resetar débito e buscar alternativa
+        cod_deb, desc_deb = _melhor_conta_por_score(
+            df_contas,
+            [(t, p) for t, p in PROVENTO_DEBITO_POSITIVO if _norm(t) != _norm(cod_cred)],
+            PROVENTO_DEBITO_NEGATIVO + [(cod_cred, -200)],
+            score_minimo=10
+        )
+        return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                "desc_debito": desc_deb, "desc_credito": desc_cred}
+
+    # ── CASO 5: Descontos ────────────────────────────────────────────────
+    if evento_tipo in ("Desconto", "Inf. Dedutora"):
+        cod_deb, desc_deb = _melhor_conta_por_score(
+            df_contas, DESCONTO_DEBITO_POSITIVO, DESCONTO_DEBITO_NEGATIVO, score_minimo=50
+        )
+        cod_cred, desc_cred = _melhor_conta_por_score(
+            df_contas, DESCONTO_CREDITO_POSITIVO, DESCONTO_CREDITO_NEGATIVO, score_minimo=30
+        )
+        if validar_par_contas(cod_deb, cod_cred):
+            return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                    "desc_debito": desc_deb, "desc_credito": desc_cred}
+        # Curto-circuito: resetar crédito
+        cod_cred, desc_cred = _melhor_conta_por_score(
+            df_contas,
+            DESCONTO_CREDITO_POSITIVO,
+            DESCONTO_CREDITO_NEGATIVO + [(cod_deb, -200)],
+            score_minimo=10
+        )
+        return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                "desc_debito": desc_deb, "desc_credito": desc_cred}
+
+    # ── CASO 6: Informativas (não FGTS, não Encargo) ─────────────────────
+    if evento_tipo == "Informativa":
+        cod_deb, desc_deb = _melhor_conta_por_score(
+            df_contas, INFORMATIVO_DEBITO_POSITIVO, INFORMATIVO_DEBITO_NEGATIVO, score_minimo=20
+        )
+        cod_cred, desc_cred = _melhor_conta_por_score(
+            df_contas, INFORMATIVO_CREDITO_POSITIVO, INFORMATIVO_CREDITO_NEGATIVO, score_minimo=20
+        )
+        if validar_par_contas(cod_deb, cod_cred):
+            return {"conta_debito": cod_deb, "conta_credito": cod_cred,
+                    "desc_debito": desc_deb, "desc_credito": desc_cred}
+
+    return resultado_vazio
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# KEYWORDS POR GRUPO — mantidas para compatibilidade com filtros de CC
 # ══════════════════════════════════════════════════════════════════════════
 KWORDS_DEBITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
@@ -504,7 +974,6 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "BAIXAS DE IMOBILIZADO","PROVISAO IRPJ","PROVISAO CSLL",
         "PERDAS POR FALTA NO INVENTARIO",
     ],
-    # Encargo Patronal: débito em despesas com encargos sociais
     "Encargo Patronal": [
         "DESPESAS COM PESSOAL","INSS","ENCARGOS SOCIAIS",
         "CONTRIBUICAO PREVIDENCIARIA","CONTRIBUICAO PATRONAL",
@@ -565,7 +1034,6 @@ KWORDS_CREDITO: dict[str, list[str]] = {
         "PROVISAO P/ CONTRIBUICAO SOCIAL S/ LUCRO",
         "IMPOSTO DE RENDA A RECOLHER","CONTRIBUICAO SOCIAL A RECOLHER",
     ],
-    # Encargo Patronal: crédito em INSS a Recolher / Obrigações Sociais
     "Encargo Patronal": [
         "INSS A RECOLHER",
         "OBRIGACOES SOCIAIS",
@@ -591,21 +1059,13 @@ GRUPOS_LISTA = [
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# FUNÇÕES DE CLASSIFICAÇÃO DE CONTAS POR GRUPO
+# FUNÇÕES DE CLASSIFICAÇÃO DE CONTAS POR GRUPO (para preview de CC)
 # ══════════════════════════════════════════════════════════════════════════
-def _conta_bate(nome_conta_norm: str, keywords: list[str]) -> bool:
-    for kw in keywords:
-        if _norm(kw) in nome_conta_norm:
-            return True
-    return False
-
-
 def _analiticas(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["tipo"] == "A"].copy() if not df.empty else df
 
 
 def _analiticas_folha(df: pd.DataFrame) -> pd.DataFrame:
-    """Retorna apenas contas analíticas com score de folha suficiente."""
     df_a = _analiticas(df)
     if df_a.empty:
         return df_a
@@ -616,11 +1076,17 @@ def _analiticas_folha(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fmt_opcoes(df_f: pd.DataFrame) -> list[str]:
-    """Formata opções como 'reduzido - descrição original'."""
     return [""] + [
         f"{r['reduzido']} - {r['nome_original']}"
         for _, r in df_f.iterrows()
     ]
+
+
+def _conta_bate(nome_conta_norm: str, keywords: list[str]) -> bool:
+    for kw in keywords:
+        if _norm(kw) in nome_conta_norm:
+            return True
+    return False
 
 
 def filtrar_contas_por_grupo(
@@ -628,11 +1094,6 @@ def filtrar_contas_por_grupo(
     grupo: str,
     aplicar_filtro_folha: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Retorna (df_debito, df_credito) filtrados pelo grupo.
-    Aplica filtro de score de folha para garantir que apenas contas
-    relacionadas a pessoal/folha sejam retornadas.
-    """
     if aplicar_filtro_folha and grupo != "Outro":
         df_a = _analiticas_folha(df_contas)
     else:
@@ -660,20 +1121,17 @@ def filtrar_contas_por_grupo(
 
 
 def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], list[str]]:
-    """Retorna listas de opções formatadas para selectbox."""
     df_d, df_c = filtrar_contas_por_grupo(df_contas, grupo)
     return _fmt_opcoes(df_d), _fmt_opcoes(df_c)
 
 
 def extrair_codigo(opcao: str) -> str:
-    """Extrai o código reduzido da opção 'reduzido - descrição'."""
     if not opcao or " - " not in opcao:
         return opcao or ""
     return opcao.split(" - ")[0].strip()
 
 
 def extrair_descricao(opcao: str) -> str:
-    """Extrai a descrição da opção 'reduzido - descrição'."""
     if not opcao or " - " not in opcao:
         return ""
     partes = opcao.split(" - ", 1)
@@ -681,7 +1139,6 @@ def extrair_descricao(opcao: str) -> str:
 
 
 def buscar_conta_por_reduzido(df_contas: pd.DataFrame, reduzido: str) -> str:
-    """Busca a descrição original de uma conta pelo código reduzido."""
     if df_contas is None or df_contas.empty or not reduzido:
         return ""
     mask = df_contas["reduzido"] == str(reduzido).strip()
@@ -699,77 +1156,6 @@ def _idx(opcoes: list[str], valor: str) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# CORE: GERAR DE/PARA EVENTO vs CONTA CONTÁBIL POR GRUPO
-# ══════════════════════════════════════════════════════════════════════════
-def gerar_depara_evento_conta(
-    evento_cod:    str,
-    evento_nome:   str,
-    evento_tipo:   str,
-    grupo:         str,
-    df_contas:     pd.DataFrame,
-    tipo_folha:    str = "1",
-) -> dict:
-    """
-    Para um evento específico, dentro de um grupo de despesa,
-    retorna as contas de débito e crédito mais adequadas.
-
-    Para Tipo Folha "Empresa" (INSS Patronal), prioriza contas
-    de encargos sociais/obrigações previdenciárias.
-    """
-    if df_contas is None or df_contas.empty:
-        return {
-            "conta_debito": "", "conta_credito": "",
-            "desc_debito": "", "desc_credito": "",
-        }
-
-    # Para Encargo Patronal, sempre aplica filtro de folha
-    aplicar_filtro = (grupo != "Outro")
-    df_d, df_c = filtrar_contas_por_grupo(df_contas, grupo, aplicar_filtro_folha=aplicar_filtro)
-
-    evento_norm = _norm(evento_nome)
-
-    def melhor_conta(df_grupo: pd.DataFrame) -> tuple[str, str]:
-        if df_grupo.empty:
-            return "", ""
-
-        palavras_evento = [p for p in evento_norm.split() if len(p) > 3]
-
-        # Para Encargo Patronal, tenta match específico pelo nome do evento
-        if tipo_folha == "2":
-            # Tenta encontrar conta de INSS a Recolher
-            for _, row in df_grupo.iterrows():
-                nome_c = row["nome_conta"]
-                if "INSS A RECOLHER" in nome_c or "OBRIGACOES SOCIAIS" in nome_c:
-                    return row["reduzido"], row["nome_original"]
-
-        # Match por palavras do evento
-        melhor_score = -1
-        melhor_idx = 0
-        for idx, row in df_grupo.iterrows():
-            nome_c = row["nome_conta"]
-            score = sum(1 for p in palavras_evento if p in nome_c)
-            # Bônus pelo score de folha
-            if "score_folha" in row:
-                score += row["score_folha"] * 0.1
-            if score > melhor_score:
-                melhor_score = score
-                melhor_idx = df_grupo.index.get_loc(idx)
-
-        row_sel = df_grupo.iloc[melhor_idx]
-        return row_sel["reduzido"], row_sel["nome_original"]
-
-    cod_deb, desc_deb = melhor_conta(df_d)
-    cod_cred, desc_cred = melhor_conta(df_c)
-
-    return {
-        "conta_debito":  cod_deb,
-        "conta_credito": cod_cred,
-        "desc_debito":   desc_deb,
-        "desc_credito":  desc_cred,
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════
 # CLASSIFICAÇÃO AUTOMÁTICA
 # ══════════════════════════════════════════════════════════════════════════
 def classificar_todos_eventos(
@@ -778,12 +1164,7 @@ def classificar_todos_eventos(
     df_contas: pd.DataFrame | None,
     log:       list,
 ) -> dict:
-    """
-    Classifica cada evento individualmente.
-    Tipo Folha "2" (Empresa) → grupo "Encargo Patronal" automaticamente.
-    """
     resultado: dict[str, dict] = {}
-    # Chave única por (cod, tipo_folha) para diferenciar o mesmo evento em folhas diferentes
     chaves_unicas = {(ev["cod"], ev["tipo_folha"]) for ev in eventos}
 
     for cod, tipo_folha in chaves_unicas:
@@ -797,6 +1178,7 @@ def classificar_todos_eventos(
 
         conta_debito = conta_credito = ""
         desc_debito  = desc_credito  = ""
+        curto_circuito = False
 
         if df_contas is not None and not df_contas.empty:
             depara = gerar_depara_evento_conta(cod, nome, tipo, grupo, df_contas, tipo_folha)
@@ -805,26 +1187,34 @@ def classificar_todos_eventos(
             desc_debito   = depara["desc_debito"]
             desc_credito  = depara["desc_credito"]
 
+            # Validação anti curto-circuito
+            if not validar_par_contas(conta_debito, conta_credito):
+                curto_circuito = True
+                conta_debito = ""
+                desc_debito = ""
+                log.append(f"⚠️ CURTO-CIRCUITO detectado: Rubrica {cod} ({nome}) — Débito = Crédito = {conta_credito}. Débito resetado.")
+
         chave_resultado = f"{cod}_{tipo_folha}"
         resultado[chave_resultado] = {
-            "grupo":         grupo,
-            "confianca":     confianca,
-            "conta_debito":  conta_debito,
-            "conta_credito": conta_credito,
-            "desc_debito":   desc_debito,
-            "desc_credito":  desc_credito,
-            "tipo_folha":    tipo_folha,
+            "grupo":          grupo,
+            "confianca":      confianca,
+            "conta_debito":   conta_debito,
+            "conta_credito":  conta_credito,
+            "desc_debito":    desc_debito,
+            "desc_credito":   desc_credito,
+            "tipo_folha":     tipo_folha,
+            "curto_circuito": curto_circuito,
         }
 
-    # Contadores por confiança
     n_alta   = sum(1 for v in resultado.values() if v["confianca"] == "alta")
     n_media  = sum(1 for v in resultado.values() if v["confianca"] == "media")
     n_baixa  = sum(1 for v in resultado.values() if v["confianca"] == "baixa")
     n_patron = sum(1 for v in resultado.values() if v["grupo"] == "Encargo Patronal")
+    n_cc     = sum(1 for v in resultado.values() if v.get("curto_circuito"))
     log.append(
         f"Classificação automática: {len(resultado)} rubricas → "
         f"🟢 {n_alta} alta · 🟡 {n_media} média · 🔴 {n_baixa} baixa · "
-        f"🏛️ {n_patron} Encargo Patronal"
+        f"🏛️ {n_patron} Encargo Patronal · ⚡ {n_cc} curto-circuito"
     )
     return resultado
 
@@ -836,10 +1226,6 @@ def classificar_eventos_por_grupo_cc(
     df_contas: pd.DataFrame,
     log:       list,
 ) -> dict:
-    """
-    Com separador: todos os eventos do CC usam o grupo do CC.
-    Tipo Folha "Empresa" sempre usa "Encargo Patronal".
-    """
     resultado: dict[str, dict] = {}
 
     for ev in eventos:
@@ -849,25 +1235,31 @@ def classificar_eventos_por_grupo_cc(
         nome       = info.get("descricao", cod)
         tipo       = info.get("tipo", "Provento")
 
-        # Tipo Folha Empresa sempre usa Encargo Patronal
         grupo_efetivo = "Encargo Patronal" if tipo_folha == "2" else grupo_cc
 
         depara = gerar_depara_evento_conta(cod, nome, tipo, grupo_efetivo, df_contas, tipo_folha)
 
+        # Validação anti curto-circuito
+        curto_circuito = False
+        if not validar_par_contas(depara["conta_debito"], depara["conta_credito"]):
+            curto_circuito = True
+            depara["conta_debito"] = ""
+            depara["desc_debito"] = ""
+            log.append(f"⚠️ CURTO-CIRCUITO (CC): Rubrica {cod} ({nome}) — Débito resetado.")
+
         chave = f"{cod}_{tipo_folha}"
         resultado[chave] = {
-            "grupo":         grupo_efetivo,
-            "confianca":     "manual" if tipo_folha != "2" else "alta",
-            "conta_debito":  depara["conta_debito"],
-            "conta_credito": depara["conta_credito"],
-            "desc_debito":   depara["desc_debito"],
-            "desc_credito":  depara["desc_credito"],
-            "tipo_folha":    tipo_folha,
+            "grupo":          grupo_efetivo,
+            "confianca":      "manual" if tipo_folha != "2" else "alta",
+            "conta_debito":   depara["conta_debito"],
+            "conta_credito":  depara["conta_credito"],
+            "desc_debito":    depara["desc_debito"],
+            "desc_credito":   depara["desc_credito"],
+            "tipo_folha":     tipo_folha,
+            "curto_circuito": curto_circuito,
         }
 
-    log.append(
-        f"CC com grupo '{grupo_cc}': {len(resultado)} evento(s) classificado(s)."
-    )
+    log.append(f"CC com grupo '{grupo_cc}': {len(resultado)} evento(s) classificado(s).")
     return resultado
 
 
@@ -982,7 +1374,6 @@ def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
                             "centro_custo_nome": cc_nome_atual,
                         })
 
-    # Log por tipo de folha
     por_folha: dict[str, int] = {}
     for ev in eventos:
         desc = ev["tipo_folha_desc"]
@@ -1031,18 +1422,14 @@ def gerar_excel_configuracao(
 
         conta_deb = conta_cred = historico = grupo = ""
         desc_deb  = desc_cred = ""
+        curto_circuito = False
 
         chave_auto = f"{cod}_{tipo_folha}"
 
         if usa_separador and config_cc and cc_cod in config_cc:
             cfg   = config_cc[cc_cod]
             historico = cfg.get("historico", "")
-
-            # Tipo Folha "Empresa" sempre usa Encargo Patronal
-            if tipo_folha == "2":
-                grupo = "Encargo Patronal"
-            else:
-                grupo = cfg.get("grupo", "")
+            grupo = "Encargo Patronal" if tipo_folha == "2" else cfg.get("grupo", "")
 
             if df_contas is not None and not df_contas.empty and grupo:
                 depara = gerar_depara_evento_conta(
@@ -1053,13 +1440,21 @@ def gerar_excel_configuracao(
                 desc_deb   = depara["desc_debito"]
                 desc_cred  = depara["desc_credito"]
 
+                if not validar_par_contas(conta_deb, conta_cred):
+                    curto_circuito = True
+                    conta_deb = ""
+                    desc_deb = ""
+
         elif classif_auto and chave_auto in classif_auto:
-            auto       = classif_auto[chave_auto]
-            grupo      = auto.get("grupo", "")
-            conta_deb  = auto.get("conta_debito", "")
-            conta_cred = auto.get("conta_credito", "")
-            desc_deb   = auto.get("desc_debito", "")
-            desc_cred  = auto.get("desc_credito", "")
+            auto          = classif_auto[chave_auto]
+            grupo         = auto.get("grupo", "")
+            conta_deb     = auto.get("conta_debito", "")
+            conta_cred    = auto.get("conta_credito", "")
+            desc_deb      = auto.get("desc_debito", "")
+            desc_cred     = auto.get("desc_credito", "")
+            curto_circuito = auto.get("curto_circuito", False)
+
+        obs = "⚡ CURTO-CIRCUITO: Débito resetado" if curto_circuito else ""
 
         linhas.append({
             "Cód. Empresa":              cod_empresa,
@@ -1079,7 +1474,7 @@ def gerar_excel_configuracao(
             "Descrição Conta Crédito":   desc_cred,
             "Cód. Histórico":            "",
             "Histórico":                 historico,
-            "Observação":                "",
+            "Observação":                obs,
         })
 
     df = pd.DataFrame(linhas)
@@ -1104,11 +1499,6 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin"),
     )
-    # Colunas:
-    # A=CodEmp B=CodEv C=DescPDF D=DescRubr E=TipoRubr F=TipoFolhaN
-    # G=TipoFolha H=CodCC I=CC J=Grupo K=UsaSep
-    # L=ContaDeb M=DescContaDeb N=ContaCred O=DescContaCred
-    # P=CodHist Q=Hist R=Obs
     larguras = {
         "A": 12, "B": 12, "C": 38, "D": 38, "E": 16,
         "F": 14, "G": 20, "H": 18, "I": 22, "J": 22,
@@ -1128,8 +1518,8 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
         "Informativa":   "CCE5FF",
         "Inf. Dedutora": "FFF3CD",
     }
-    # Cor especial para Tipo Folha "Empresa" (INSS Patronal)
-    COR_EMPRESA = "E8D5FF"  # Lilás para destacar encargo patronal
+    COR_EMPRESA      = "E8D5FF"
+    COR_CURTO_CIRC   = "FFD700"  # Amarelo ouro para alertas de curto-circuito
 
     for col_idx, cell in enumerate(ws[1], start=1):
         if col_idx in COLS_EDITAVEIS:
@@ -1151,9 +1541,12 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
     for row_idx, row in enumerate(ws.iter_rows(min_row=2), start=2):
         tipo_val       = ws.cell(row=row_idx, column=5).value or ""
         tipo_folha_val = ws.cell(row=row_idx, column=6).value or ""
+        obs_val        = ws.cell(row=row_idx, column=18).value or ""
 
-        # Tipo Folha "2" = Empresa (INSS Patronal) → cor lilás
-        if str(tipo_folha_val).strip() == "2":
+        # Prioridade: curto-circuito > Empresa > tipo normal
+        if "CURTO-CIRCUITO" in str(obs_val).upper():
+            cor_linha = COR_CURTO_CIRC
+        elif str(tipo_folha_val).strip() == "2":
             cor_linha = COR_EMPRESA
         else:
             cor_linha = TIPO_COR.get(tipo_val, "E2E3E5")
@@ -1239,7 +1632,7 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
     )
 
     linhas_evento, linhas_integra, linhas_integra_xls = [], [], []
-    sem_conta = com_conta = 0
+    sem_conta = com_conta = curto_circuito_count = 0
 
     for _, row in df.iterrows():
         empresa     = _limpa(row.get(col_map.get("empresa",      ""), "")) or cod_empresa_padrao
@@ -1255,6 +1648,12 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
 
         if not seq:
             continue
+
+        # Validação anti curto-circuito na geração final
+        if debito and credito and debito == credito:
+            curto_circuito_count += 1
+            log.append(f"⚠️ CURTO-CIRCUITO na exportação: Seq {seq} — Débito = Crédito = {debito}. Débito removido.")
+            debito = ""
 
         sep_val = "1" if usa_sep.lower() == "sim" else "0"
         if debito or credito:
@@ -1291,7 +1690,10 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
             "Código do Histórico":             historico,
         })
 
-    log.append(f"Arquivos → Com conta: {com_conta} | Sem conta: {sem_conta}")
+    log.append(
+        f"Arquivos → Com conta: {com_conta} | Sem conta: {sem_conta} | "
+        f"Curto-circuito corrigido: {curto_circuito_count}"
+    )
 
     buf_evento = BytesIO()
     with pd.ExcelWriter(buf_evento, engine="openpyxl") as writer:
@@ -1365,7 +1767,8 @@ def main():
             <p style="color:#DDDDDD; margin:6px 0 0 0;">
                 <b>Etapa 1:</b> PDF + TXT + Plano de Contas → classifica automaticamente → gera Excel.<br>
                 <b>Etapa 2:</b> Excel preenchido → gera <b>evento exemplo.xlsx</b> e <b>integra exemplo.xlsx</b>.<br>
-                <span style="color:#CC99FF;">🏛️ Tipo Folha "Empresa" = INSS Patronal → grupo <b>Encargo Patronal</b> automático.</span>
+                <span style="color:#CC99FF;">🏛️ Tipo Folha "Empresa" = INSS Patronal → grupo <b>Encargo Patronal</b> automático.</span><br>
+                <span style="color:#FFD700;">⚡ Anti curto-circuito: Débito ≠ Crédito garantido em todos os lançamentos.</span>
             </p>
         </div>
         """,
@@ -1385,12 +1788,16 @@ def main():
         st.markdown("🟣 Lilás → Encargo Patronal")
         st.markdown("🟠 Laranja → Campos editáveis")
         st.markdown("🌿 Verde claro → Preenchimento automático")
+        st.markdown("⭐ Dourado → Curto-circuito detectado")
         st.markdown("---")
-        st.markdown("### ℹ️ Regra De/Para")
+        st.markdown("### 📋 Regras de Negócio V6")
         st.markdown(
-            "**Tipo Folha Empresa:** Grupo fixo = Encargo Patronal.\n\n"
-            "**Com separador:** Grupo definido por CC → cada evento recebe as contas do grupo.\n\n"
-            "**Sem separador:** Grupo definido por rubrica → contas do grupo da rubrica."
+            "**Proventos:** Débito = Despesa (DRE) | Crédito = Salários a Pagar\n\n"
+            "**Descontos:** Débito = Salários a Pagar | Crédito = Obrigação específica\n\n"
+            "**Informativos:** Débito = Encargo (DRE) | Crédito = INSS/FGTS a Recolher\n\n"
+            "**FGTS:** Crédito fixo = FGTS a Recolher | Débito varia por tipo de folha\n\n"
+            "**Consignado:** Débito = Salários a Pagar | Crédito = Empréstimos Consignados\n\n"
+            "**⚡ Anti curto-circuito:** Débito ≠ Crédito sempre verificado"
         )
         st.markdown("---")
         st.markdown(f"**Versão:** {VERSAO}")
@@ -1463,16 +1870,37 @@ def main():
             f"**{len(df_pc)}** contas ({n_a} analíticas · {n_s} sintéticas · "
             f"**{n_folha}** de folha)"
         )
-        with st.expander("🔍 Ver amostra das contas analíticas de folha", expanded=False):
-            if "score_folha" in df_pc.columns:
-                df_am = df_pc[(df_pc["tipo"] == "A") & (df_pc["score_folha"] >= SCORE_MINIMO_FOLHA)][
-                    ["reduzido", "classificacao", "nome_original", "score_folha"]
-                ].sort_values("score_folha", ascending=False).head(30)
-                df_am.columns = ["Código Reduzido", "Classificação", "Nome da Conta", "Score Folha"]
-            else:
-                df_am = df_pc[df_pc["tipo"] == "A"][["reduzido", "classificacao", "nome_original"]].head(30)
-                df_am.columns = ["Código Reduzido", "Classificação", "Nome da Conta"]
-            st.dataframe(df_am, use_container_width=True)
+
+        # Preview das regras de negócio aplicadas ao plano
+        with st.expander("🔍 Preview das regras V6 no Plano de Contas", expanded=False):
+            col_prev_a, col_prev_b, col_prev_c = st.columns(3)
+            with col_prev_a:
+                st.markdown("**Proventos — Crédito (Salários a Pagar)**")
+                cod_t, desc_t = _melhor_conta_por_score(df_pc, PROVENTO_CREDITO_POSITIVO, PROVENTO_CREDITO_NEGATIVO, 50)
+                st.info(f"`{cod_t}` — {desc_t}" if cod_t else "Não encontrada")
+            with col_prev_b:
+                st.markdown("**Descontos — Débito (Salários a Pagar)**")
+                cod_t, desc_t = _melhor_conta_por_score(df_pc, DESCONTO_DEBITO_POSITIVO, DESCONTO_DEBITO_NEGATIVO, 50)
+                st.info(f"`{cod_t}` — {desc_t}" if cod_t else "Não encontrada")
+            with col_prev_c:
+                st.markdown("**FGTS — Crédito (FGTS a Recolher)**")
+                cod_t, desc_t = _melhor_conta_por_score(df_pc, FGTS_CREDITO_POSITIVO, FGTS_CREDITO_NEGATIVO, 50)
+                st.info(f"`{cod_t}` — {desc_t}" if cod_t else "Não encontrada")
+
+            col_prev_d, col_prev_e, col_prev_f = st.columns(3)
+            with col_prev_d:
+                st.markdown("**Proventos — Débito (Despesa)**")
+                cod_t, desc_t = _melhor_conta_por_score(df_pc, PROVENTO_DEBITO_POSITIVO, PROVENTO_DEBITO_NEGATIVO, 30)
+                st.info(f"`{cod_t}` — {desc_t}" if cod_t else "Não encontrada")
+            with col_prev_e:
+                st.markdown("**Consignado — Crédito (Empréstimos)**")
+                cod_t, desc_t = _melhor_conta_por_score(df_pc, CONSIGNADO_CREDITO_POSITIVO, CONSIGNADO_CREDITO_NEGATIVO, 50)
+                st.info(f"`{cod_t}` — {desc_t}" if cod_t else "Não encontrada")
+            with col_prev_f:
+                st.markdown("**Encargo Patronal — Crédito (INSS a Recolher)**")
+                cod_t, desc_t = _melhor_conta_por_score(df_pc, INFORMATIVO_CREDITO_POSITIVO, INFORMATIVO_CREDITO_NEGATIVO, 30)
+                st.info(f"`{cod_t}` — {desc_t}" if cod_t else "Não encontrada")
+
     elif contas_file is not None:
         st.error("❌ Não foi possível carregar o Plano de Contas.")
 
@@ -1486,7 +1914,7 @@ def main():
     )
     usa_sep_bool = (usa_separador == "Sim")
 
-    # ── Configuração por CC (apenas quando Separador = Sim) ────────────────
+    # ── Configuração por CC ────────────────────────────────────────────────
     if usa_sep_bool:
         if st.session_state.eventos_parsed:
             ccs = get_centros_custo_unicos(st.session_state.eventos_parsed)
@@ -1544,7 +1972,6 @@ def main():
                             options=GRUPOS_LISTA,
                             index=grupo_idx,
                             key=f"grupo_{cc_cod}",
-                            help="Tipo Folha 'Empresa' sempre usa Encargo Patronal automaticamente.",
                         )
 
                         hist_sel = st.text_input(
@@ -1554,57 +1981,6 @@ def main():
                             placeholder="Ex: 001",
                         )
 
-                        # Preview das contas disponíveis no grupo
-                        if df_pc is not None and not df_pc.empty and grupo_sel != "Outro":
-                            col_prev1, col_prev2 = st.columns(2)
-                            with col_prev1:
-                                df_d, _ = filtrar_contas_por_grupo(df_pc, grupo_sel)
-                                n_deb   = len(df_d)
-                                if n_deb > 0:
-                                    st.success(f"💸 **{n_deb}** conta(s) de débito no grupo")
-                                    with st.expander("Ver contas de débito", expanded=False):
-                                        for _, r in df_d.head(10).iterrows():
-                                            score_txt = f" [score:{r.get('score_folha',0)}]" if "score_folha" in r else ""
-                                            st.markdown(f"- `{r['reduzido']}` — {r['nome_original']}{score_txt}")
-                                else:
-                                    st.warning("⚠️ Nenhuma conta de débito encontrada")
-
-                            with col_prev2:
-                                _, df_c = filtrar_contas_por_grupo(df_pc, grupo_sel)
-                                n_cred  = len(df_c)
-                                if n_cred > 0:
-                                    st.success(f"💰 **{n_cred}** conta(s) de crédito no grupo")
-                                    with st.expander("Ver contas de crédito", expanded=False):
-                                        for _, r in df_c.head(10).iterrows():
-                                            score_txt = f" [score:{r.get('score_folha',0)}]" if "score_folha" in r else ""
-                                            st.markdown(f"- `{r['reduzido']}` — {r['nome_original']}{score_txt}")
-                                else:
-                                    st.warning("⚠️ Nenhuma conta de crédito encontrada")
-
-                            # Preview Encargo Patronal (sempre mostrado se há eventos de empresa)
-                            if n_empresa > 0:
-                                st.markdown("**🏛️ Contas para Encargo Patronal (automático):**")
-                                col_ep1, col_ep2 = st.columns(2)
-                                with col_ep1:
-                                    df_ep_d, _ = filtrar_contas_por_grupo(df_pc, "Encargo Patronal")
-                                    if not df_ep_d.empty:
-                                        st.success(f"💸 **{len(df_ep_d)}** conta(s) débito Encargo Patronal")
-                                        with st.expander("Ver", expanded=False):
-                                            for _, r in df_ep_d.head(5).iterrows():
-                                                st.markdown(f"- `{r['reduzido']}` — {r['nome_original']}")
-                                    else:
-                                        st.warning("⚠️ Nenhuma conta de débito para Encargo Patronal")
-                                with col_ep2:
-                                    _, df_ep_c = filtrar_contas_por_grupo(df_pc, "Encargo Patronal")
-                                    if not df_ep_c.empty:
-                                        st.success(f"💰 **{len(df_ep_c)}** conta(s) crédito Encargo Patronal")
-                                        with st.expander("Ver", expanded=False):
-                                            for _, r in df_ep_c.head(5).iterrows():
-                                                st.markdown(f"- `{r['reduzido']}` — {r['nome_original']}")
-                                    else:
-                                        st.warning("⚠️ Nenhuma conta de crédito para Encargo Patronal")
-
-                        # Preview eventos
                         if evs_cc and st.session_state.catalog_parsed:
                             with st.expander(f"📋 Ver {n_evs} evento(s) deste CC", expanded=False):
                                 dados_evs = []
@@ -1612,16 +1988,16 @@ def main():
                                     info = st.session_state.catalog_parsed.get(ev["cod"], {})
                                     grupo_ev = "🏛️ Encargo Patronal" if ev["tipo_folha"] == "2" else grupo_sel
                                     dados_evs.append({
-                                        "Código":       ev["cod"],
-                                        "Descrição":    ev["descricao_pdf"],
-                                        "Tipo":         info.get("tipo", "—"),
-                                        "Tipo Folha":   ev["tipo_folha_desc"],
+                                        "Código":        ev["cod"],
+                                        "Descrição":     ev["descricao_pdf"],
+                                        "Tipo":          info.get("tipo", "—"),
+                                        "Tipo Folha":    ev["tipo_folha_desc"],
                                         "Grupo Efetivo": grupo_ev,
                                     })
                                 st.dataframe(pd.DataFrame(dados_evs), use_container_width=True)
 
                         st.session_state.config_cc[cc_cod] = {
-                            "grupo":    grupo_sel,
+                            "grupo":     grupo_sel,
                             "historico": hist_sel,
                         }
         else:
@@ -1656,7 +2032,7 @@ def main():
                     st.session_state[k] = None
             st.rerun()
 
-    # ── Processamento ao clicar em Gerar Excel ────────────────────────────
+    # ── Processamento ──────────────────────────────────────────────────────
     if gerar_excel and pdf_file and txt_file:
         log: list[str] = ["[Etapa 1] Iniciando..."]
 
@@ -1669,7 +2045,7 @@ def main():
         st.session_state.eventos_parsed = eventos
         st.session_state.catalog_parsed = catalog
 
-        with st.spinner("🔍 Classificando rubricas automaticamente..."):
+        with st.spinner("🔍 Classificando rubricas com regras V6..."):
             classif_auto = classificar_todos_eventos(eventos, catalog, df_pc, log)
             st.session_state.classif_auto = classif_auto
 
@@ -1684,7 +2060,7 @@ def main():
                     ]
                     grupo_dom = max(set(grupos_cc), key=grupos_cc.count) if grupos_cc else "Despesa Administrativa"
                     st.session_state.config_cc[cc_cod] = {
-                        "grupo":    grupo_dom,
+                        "grupo":     grupo_dom,
                         "historico": "",
                     }
                     log.append(f"CC {cc_cod}: grupo sugerido → {grupo_dom}")
@@ -1732,7 +2108,13 @@ def main():
                     conta_cred = auto.get("conta_credito", "")
                     confianca  = auto.get("confianca", "")
 
-                ok = bool(conta_deb and conta_cred)
+                # Verificação anti curto-circuito para preview
+                cc_alert = ""
+                if conta_deb and conta_cred and conta_deb == conta_cred:
+                    cc_alert = "⚡"
+                    conta_deb = ""
+
+                ok = "✅" if (conta_deb and conta_cred) else ("⚡" if cc_alert else "⚠️")
                 linhas_prev.append({
                     "Código":        cod_ev,
                     "Descrição":     ev["descricao_pdf"],
@@ -1743,7 +2125,7 @@ def main():
                     "Confiança":     confianca,
                     "Conta Débito":  conta_deb,
                     "Conta Crédito": conta_cred,
-                    "Classif.":      "✅" if ok else "⚠️",
+                    "Status":        ok,
                 })
             st.session_state.df_preview = pd.DataFrame(linhas_prev)
 
@@ -1770,34 +2152,31 @@ def main():
             i        = len(df[df["Tipo"] == "Informativa"])
             id_      = len(df[df["Tipo"] == "Inf. Dedutora"])
             nf       = len(df[df["Tipo"].str.startswith("⚠️", na=False)])
-            ok       = len(df[df["Classif."] == "✅"]) if "Classif." in df.columns else 0
-            nok      = len(df[df["Classif."] == "⚠️"]) if "Classif." in df.columns else 0
+            ok       = len(df[df["Status"] == "✅"]) if "Status" in df.columns else 0
+            nok      = len(df[df["Status"] == "⚠️"]) if "Status" in df.columns else 0
+            n_cc_al  = len(df[df["Status"] == "⚡"]) if "Status" in df.columns else 0
             n_patron = len(df[df["Grupo"] == "Encargo Patronal"]) if "Grupo" in df.columns else 0
 
             cols_m = st.columns(9)
             for col_m, lbl, val in zip(cols_m, [
                 "📋 Total","🟢 Proventos","🔴 Descontos","🔵 Informativas",
-                "🟡 Inf.Ded.","⚠️ Tipo n/id","✅ Com conta","⚠️ Sem conta","🏛️ Patronal",
-            ], [total, p, d, i, id_, nf, ok, nok, n_patron]):
+                "🟡 Inf.Ded.","⚠️ Tipo n/id","✅ Completos","⚡ Curto-circ.","🏛️ Patronal",
+            ], [total, p, d, i, id_, nf, ok, n_cc_al, n_patron]):
                 col_m.metric(lbl, val)
 
-            if "Confiança" in df.columns:
-                n_manual = len(df[df["Confiança"] == "manual"])
-                n_alta   = len(df[df["Confiança"] == "alta"])
-                n_media  = len(df[df["Confiança"] == "media"])
-                n_baixa  = len(df[df["Confiança"] == "baixa"])
-                partes = []
-                if n_manual: partes.append(f"🔧 {n_manual} manual")
-                if n_alta:   partes.append(f"🟢 {n_alta} alta")
-                if n_media:  partes.append(f"🟡 {n_media} média")
-                if n_baixa:  partes.append(f"🔴 {n_baixa} baixa")
-                if partes:
-                    st.info(f"🤖 Classificação: {' · '.join(partes)}")
+            if n_cc_al > 0:
+                st.warning(
+                    f"⚡ **{n_cc_al} lançamento(s)** com curto-circuito detectado (Débito = Crédito). "
+                    f"O campo Débito foi resetado. Preencha manualmente no Excel."
+                )
 
             def hl(row):
                 t  = str(row.get("Tipo", ""))
                 tf = str(row.get("Tipo Folha", ""))
                 g  = str(row.get("Grupo", ""))
+                s  = str(row.get("Status", ""))
+                if s == "⚡":
+                    return ["background-color:#FFD700"] * len(row)
                 if tf == "Empresa" or g == "Encargo Patronal":
                     return ["background-color:#E8D5FF"] * len(row)
                 if t == "Provento":      return ["background-color:#d4edda"] * len(row)
@@ -1873,7 +2252,8 @@ def main():
     st.markdown("**Log de processamento**")
     log_texto = "\n".join(st.session_state.log)
     tem_erro  = any(str(l).upper().startswith("ERRO") for l in st.session_state.log)
-    cor_borda = "#D32F2F" if tem_erro else "#388E3C"
+    tem_cc    = any("CURTO-CIRCUITO" in str(l).upper() for l in st.session_state.log)
+    cor_borda = "#D32F2F" if tem_erro else ("#FF8C00" if tem_cc else "#388E3C")
     st.markdown(
         f"""
         <div style="background:#FCFCFC; border:1px solid {cor_borda};
