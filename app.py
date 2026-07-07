@@ -88,9 +88,14 @@ def gemini_classificar_rubrica(
     api_key: str,
     max_retries: int = 3,
 ) -> dict:
+    """Classifica uma rubrica de folha usando o Gemini."""
     if not GEMINI_DISPONIVEL or not api_key:
-        return {"grupo": "Despesa Administrativa", "confianca": "baixa",
-                "motivo": "Gemini não disponível", "fonte": "fallback"}
+        return {
+            "grupo": "Despesa Administrativa",
+            "confianca": "baixa",
+            "motivo": "Gemini não disponível",
+            "fonte": "fallback",
+        }
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
@@ -126,19 +131,31 @@ Responda APENAS com JSON válido no formato especificado.
             if tentativa < max_retries - 1:
                 time.sleep(1)
                 continue
-            return {"grupo": "Despesa Administrativa", "confianca": "baixa",
-                    "motivo": "Erro ao parsear resposta", "fonte": "erro"}
+            return {
+                "grupo": "Despesa Administrativa",
+                "confianca": "baixa",
+                "motivo": "Erro ao parsear resposta",
+                "fonte": "erro",
+            }
         except Exception as e:
             erro_str = str(e)
             if "429" in erro_str or "quota" in erro_str.lower():
                 time.sleep((tentativa + 1) * 10)
                 continue
-            return {"grupo": "Despesa Administrativa", "confianca": "baixa",
-                    "motivo": "Erro na API Gemini", "fonte": "erro",
-                    "erro": erro_str[:100]}
+            return {
+                "grupo": "Despesa Administrativa",
+                "confianca": "baixa",
+                "motivo": "Erro na API Gemini",
+                "fonte": "erro",
+                "erro": erro_str[:100],
+            }
 
-    return {"grupo": "Despesa Administrativa", "confianca": "baixa",
-            "motivo": "Máximo de tentativas atingido", "fonte": "erro"}
+    return {
+        "grupo": "Despesa Administrativa",
+        "confianca": "baixa",
+        "motivo": "Máximo de tentativas atingido",
+        "fonte": "erro",
+    }
 
 
 def gemini_sugerir_contas_para_rubrica(
@@ -149,6 +166,7 @@ def gemini_sugerir_contas_para_rubrica(
     api_key: str,
     top_n: int = 5,
 ) -> dict:
+    """Sugere contas de débito e crédito para uma rubrica via Gemini."""
     if not GEMINI_DISPONIVEL or not api_key or df_contas is None or df_contas.empty:
         return {"erro": "Gemini não disponível ou plano de contas não carregado"}
 
@@ -235,25 +253,24 @@ def apply_tr_theme():
 # ══════════════════════════════════════════════════════════════════════════
 # PARSE DO PLANO DE CONTAS
 #
-# Formato real confirmado do arquivo:
-#   Linha 0 (header): "Plano de Contas - Completo" | "Unnamed: 1:Reduzido" |
-#                     "Unnamed: 2:Classificação"   | "Unnamed: 3:Tipo"     |
-#                     "Unnamed: 4:Descriçao"       | ...
-#
-#   Dados (col posicional):
-#     iloc[0] = Empresa       ex: 1000003
-#     iloc[1] = Reduzido      ex: 1, 5, 700...
-#     iloc[2] = Classificação ex: 1, 11, 11101, 11101000001
-#     iloc[3] = Tipo          ex: S ou A
-#     iloc[4] = Descrição     ex: ATIVO, CAIXA GERAL, SALÁRIOS E ORDENADOS
-#
+# Formato confirmado do arquivo Kaph Numeric:
+#   Header linha 0:
+#     col[0] = "Plano de Contas - Completo" (Empresa)
+#     col[1] = "Unnamed: 1:Reduzido"
+#     col[2] = "Unnamed: 2:Classificação"
+#     col[3] = "Unnamed: 3:Tipo"          → S ou A
+#     col[4] = "Unnamed: 4:Descriçao"
+#   Dados:
+#     col[0] = 1000003 (código empresa)
+#     col[2] = 1, 11, 111, 11101, 11101000001 (classificação numérica)
+#     col[3] = S ou A
+#     col[4] = Nome da conta
 #   Última linha: "Total de : 746" → ignorada
 # ══════════════════════════════════════════════════════════════════════════
 def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFrame:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "xlsx"
     df_raw = None
 
-    # ── Leitura do arquivo ─────────────────────────────────────────────────
     if ext == "xlsx":
         try:
             df_raw = pd.read_excel(
@@ -289,60 +306,64 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
         f"{len(df_raw.columns)} colunas."
     )
 
-    # ── Detecta o índice real das colunas ──────────────────────────────────
-    # O arquivo pode ter o header na linha 0 com nomes como:
-    #   "Plano de Contas - Completo", "Unnamed: 1:Reduzido",
-    #   "Unnamed: 2:Classificação", "Unnamed: 3:Tipo", "Unnamed: 4:Descriçao"
-    # Ou pode ter sido lido com pandas já mapeando para índices posicionais.
-    # Estratégia: identificar as colunas por nome ou por posição.
-
+    # ── Detecta índices das colunas por nome (flexível) ────────────────────
     cols = [str(c).strip() for c in df_raw.columns]
-    log.append(f"Colunas detectadas: {cols[:8]}")
+    log.append(f"Colunas detectadas: {cols[:6]}")
 
-    # Mapeamento por nome (flexível)
-    idx_empresa      = None
+    idx_empresa       = None
     idx_classificacao = None
-    idx_tipo         = None
-    idx_descricao    = None
+    idx_tipo          = None
+    idx_descricao     = None
 
     for i, c in enumerate(cols):
-        c_lower = c.lower()
+        cl = c.lower()
+        # Empresa: primeira coluna ou contém "plano de contas" ou "empresa"
         if idx_empresa is None and (
-            "empresa" in c_lower or c_lower.startswith("plano de contas")
-            or (i == 0 and idx_empresa is None)
+            i == 0
+            or "plano de contas" in cl
+            or (cl == "empresa" and i < 3)
         ):
             idx_empresa = i
+
+        # Classificação: "classifica" no nome ou "unnamed: 2"
         if idx_classificacao is None and (
-            "classifica" in c_lower or "unnamed: 2" in c_lower
+            "classifica" in cl
+            or "unnamed: 2" in cl
         ):
             idx_classificacao = i
+
+        # Tipo: "tipo" isolado (não ecf) ou "unnamed: 3"
         if idx_tipo is None and (
-            c_lower == "tipo" or "unnamed: 3" in c_lower
-            or ("tipo" in c_lower and "ecf" not in c_lower and i < 6)
+            "unnamed: 3" in cl
+            or (cl == "tipo")
+            or ("tipo" in cl and "ecf" not in cl and "dlpa" not in cl and i < 6)
         ):
             idx_tipo = i
+
+        # Descrição: "descri" ou "unnamed: 4"
         if idx_descricao is None and (
-            "descri" in c_lower or "unnamed: 4" in c_lower
+            "descri" in cl
+            or "unnamed: 4" in cl
         ):
             idx_descricao = i
 
-    # Fallback para posições fixas se não encontrou por nome
-    if idx_empresa is None:      idx_empresa = 0
+    # Fallback para posições fixas do formato Kaph Numeric
+    if idx_empresa is None:       idx_empresa = 0
     if idx_classificacao is None: idx_classificacao = 2
-    if idx_tipo is None:         idx_tipo = 3
-    if idx_descricao is None:    idx_descricao = 4
+    if idx_tipo is None:          idx_tipo = 3
+    if idx_descricao is None:     idx_descricao = 4
 
     log.append(
-        f"Índices usados → empresa:{idx_empresa} | "
+        f"Índices → empresa:{idx_empresa} | "
         f"classificação:{idx_classificacao} | "
         f"tipo:{idx_tipo} | descrição:{idx_descricao}"
     )
 
-    if len(df_raw.columns) <= max(idx_empresa, idx_classificacao, idx_tipo, idx_descricao):
+    max_idx = max(idx_empresa, idx_classificacao, idx_tipo, idx_descricao)
+    if len(df_raw.columns) <= max_idx:
         log.append(
-            f"ERRO: Esperado mínimo "
-            f"{max(idx_empresa, idx_classificacao, idx_tipo, idx_descricao) + 1} "
-            f"colunas, encontrado {len(df_raw.columns)}."
+            f"ERRO: Esperado mínimo {max_idx + 1} colunas, "
+            f"encontrado {len(df_raw.columns)}."
         )
         return pd.DataFrame()
 
@@ -356,13 +377,15 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
         tipo_raw    = str(row.iloc[idx_tipo]).strip().upper()
         nome        = str(row.iloc[idx_descricao]).strip()
 
-        # Ignora linha de totalizador ("Total de : 746")
+        # Ignora linha de totalizador e linhas vazias
         if empresa_val.lower().startswith("total"):
             ignorados += 1
             continue
+        if empresa_val.lower() in ("nan", "none", ""):
+            ignorados += 1
+            continue
 
-        # Remove sufixo ".0" que o pandas às vezes adiciona em números lidos como float
-        # ex: "11101000001.0" → "11101000001"
+        # Remove sufixo ".0" gerado pelo pandas em números float
         if classif.endswith(".0"):
             classif = classif[:-2]
 
@@ -404,7 +427,7 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
     if n_a == 0:
         log.append(
             "AVISO: Nenhuma conta analítica (tipo=A) encontrada. "
-            "Verifique se a coluna 'Tipo' contém 'A' e 'S'."
+            "Verifique se a coluna Tipo contém 'A' e 'S'."
         )
 
     return df
@@ -432,9 +455,10 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "MATERIA-PRIMA","MATERIAL APLICADO","MAO-DE-OBRA DIRETA",
         "SALARIOS E ORDENADOS CUSTOS","PRO-LABORE CUSTOS",
         "PREMIOS DE GRATIFICACOES CUSTOS","13 SALARIO CUSTOS",
-        "FERIAS CUSTOS","INSS CUSTOS","FGTS CUSTOS","INDENIZACOES",
+        "FERIAS CUSTOS","INSS CUSTOS","FGTS CUSTOS",
+        "INDENIZACOES E AVISO PREVIO CUSTOS",
         "ASSISTENCIA MEDICA E SOCIAL CUSTOS","PIS S/ FOLHA CUSTOS",
-        "HORAS EXTRAS","INDUSTRIALIZACAO","CUSTOS DIRETOS DE PRODUCAO",
+        "INDUSTRIALIZACAO","CUSTOS DIRETOS DE PRODUCAO",
         "MAO-DE-OBRA DIRETA",
     ],
     "Custo Direto de Serviços": [
@@ -443,7 +467,7 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "13 SALARIO","FERIAS","INSS","FGTS","INDENIZACOES",
         "ASSISTENCIA MEDICA","VALE TRANSPORTE","PIS S/ FOLHA",
         "ALIMENTACAO","VALE REFEICAO","HORAS EXTRAS",
-        "CUSTOS SERVIÇOS","CUSTOS SERVIÇOS PRESTADOS",
+        "CUSTOS SERVICOS","CUSTOS SERVICOS PRESTADOS",
     ],
     "Custo Indireto de Produção": [
         "MAO-DE-OBRA INDIRETA","MATERIAIS DE CONSUMO INDIRETO",
@@ -456,25 +480,27 @@ KWORDS_DEBITO: dict[str, list[str]] = {
     "Despesa Administrativa": [
         "DESPESAS ADMINISTRATIVAS","DESPESAS COM PESSOAL",
         "SALARIOS E ORDENADOS","PRO-LABORE","PREMIOS E GRATIFICACOES",
-        "13 SALARIO","FERIAS","INSS","FGTS","INDENIZACOES E AVISO PREVIO",
-        "ASSISTENCIA MEDICA E SOCIAL","VALE TRANSPORTE","PIS S/ FOLHA",
-        "DESPESAS COM ALIMENTACAO","VALE REFEICAO","HORAS EXTRAS",
-        "SEGURO DE VIDA","TREINAMENTO","BOLSA AUXILIO",
-        "CONTRIBUICAO ASSISTENCIAL","SERVICOS PESSOAL PJ",
-        "ALUGUEIS DE IMOVEIS","ALUGUEIS DE MAQUINAS","LEASING",
+        "13 SALARIO","FERIAS","INSS","FGTS",
+        "INDENIZACOES E AVISO PREVIO","ASSISTENCIA MEDICA E SOCIAL",
+        "VALE TRANSPORTE","PIS S/ FOLHA","DESPESAS COM ALIMENTACAO",
+        "VALE REFEICAO","HORAS EXTRAS","PENSAO ALIMENTICIA",
+        "ALIMENTACAO/ CESTA BASICA","COMISSOES",
+        "ALUGUEIS DE IMOVEIS","ALUGUEIS DE MAQUINAS",
+        "ARRENDAMENTO MERCANTIL","LEASING",
         "PIS","COFINS","IPTU","IPVA","TAXAS DIVERSAS","MULTAS DE MORA",
         "ENERGIA ELETRICA","AGUA E ESGOTO","TELEFONE",
         "DESPESAS POSTAIS","SEGUROS","MATERIAL DE ESCRITORIO",
-        "MATERIAL DE HIGIENE","DEPRECIACOES E AMORTIZACOES",
+        "MATERIAL DE HIGIENE","DEPRECIACAO","DEPRECIACOES E AMORTIZACOES",
+        "REPRODUCOES","DESPESAS LEGAIS","LIVROS, JORNAIS",
         "COMBUSTIVEIS E LUBRIFICANTES","MATERIAIS DE CONSUMO",
-        "SERVICOS TOMADOS DE PJ","DESPESA SERVICOS",
-        "DESPESAS GERAIS","COMISSOES","FRETES E CARRETOS",
-        "MANUTENCAO DE VEICULOS","VIAGENS","REFEICOES",
-        "PENSAO ALIMENTICIA","ALIMENTACAO","CESTA BASICA",
+        "CONDOMINIOS","GAS","BENS DE PEQUENO VALOR",
+        "DESPESA SERVICOS","SERVICOS TOMADOS DE PJ",
+        "DESPESAS GERAIS","FRETES E CARRETOS","MANUTENCAO DE VEICULOS",
+        "VIAGENS","REFEICOES",
     ],
     "Despesa com Vendas": [
-        "DESPESAS COM VENDAS","COMISSOES SOBRE VENDAS",
-        "PROPAGANDA E PUBLICIDADE","BONIFICACAO E/OU AMOSTRAS",
+        "DESPESAS COM VENDAS","COMISSOES SOBRE VENDAS","COMISSOES",
+        "PROPAGANDA E PUBLICIDADE","BONIFICACAO E/OU AMOSTRAS GRATIS",
         "DESPESAS COM ENTREGA","FRETES E CARRETOS",
         "MANUTENCAO DE VEICULOS","DESPESAS COM VIAGENS",
         "VIAGENS TERRESTRES","VIAGENS AEREAS","HOSPEDAGEM",
@@ -494,9 +520,8 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "PERDAS NA ALIENACAO","RESULTADO NEGATIVO NA ALIENACAO",
         "RESULTADO NEGATIVO DE SINISTRO","OUTRAS BAIXAS DO ATIVO",
         "BAIXAS DE INVESTIMENTOS","BAIXAS DE IMOBILIZADO",
-        "PROVISOES PARA PERDAS PERMANENTE",
+        "BAIXAS DE ATIVO DIFERIDO","PROVISOES PARA PERDAS PERMANENTE",
         "PROVISAO IRPJ","PROVISAO CSLL",
-        "IMPOSTO DE RENDA","CONTRIBUICAO SOCIAL",
         "PERDAS POR FALTA NO INVENTARIO",
     ],
 }
@@ -505,8 +530,9 @@ KWORDS_CREDITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
         "SALARIOS E ORDENADOS A PAGAR","PRO-LABORE A PAGAR",
         "GRATIFICACOES A PAGAR","FERIAS A PAGAR","RESCISOES A PAGAR",
-        "13 SALARIO A PAGAR","PENSAO ALIMENTICIA","INDENIZACOES A PAGAR",
-        "INSS A RECOLHER","FGTS A RECOLHER","PIS S/ FOLHA A RECOLHER",
+        "13 SALARIO A PAGAR","PENSAO ALIMENTICIA A PAGAR",
+        "INDENIZACOES A PAGAR","INSS A RECOLHER","FGTS A RECOLHER",
+        "PIS S/ FOLHA A RECOLHER","IRRF S/ FOLHA",
         "PROVISOES PARA FERIAS","PROVISOES PARA 13",
         "INSS SOBRE PROVISOES","FGTS SOBRE PROVISOES",
         "OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS","PROVISOES",
@@ -518,52 +544,55 @@ KWORDS_CREDITO: dict[str, list[str]] = {
         "INSS A RECOLHER","FGTS A RECOLHER","PIS S/ FOLHA A RECOLHER",
         "PROVISOES PARA FERIAS","PROVISOES PARA 13",
         "OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS","PROVISOES",
-        "OBRIGACOES TRABALHISTA","FORNECEDORES","CONTAS A PAGAR",
+        "OBRIGACOES TRABALHISTA","FORNECEDORES NACIONAIS","CONTAS A PAGAR",
     ],
     "Custo Indireto de Produção": [
         "SALARIOS E ORDENADOS A PAGAR","FERIAS A PAGAR",
         "13 SALARIO A PAGAR","INSS A RECOLHER","FGTS A RECOLHER",
         "PROVISOES PARA FERIAS","PROVISOES PARA 13",
         "OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS","PROVISOES",
-        "OBRIGACOES TRABALHISTA","FORNECEDORES","CONTAS A PAGAR",
+        "OBRIGACOES TRABALHISTA","FORNECEDORES NACIONAIS","CONTAS A PAGAR",
         "ALUGUEIS A PAGAR",
     ],
     "Despesa Administrativa": [
         "SALARIOS E ORDENADOS A PAGAR","PRO-LABORE A PAGAR",
         "GRATIFICACOES A PAGAR","FERIAS A PAGAR","RESCISOES A PAGAR",
         "13 SALARIO A PAGAR","PENSAO ALIMENTICIA A PAGAR",
+        "PREMIOS E BONIFICACOES","COMISSOES A PAGAR","AUTONOMOS A PAGAR",
         "INDENIZACOES A PAGAR","INSS A RECOLHER","FGTS A RECOLHER",
-        "PIS S/ FOLHA A RECOLHER","IRRF S/ FOLHA",
+        "PIS S/ FOLHA A RECOLHER","IRRF S/ FOLHA","CONTRIBUICOES SINDICAIS",
         "PROVISOES PARA FERIAS","PROVISOES PARA 13",
-        "INSS SOBRE PROVISOES","FGTS SOBRE PROVISOES",
+        "INSS SOBRE PROVISOES PARA FERIAS","INSS SOBRE PROVISOES PARA 13",
+        "FGTS SOBRE PROVISOES PARA FERIAS","FGTS SOBRE PROVISOES PARA 13",
         "PIS SOBRE PROVISOES","OBRIGACOES COM O PESSOAL",
         "OBRIGACOES SOCIAIS","PROVISOES","OBRIGACOES TRABALHISTA",
-        "IMPOSTOS E CONTRIBUICOES A RECOLHER","ISS A RECOLHER",
-        "IRRF A RECOLHER","INSS RETIDO A RECOLHER",
-        "FORNECEDORES","CONTAS A PAGAR","HONORARIOS CONTABEIS",
+        "ISS A RECOLHER","IRRF S/ NF A RECOLHER","INSS RETIDO A RECOLHER",
+        "FORNECEDORES NACIONAIS","CONTAS A PAGAR",
+        "HONORARIOS CONTABEIS","HONORARIOS JURIDICOS",
         "ENERGIA ELETRICA A PAGAR","TELEFONE A PAGAR",
-        "ALUGUEIS A PAGAR","SEGUROS A PAGAR","OUTRAS OBRIGACOES",
-        "RESCISOES A PAGAR","PREMIOS E BONIFICACOES",
-        "COMISSOES A PAGAR","AUTONOMOS A PAGAR",
+        "ALUGUEIS A PAGAR","OUTRAS OBRIGACOES",
     ],
     "Despesa com Vendas": [
         "SALARIOS E ORDENADOS A PAGAR","FERIAS A PAGAR",
         "13 SALARIO A PAGAR","INSS A RECOLHER","FGTS A RECOLHER",
         "PROVISOES PARA FERIAS","PROVISOES PARA 13",
         "OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS","PROVISOES",
-        "OBRIGACOES TRABALHISTA","FORNECEDORES","CONTAS A PAGAR",
+        "OBRIGACOES TRABALHISTA","FORNECEDORES NACIONAIS","CONTAS A PAGAR",
         "OUTRAS OBRIGACOES",
     ],
     "Despesa Financeira": [
         "CONTAS A PAGAR","OUTRAS OBRIGACOES",
-        "EMPRESTIMOS PAGAR","FINANCIAMENTO",
+        "BANCO DO BRASIL","BANCO ITAU UNIBANCO","BANCO BRADESCO",
+        "BANCO SANTANDER","BANCO INTER","BANCO C6 BANK",
+        "BANCO NU PAGAMENTOS","BANCO CORA","BANCO DAYCOVAL",
+        "FINANCIAMENTO BANCO NACIONAL",
         "IMPOSTOS E CONTRIBUICOES A RECOLHER",
     ],
     "Despesa Não Operacional": [
         "CONTAS A PAGAR","OUTRAS OBRIGACOES",
         "IMPOSTOS E CONTRIBUICOES A RECOLHER",
-        "PROVISAO PARA IMPOSTO DE RENDA",
-        "PROVISAO P/ CONTRIBUICAO SOCIAL",
+        "PROVISAO PARA IMPOSTO DE RENDA S/ LUCRO",
+        "PROVISAO P/ CONTRIBUICAO SOCIAL S/ LUCRO",
         "IMPOSTO DE RENDA A RECOLHER",
         "CONTRIBUICAO SOCIAL A RECOLHER",
     ],
@@ -591,7 +620,9 @@ def _fmt_opcoes(df_f: pd.DataFrame) -> list[str]:
     ]
 
 
-def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], list[str]]:
+def classificar_contas(
+    df_contas: pd.DataFrame, grupo: str
+) -> tuple[list[str], list[str]]:
     df_a = _analiticas(df_contas)
     if df_a.empty:
         return [""], [""]
@@ -619,9 +650,9 @@ def sugerir_contas(df_contas: pd.DataFrame, grupo: str) -> dict:
     return {
         "ops_deb":       ops_d,
         "ops_cred":      ops_c,
-        "conta_debito":  extrair_codigo(ops_d[1])  if len(ops_d)  > 1 else "",
+        "conta_debito":  extrair_codigo(ops_d[1]) if len(ops_d) > 1 else "",
         "conta_credito": extrair_codigo(ops_c[1]) if len(ops_c) > 1 else "",
-        "n_deb":  len(ops_d)  - 1,
+        "n_deb":  len(ops_d) - 1,
         "n_cred": len(ops_c) - 1,
     }
 
@@ -643,12 +674,16 @@ def _idx(opcoes: list[str], valor: str) -> int:
 
 # ══════════════════════════════════════════════════════════════════════════
 # PARSE TXT RUBRICAS
+# Formato confirmado:
+#   col[0]=empresa  col[1]=?  col[2]=código  col[3]=descrição  col[4]=tipo(P/D/I/ID)
 # ══════════════════════════════════════════════════════════════════════════
 def parse_rubricas_txt(file_bytes: bytes, log: list) -> dict:
     catalog = {}
     TIPO_MAP = {
-        "P": "Provento", "D": "Desconto",
-        "I": "Informativa", "ID": "Inf. Dedutora"
+        "P":  "Provento",
+        "D":  "Desconto",
+        "I":  "Informativa",
+        "ID": "Inf. Dedutora",
     }
     try:
         texto = file_bytes.decode("latin-1", errors="replace")
@@ -747,10 +782,10 @@ def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
                     if chave not in vistos:
                         vistos.add(chave)
                         eventos.append({
-                            "cod": cod,
-                            "descricao_pdf": desc,
-                            "tipo_folha": tipo_folha_atual,
-                            "tipo_folha_desc": SECAO_TIPO_FOLHA_DESC.get(
+                            "cod":               cod,
+                            "descricao_pdf":     desc,
+                            "tipo_folha":        tipo_folha_atual,
+                            "tipo_folha_desc":   SECAO_TIPO_FOLHA_DESC.get(
                                 tipo_folha_atual, tipo_folha_atual
                             ),
                             "centro_custo_cod":  cc_cod_atual,
@@ -855,10 +890,10 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
     COLS_PREENCHER  = {12, 13, 14, 15, 16}
     COLS_INFO_EXTRA = {10, 11}
     TIPO_COR = {
-        "Provento":     "D4EDDA",
-        "Desconto":     "F8D7DA",
-        "Informativa":  "CCE5FF",
-        "Inf. Dedutora":"FFF3CD",
+        "Provento":      "D4EDDA",
+        "Desconto":      "F8D7DA",
+        "Informativa":   "CCE5FF",
+        "Inf. Dedutora": "FFF3CD",
     }
 
     for col_idx, cell in enumerate(ws[1], start=1):
@@ -954,6 +989,11 @@ def gerar_arquivos_finais(
         elif "observação"           in cl:                             col_map["observacao"]    = col
         elif "usa separador"        in cl:                             col_map["usa_separador"] = col
 
+    TIPO_COL = (
+        "Tipo da Integração (1 - Folha mensal; 2 - Empresa; "
+        "3 - Férias; 4 - Rescisao; 5 - Prov. Férias; 6 - Prov. 13)"
+    )
+
     linhas_evento, linhas_integra, linhas_integra_xls = [], [], []
     sem_conta = com_conta = 0
 
@@ -978,37 +1018,33 @@ def gerar_arquivos_finais(
         else:
             sem_conta += 1
 
-        TIPO_COL = (
-            "Tipo da Integração (1 - Folha mensal; 2 - Empresa; "
-            "3 - Férias; 4 - Rescisao; 5 - Prov. Férias; 6 - Prov. 13)"
-        )
         linhas_evento.append({
-            "Código da Empresa":   empresa,
-            "Centro de custo":     cc,
+            "Código da Empresa":             empresa,
+            "Centro de custo":               cc,
             "Código Sequencial da Integração": seq,
-            TIPO_COL:              tipo,
-            "Descrição":           desc,
-            "Código da Conta Débito":  debito,
-            "Código da Conta Crédito": credito,
-            "Código do Histórico": historico,
-            "Complemento":         complemento,
+            TIPO_COL:                        tipo,
+            "Descrição":                     desc,
+            "Código da Conta Débito":        debito,
+            "Código da Conta Crédito":       credito,
+            "Código do Histórico":           historico,
+            "Complemento":                   complemento,
         })
         linhas_integra.append({
-            "Código da Empresa":   empresa,
-            "Separador":           sep_val,
+            "Código da Empresa":             empresa,
+            "Separador":                     sep_val,
             "Código Sequencial da Integração": seq,
-            TIPO_COL:              tipo,
+            TIPO_COL:                        tipo,
             "Código da Rúbrica Selecionada": seq,
         })
         linhas_integra_xls.append({
-            "Código da Empresa":   empresa,
-            "Centro de Custo":     cc,
+            "Código da Empresa":             empresa,
+            "Centro de Custo":               cc,
             "Código Sequencial da Integração": seq,
-            TIPO_COL:              tipo,
-            "Descrição":           desc,
-            "Código da Conta Crédito": credito,
-            "Código da Conta Débito":  debito,
-            "Código do Histórico": historico,
+            TIPO_COL:                        tipo,
+            "Descrição":                     desc,
+            "Código da Conta Crédito":       credito,
+            "Código da Conta Débito":        debito,
+            "Código do Histórico":           historico,
         })
 
     log.append(f"Arquivos → Com conta: {com_conta} | Sem conta: {sem_conta}")
@@ -1100,7 +1136,7 @@ def render_secao_gemini(
             f"{cod} — {info['descricao']} ({info['tipo']})"
             for cod, info in sorted(
                 catalog.items(),
-                key=lambda x: int(x[0]) if x[0].isdigit() else 0
+                key=lambda x: int(x[0]) if x[0].isdigit() else 0,
             )
         ]
 
@@ -1114,19 +1150,19 @@ def render_secao_gemini(
         with col_r2:
             st.markdown("<br>", unsafe_allow_html=True)
             buscar = st.button(
-                "🔍 Classificar com Gemini",
+                "🔍 Classificar",
                 key="btn_gemini_individual",
                 disabled=not rubrica_sel,
                 use_container_width=True,
             )
 
         if buscar and rubrica_sel:
-            cod_sel    = rubrica_sel.split(" — ")[0].strip()
-            info_sel   = catalog.get(cod_sel, {})
-            nome_rubr  = info_sel.get("descricao", rubrica_sel)
-            tipo_rubr  = info_sel.get("tipo", "Provento")
+            cod_sel   = rubrica_sel.split(" — ")[0].strip()
+            info_sel  = catalog.get(cod_sel, {})
+            nome_rubr = info_sel.get("descricao", rubrica_sel)
+            tipo_rubr = info_sel.get("tipo", "Provento")
 
-            with st.spinner(f"Gemini classificando '{nome_rubr}'..."):
+            with st.spinner(f"Classificando '{nome_rubr}'..."):
                 resultado_grupo = gemini_classificar_rubrica(
                     nome_rubrica=nome_rubr,
                     tipo_rubrica=tipo_rubr,
@@ -1212,8 +1248,8 @@ def render_secao_gemini(
     with tab2:
         st.markdown("#### Classificar todas as rubricas do catálogo")
 
-        n_rubricas  = len(catalog)
-        tempo_est   = round(n_rubricas * 1.5 / 60, 1)
+        n_rubricas = len(catalog)
+        tempo_est  = round(n_rubricas * 1.5 / 60, 1)
 
         st.info(
             f"📋 **{n_rubricas} rubricas** no catálogo. "
@@ -1226,9 +1262,9 @@ def render_secao_gemini(
         ja_class  = len(cache)
 
         col_i1, col_i2, col_i3 = st.columns(3)
-        col_i1.metric("Total de rubricas",       n_rubricas)
-        col_i2.metric("Já classificadas (cache)", ja_class)
-        col_i3.metric("A classificar",            n_rubricas - ja_class)
+        col_i1.metric("Total de rubricas",        n_rubricas)
+        col_i2.metric("Já classificadas (cache)",  ja_class)
+        col_i3.metric("A classificar",             n_rubricas - ja_class)
 
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
@@ -1249,7 +1285,6 @@ def render_secao_gemini(
                 for cod, info in catalog.items()
                 if cod not in cache
             }
-
             progress_bar = st.progress(0)
             status_text  = st.empty()
             total  = len(rubricas_para)
@@ -1258,7 +1293,7 @@ def render_secao_gemini(
             for i, (cod, info) in enumerate(rubricas_para.items()):
                 status_text.text(
                     f"Classificando {i+1}/{total}: "
-                    f"{info['descricao'][:40]}..."
+                    f"{info['descricao'][:45]}..."
                 )
                 resultado = gemini_classificar_rubrica(
                     nome_rubrica=info["descricao"],
@@ -1276,7 +1311,6 @@ def render_secao_gemini(
                 }
                 if resultado.get("fonte") == "erro":
                     erros += 1
-
                 progress_bar.progress((i + 1) / total)
                 if i < total - 1:
                     time.sleep(1.5)
@@ -1289,7 +1323,7 @@ def render_secao_gemini(
                 f"{'⚠️ ' + str(erros) + ' com erro' if erros else ''}"
             )
 
-        # Exibe resultados
+        # Exibe resultados do cache
         if cache:
             st.markdown("#### 📊 Resultados da Classificação")
             df_res = pd.DataFrame(list(cache.values()))
@@ -1329,9 +1363,12 @@ def render_secao_gemini(
 
             st.dataframe(
                 df_exibir[cols_exibir].rename(columns={
-                    "cod": "Código", "descricao": "Descrição",
-                    "tipo": "Tipo", "grupo": "Grupo Sugerido",
-                    "confianca": "Confiança", "motivo": "Motivo",
+                    "cod":       "Código",
+                    "descricao": "Descrição",
+                    "tipo":      "Tipo",
+                    "grupo":     "Grupo Sugerido",
+                    "confianca": "Confiança",
+                    "motivo":    "Motivo",
                 }).style.apply(highlight_conf, axis=1),
                 use_container_width=True,
                 height=400,
@@ -1475,10 +1512,7 @@ def main():
         contas_file = st.file_uploader(
             "3️⃣ XLS/XLSX — Plano de Contas (opcional)",
             type=["xls", "xlsx"], key="contas_etapa1",
-            help=(
-                "Arquivo exportado pelo Domínio: "
-                "Plano de Contas Completo (Kaph Numeric)"
-            ),
+            help="Arquivo: Exportação Plano de Contas - Completo (Kaph Numeric)",
         )
 
     # ── Carrega plano de contas ────────────────────────────────────────────
@@ -1820,11 +1854,11 @@ def main():
             id_ = len(df[df["Tipo"] == "Inf. Dedutora"])
             nf  = len(df[df["Tipo"].str.startswith("⚠️", na=False)])
             ok  = (
-                len(df[df.get("Classif.", pd.Series(dtype=str)) == "✅"])
+                len(df[df["Classif."] == "✅"])
                 if "Classif." in df.columns else 0
             )
             nok = (
-                len(df[df.get("Classif.", pd.Series(dtype=str)) == "⚠️"])
+                len(df[df["Classif."] == "⚠️"])
                 if "Classif." in df.columns else 0
             )
 
@@ -1889,7 +1923,7 @@ def main():
     )
     st.markdown(
         "1. Baixe o Excel da Etapa 1 · "
-        "2. Ajuste se necessário · "
+        "2. Preencha Conta Débito e Conta Crédito · "
         "3. Faça upload e clique em **▶ Gerar**"
     )
 
