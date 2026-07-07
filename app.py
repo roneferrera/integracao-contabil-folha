@@ -1,5 +1,5 @@
 # ============================================================
-# app.py  –  Integração Contábil Domínio V4.7
+# app.py  –  Integração Contábil Domínio V4.8
 # Classificação automática local (sem API)
 # ============================================================
 
@@ -11,7 +11,7 @@ from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSAO = "V4.7"
+VERSAO = "V4.8"
 
 # ══════════════════════════════════════════════════════════════════════════
 # TEMA
@@ -173,12 +173,14 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
         return pd.DataFrame()
 
     cols = [str(c).strip() for c in df_raw.columns]
-    idx_empresa = idx_classificacao = idx_tipo = idx_descricao = None
+    idx_empresa = idx_reduzido = idx_classificacao = idx_tipo = idx_descricao = None
 
     for i, c in enumerate(cols):
         cl = c.lower()
         if idx_empresa is None and (i == 0 or "plano de contas" in cl or (cl == "empresa" and i < 3)):
             idx_empresa = i
+        if idx_reduzido is None and ("reduzido" in cl or "unnamed: 1" in cl):
+            idx_reduzido = i
         if idx_classificacao is None and ("classifica" in cl or "unnamed: 2" in cl):
             idx_classificacao = i
         if idx_tipo is None and ("unnamed: 3" in cl or cl == "tipo" or ("tipo" in cl and "ecf" not in cl and i < 6)):
@@ -187,6 +189,7 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
             idx_descricao = i
 
     if idx_empresa is None:       idx_empresa = 0
+    if idx_reduzido is None:      idx_reduzido = 1
     if idx_classificacao is None: idx_classificacao = 2
     if idx_tipo is None:          idx_tipo = 3
     if idx_descricao is None:     idx_descricao = 4
@@ -196,6 +199,7 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
 
     for _, row in df_raw.iterrows():
         empresa_val = str(row.iloc[idx_empresa]).strip()
+        reduzido    = str(row.iloc[idx_reduzido]).strip()
         classif     = str(row.iloc[idx_classificacao]).strip()
         tipo_raw    = str(row.iloc[idx_tipo]).strip().upper()
         nome        = str(row.iloc[idx_descricao]).strip()
@@ -207,7 +211,14 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
         if tipo_raw not in ("S","A"): ignorados += 1; continue
         if not nome or nome.lower() in ("nan","none",""): ignorados += 1; continue
 
+        # Limpa o código reduzido
+        if reduzido.endswith(".0"):
+            reduzido = reduzido[:-2]
+        if reduzido.lower() in ("nan","none",""):
+            reduzido = classif  # fallback para classificação se reduzido vazio
+
         registros.append({
+            "reduzido":      reduzido,
             "classificacao": classif,
             "nome_conta":    _norm(nome),
             "nome_original": nome,
@@ -223,6 +234,7 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
 
 # ══════════════════════════════════════════════════════════════════════════
 # CLASSIFICADOR DE CONTAS POR GRUPO
+# Retorna APENAS contas dentro do grupo — sem fallback para todas
 # ══════════════════════════════════════════════════════════════════════════
 KWORDS_DEBITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
@@ -256,7 +268,7 @@ KWORDS_DEBITO: dict[str, list[str]] = {
     "Despesa com Vendas": [
         "DESPESAS COM VENDAS","COMISSOES SOBRE VENDAS","COMISSOES",
         "PROPAGANDA E PUBLICIDADE","BONIFICACAO","FRETES E CARRETOS",
-        "MANUTENÇÃO DE VEICULOS","VIAGENS","ALUGUEIS",
+        "MANUTENCAO DE VEICULOS","VIAGENS","ALUGUEIS",
     ],
     "Despesa Financeira": [
         "DESPESAS FINANCEIRAS","JUROS PASSIVOS","VARIACOES MONETARIAS",
@@ -346,11 +358,19 @@ def _analiticas(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fmt_opcoes(df_f: pd.DataFrame) -> list[str]:
-    col_nome = "nome_original" if "nome_original" in df_f.columns else "nome_conta"
-    return [""] + [f"{r['classificacao']} - {r[col_nome]}" for _, r in df_f.iterrows()]
+    """Formata opções usando código REDUZIDO - descrição original."""
+    return [""] + [
+        f"{r['reduzido']} - {r['nome_original']}"
+        for _, r in df_f.iterrows()
+    ]
 
 
 def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], list[str]]:
+    """
+    Retorna listas de opções APENAS com contas que pertencem ao grupo.
+    Se nenhuma conta bater com as keywords do grupo, retorna lista vazia (só "").
+    NÃO faz fallback para todas as contas.
+    """
     df_a = _analiticas(df_contas)
     if df_a.empty:
         return [""], [""]
@@ -358,17 +378,19 @@ def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], 
     kw_d = KWORDS_DEBITO.get(grupo, [])
     kw_c = KWORDS_CREDITO.get(grupo, [])
 
+    # Débito: filtra APENAS contas que batem com keywords do grupo
     if kw_d and grupo != "Outro":
         mask_d = df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_d))
-        df_d   = df_a[mask_d] if mask_d.any() else df_a
+        df_d   = df_a[mask_d]  # SEM fallback — pode ser vazio
     else:
-        df_d = df_a
+        df_d = df_a  # grupo "Outro" = todas
 
+    # Crédito: filtra APENAS contas que batem com keywords do grupo
     if kw_c and grupo != "Outro":
         mask_c = df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_c))
-        df_c   = df_a[mask_c] if mask_c.any() else df_a
+        df_c   = df_a[mask_c]  # SEM fallback — pode ser vazio
     else:
-        df_c = df_a
+        df_c = df_a  # grupo "Outro" = todas
 
     return _fmt_opcoes(df_d), _fmt_opcoes(df_c)
 
@@ -380,15 +402,26 @@ def sugerir_contas(df_contas: pd.DataFrame, grupo: str) -> dict:
         "ops_cred":      ops_c,
         "conta_debito":  extrair_codigo(ops_d[1]) if len(ops_d) > 1 else "",
         "conta_credito": extrair_codigo(ops_c[1]) if len(ops_c) > 1 else "",
+        "desc_debito":   extrair_descricao(ops_d[1]) if len(ops_d) > 1 else "",
+        "desc_credito":  extrair_descricao(ops_c[1]) if len(ops_c) > 1 else "",
         "n_deb":  len(ops_d) - 1,
         "n_cred": len(ops_c) - 1,
     }
 
 
 def extrair_codigo(opcao: str) -> str:
+    """Extrai o código REDUZIDO da opção formatada 'reduzido - descrição'."""
     if not opcao or " - " not in opcao:
         return opcao or ""
     return opcao.split(" - ")[0].strip()
+
+
+def extrair_descricao(opcao: str) -> str:
+    """Extrai a descrição da opção formatada 'reduzido - descrição'."""
+    if not opcao or " - " not in opcao:
+        return ""
+    partes = opcao.split(" - ", 1)
+    return partes[1].strip() if len(partes) > 1 else ""
 
 
 def _idx(opcoes: list[str], valor: str) -> int:
@@ -421,16 +454,22 @@ def classificar_todos_eventos(
         confianca = classif["confianca"]
 
         conta_debito = conta_credito = ""
+        desc_debito  = desc_credito  = ""
+
         if df_contas is not None and not df_contas.empty:
             auto = sugerir_contas(df_contas, grupo)
             conta_debito  = auto["conta_debito"]
             conta_credito = auto["conta_credito"]
+            desc_debito   = auto["desc_debito"]
+            desc_credito  = auto["desc_credito"]
 
         resultado[cod] = {
             "grupo":         grupo,
             "confianca":     confianca,
             "conta_debito":  conta_debito,
             "conta_credito": conta_credito,
+            "desc_debito":   desc_debito,
+            "desc_credito":  desc_credito,
         }
 
     n_alta  = sum(1 for v in resultado.values() if v["confianca"] == "alta")
@@ -569,6 +608,20 @@ def get_centros_custo_unicos(eventos: list) -> list[tuple[str, str]]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# BUSCA DESCRIÇÃO DA CONTA NO PLANO DE CONTAS PELO CÓDIGO REDUZIDO
+# ══════════════════════════════════════════════════════════════════════════
+def buscar_descricao_conta(df_contas: pd.DataFrame | None, codigo_reduzido: str) -> str:
+    """Busca a descrição original de uma conta pelo seu código reduzido."""
+    if df_contas is None or df_contas.empty or not codigo_reduzido:
+        return ""
+    mask = df_contas["reduzido"] == str(codigo_reduzido).strip()
+    resultado = df_contas[mask]
+    if not resultado.empty:
+        return resultado.iloc[0]["nome_original"]
+    return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # GERA EXCEL — ETAPA 1
 # ══════════════════════════════════════════════════════════════════════════
 def gerar_excel_configuracao(
@@ -589,8 +642,8 @@ def gerar_excel_configuracao(
         desc_rubr = info.get("descricao", ev["descricao_pdf"])
         cc_cod    = ev["centro_custo_cod"]
 
-        # Prioridade: config manual por CC → classificação automática local
         conta_deb = conta_cred = historico = grupo = ""
+        desc_deb  = desc_cred = ""
 
         if usa_separador and config_cc and cc_cod in config_cc:
             cfg        = config_cc[cc_cod]
@@ -598,29 +651,36 @@ def gerar_excel_configuracao(
             conta_cred = cfg.get("conta_credito", "")
             historico  = cfg.get("historico",     "")
             grupo      = cfg.get("grupo",         "")
+            # Busca descrições pelo código reduzido
+            desc_deb   = buscar_descricao_conta(df_contas, conta_deb)
+            desc_cred  = buscar_descricao_conta(df_contas, conta_cred)
         elif classif_auto and cod in classif_auto:
             auto       = classif_auto[cod]
             grupo      = auto.get("grupo",         "")
             conta_deb  = auto.get("conta_debito",  "")
             conta_cred = auto.get("conta_credito", "")
+            desc_deb   = auto.get("desc_debito",   "")
+            desc_cred  = auto.get("desc_credito",  "")
 
         linhas.append({
-            "Cód. Empresa":         cod_empresa,
-            "Cód. Evento":          cod,
-            "Descrição (PDF)":      ev["descricao_pdf"],
-            "Descrição (Rubricas)": desc_rubr,
-            "Tipo Rubrica":         tipo,
-            "Tipo Folha (Nº)":      ev["tipo_folha"],
-            "Tipo Folha":           ev["tipo_folha_desc"],
-            "Cód. Centro de Custo": cc_cod,
-            "Centro de Custo":      ev["centro_custo_nome"],
-            "Grupo de Despesa":     grupo,
-            "Usa Separador":        "Sim" if usa_separador else "Não",
-            "Conta Débito":         conta_deb,
-            "Conta Crédito":        conta_cred,
-            "Cód. Histórico":       "",
-            "Histórico":            historico,
-            "Observação":           "",
+            "Cód. Empresa":              cod_empresa,
+            "Cód. Evento":               cod,
+            "Descrição (PDF)":           ev["descricao_pdf"],
+            "Descrição (Rubricas)":      desc_rubr,
+            "Tipo Rubrica":              tipo,
+            "Tipo Folha (Nº)":           ev["tipo_folha"],
+            "Tipo Folha":                ev["tipo_folha_desc"],
+            "Cód. Centro de Custo":      cc_cod,
+            "Centro de Custo":           ev["centro_custo_nome"],
+            "Grupo de Despesa":          grupo,
+            "Usa Separador":             "Sim" if usa_separador else "Não",
+            "Conta Débito":              conta_deb,
+            "Descrição Conta Débito":    desc_deb,
+            "Conta Crédito":             conta_cred,
+            "Descrição Conta Crédito":   desc_cred,
+            "Cód. Histórico":            "",
+            "Histórico":                 historico,
+            "Observação":                "",
         })
 
     df = pd.DataFrame(linhas)
@@ -630,9 +690,8 @@ def gerar_excel_configuracao(
         _formatar_planilha_config(writer.sheets["Configuração"], df)
 
         if df_contas is not None and not df_contas.empty:
-            col_nome = "nome_original" if "nome_original" in df_contas.columns else "nome_conta"
-            df_exp = df_contas[["classificacao", col_nome, "tipo"]].copy()
-            df_exp.columns = ["Classificação", "Nome da Conta", "Tipo (S/A)"]
+            df_exp = df_contas[["reduzido", "classificacao", "nome_original", "tipo"]].copy()
+            df_exp.columns = ["Código Reduzido", "Classificação", "Nome da Conta", "Tipo (S/A)"]
             df_exp.to_excel(writer, sheet_name="Plano de Contas", index=False)
             _formatar_planilha_saida(writer.sheets["Plano de Contas"])
 
@@ -646,16 +705,26 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
         left=Side(style="thin"), right=Side(style="thin"),
         top=Side(style="thin"), bottom=Side(style="thin"),
     )
+    # Colunas: A=CodEmp B=CodEv C=DescPDF D=DescRubr E=TipoRubr F=TipoFolhaN
+    # G=TipoFolha H=CodCC I=CC J=Grupo K=UsaSep
+    # L=ContaDeb M=DescContaDeb N=ContaCred O=DescContaCred
+    # P=CodHist Q=Hist R=Obs
     larguras = {
         "A": 12, "B": 12, "C": 38, "D": 38, "E": 16,
         "F": 14, "G": 20, "H": 18, "I": 22, "J": 22,
-        "K": 14, "L": 16, "M": 16, "N": 14, "O": 42, "P": 30,
+        "K": 14, "L": 16, "M": 38, "N": 16, "O": 38,
+        "P": 14, "Q": 42, "R": 30,
     }
     for col, w in larguras.items():
         ws.column_dimensions[col].width = w
 
-    COLS_PREENCHER  = {12, 13, 14, 15, 16}
-    COLS_INFO_EXTRA = {10, 11}
+    # Colunas a preencher: L(12), N(14) = Conta Débito e Crédito
+    # Descrições: M(13), O(15) = leitura automática
+    # Histórico/Obs: P(16), Q(17), R(18)
+    COLS_PREENCHER  = {12, 14, 16, 17, 18}   # ContaDeb, ContaCred, CodHist, Hist, Obs
+    COLS_AUTO       = {13, 15}                # DescContaDeb, DescContaCred (preenchimento automático)
+    COLS_INFO_EXTRA = {10, 11}                # Grupo, UsaSep
+
     TIPO_COR = {
         "Provento":      "D4EDDA",
         "Desconto":      "F8D7DA",
@@ -666,6 +735,9 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
     for col_idx, cell in enumerate(ws[1], start=1):
         if col_idx in COLS_PREENCHER:
             cell.fill = PatternFill("solid", fgColor="FF8000")
+            cell.font = Font(bold=True, color="FFFFFF", size=10)
+        elif col_idx in COLS_AUTO:
+            cell.fill = PatternFill("solid", fgColor="28A745")
             cell.font = Font(bold=True, color="FFFFFF", size=10)
         elif col_idx in COLS_INFO_EXTRA:
             cell.fill = PatternFill("solid", fgColor="6C757D")
@@ -686,6 +758,9 @@ def _formatar_planilha_config(ws, df: pd.DataFrame):
             if col_idx in COLS_PREENCHER:
                 cell.fill = PatternFill("solid", fgColor="FFF8F0")
                 cell.font = Font(size=10)
+            elif col_idx in COLS_AUTO:
+                cell.fill = PatternFill("solid", fgColor="F0FFF4")
+                cell.font = Font(size=10, italic=True)
             else:
                 cell.fill = PatternFill("solid", fgColor=cor_linha)
                 cell.font = Font(size=10)
@@ -736,19 +811,21 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
     col_map: dict[str, str] = {}
     for col in df.columns:
         cl = col.lower()
-        if   "cód. empresa"         in cl or "cod. empresa"    in cl: col_map["empresa"]       = col
-        elif "cód. evento"          in cl or "cod. evento"     in cl: col_map["seq"]           = col
-        elif "tipo folha (nº)"      in cl or "tipo folha (n"   in cl: col_map["tipo"]          = col
-        elif "descrição (rubricas)" in cl:                             col_map["desc"]          = col
-        elif "descrição (pdf)"      in cl and "desc" not in col_map:  col_map["desc"]          = col
-        elif "cód. centro de custo" in cl:                             col_map["cc"]            = col
-        elif "conta débito"         in cl or "conta debito"    in cl: col_map["debito"]        = col
-        elif "conta crédito"        in cl or "conta credito"   in cl: col_map["credito"]       = col
-        elif "cód. histórico"       in cl or "cod. historico"  in cl: col_map["historico"]     = col
-        elif "histórico"            in cl and "cód" not in cl and "cod" not in cl:
+        if   "cód. empresa"              in cl or "cod. empresa"    in cl: col_map["empresa"]       = col
+        elif "cód. evento"               in cl or "cod. evento"     in cl: col_map["seq"]           = col
+        elif "tipo folha (nº)"           in cl or "tipo folha (n"   in cl: col_map["tipo"]          = col
+        elif "descrição (rubricas)"      in cl:                             col_map["desc"]          = col
+        elif "descrição (pdf)"           in cl and "desc" not in col_map:  col_map["desc"]          = col
+        elif "cód. centro de custo"      in cl:                             col_map["cc"]            = col
+        elif "conta débito"              in cl or "conta debito"    in cl: col_map["debito"]        = col
+        elif "descrição conta débito"    in cl or "descricao conta debito" in cl: col_map["desc_deb"] = col
+        elif "conta crédito"             in cl or "conta credito"   in cl: col_map["credito"]       = col
+        elif "descrição conta crédito"   in cl or "descricao conta credito" in cl: col_map["desc_cred"] = col
+        elif "cód. histórico"            in cl or "cod. historico"  in cl: col_map["historico"]     = col
+        elif "histórico"                 in cl and "cód" not in cl and "cod" not in cl:
             col_map["historico_texto"] = col
-        elif "observação"           in cl:                             col_map["observacao"]    = col
-        elif "usa separador"        in cl:                             col_map["usa_separador"] = col
+        elif "observação"                in cl:                             col_map["observacao"]    = col
+        elif "usa separador"             in cl:                             col_map["usa_separador"] = col
 
     TIPO_COL = (
         "Tipo da Integração (1 - Folha mensal; 2 - Empresa; "
@@ -759,16 +836,16 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
     sem_conta = com_conta = 0
 
     for _, row in df.iterrows():
-        empresa     = _limpa(row.get(col_map.get("empresa",         ""), "")) or cod_empresa_padrao
-        seq         = _limpa(row.get(col_map.get("seq",             ""), ""))
-        tipo        = _limpa(row.get(col_map.get("tipo",            ""), ""))
-        desc        = _limpa(row.get(col_map.get("desc",            ""), ""))
-        cc          = _limpa(row.get(col_map.get("cc",              ""), ""))
-        debito      = _limpa(row.get(col_map.get("debito",          ""), ""))
-        credito     = _limpa(row.get(col_map.get("credito",         ""), ""))
-        historico   = _limpa(row.get(col_map.get("historico",       ""), ""))
+        empresa     = _limpa(row.get(col_map.get("empresa",      ""), "")) or cod_empresa_padrao
+        seq         = _limpa(row.get(col_map.get("seq",          ""), ""))
+        tipo        = _limpa(row.get(col_map.get("tipo",         ""), ""))
+        desc        = _limpa(row.get(col_map.get("desc",         ""), ""))
+        cc          = _limpa(row.get(col_map.get("cc",           ""), ""))
+        debito      = _limpa(row.get(col_map.get("debito",       ""), ""))
+        credito     = _limpa(row.get(col_map.get("credito",      ""), ""))
+        historico   = _limpa(row.get(col_map.get("historico",    ""), ""))
         complemento = _limpa(row.get(col_map.get("historico_texto", ""), ""))
-        usa_sep     = _limpa(row.get(col_map.get("usa_separador",   ""), ""))
+        usa_sep     = _limpa(row.get(col_map.get("usa_separador",""), ""))
 
         if not seq:
             continue
@@ -902,6 +979,7 @@ def main():
         st.markdown("🔵 Azul → Informativa")
         st.markdown("🟡 Amarelo → Inf. Dedutora")
         st.markdown("🟠 Laranja → Campos a preencher")
+        st.markdown("🌿 Verde claro → Descrição automática")
         st.markdown("---")
         st.markdown(f"**Versão:** {VERSAO}")
 
@@ -972,9 +1050,8 @@ def main():
             f"**{len(df_pc)}** contas ({n_a} analíticas · {n_s} sintéticas)"
         )
         with st.expander("🔍 Ver amostra das contas analíticas", expanded=False):
-            col_nome = "nome_original" if "nome_original" in df_pc.columns else "nome_conta"
-            df_am = df_pc[df_pc["tipo"] == "A"][["classificacao", col_nome]].head(30)
-            df_am.columns = ["Classificação", "Nome da Conta"]
+            df_am = df_pc[df_pc["tipo"] == "A"][["reduzido", "classificacao", "nome_original"]].head(30)
+            df_am.columns = ["Código Reduzido", "Classificação", "Nome da Conta"]
             st.dataframe(df_am, use_container_width=True)
     elif contas_file is not None:
         st.error("❌ Não foi possível carregar o Plano de Contas. Verifique o log abaixo.")
@@ -1028,6 +1105,7 @@ def main():
                             index=grupo_idx, key=f"grupo_{cc_cod}",
                         )
 
+                        # Filtra contas APENAS do grupo selecionado
                         if df_pc is not None and not df_pc.empty:
                             ops_deb, ops_cred = classificar_contas(df_pc, grupo_sel)
                             n_deb  = len(ops_deb)  - 1
@@ -1035,6 +1113,14 @@ def main():
                         else:
                             ops_deb = ops_cred = [""]
                             n_deb = n_cred = 0
+
+                        # Aviso se nenhuma conta foi encontrada no grupo
+                        if n_deb == 0 and df_pc is not None:
+                            st.warning(f"⚠️ Nenhuma conta de débito encontrada para o grupo **{grupo_sel}**. "
+                                      f"Selecione 'Outro' para ver todas as contas.")
+                        if n_cred == 0 and df_pc is not None:
+                            st.warning(f"⚠️ Nenhuma conta de crédito encontrada para o grupo **{grupo_sel}**. "
+                                      f"Selecione 'Outro' para ver todas as contas.")
 
                         col_d, col_c, col_h = st.columns([3, 3, 2])
                         with col_d:
@@ -1057,11 +1143,21 @@ def main():
 
                         deb_cod  = extrair_codigo(deb_sel)
                         cred_cod = extrair_codigo(cred_sel)
+                        deb_desc = extrair_descricao(deb_sel)
+                        cred_desc = extrair_descricao(cred_sel)
+
+                        # Exibe as descrições selecionadas
+                        if deb_desc:
+                            st.info(f"📌 Débito: **{deb_cod}** — {deb_desc}")
+                        if cred_desc:
+                            st.info(f"📌 Crédito: **{cred_cod}** — {cred_desc}")
 
                         st.session_state.config_cc[cc_cod] = {
                             "grupo":         grupo_sel,
                             "conta_debito":  deb_cod,
                             "conta_credito": cred_cod,
+                            "desc_debito":   deb_desc,
+                            "desc_credito":  cred_desc,
                             "historico":     hist_sel,
                         }
         else:
@@ -1109,7 +1205,7 @@ def main():
         st.session_state.eventos_parsed = eventos
         st.session_state.catalog_parsed = catalog
 
-        # ✅ Classificação automática local ANTES de gerar o Excel
+        # Classificação automática local
         with st.spinner("🔍 Classificando rubricas automaticamente..."):
             classif_auto = classificar_todos_eventos(eventos, catalog, df_pc, log)
             st.session_state.classif_auto = classif_auto
@@ -1122,7 +1218,6 @@ def main():
                     cc_cod not in st.session_state.config_cc
                     or not st.session_state.config_cc[cc_cod].get("conta_debito")
                 ):
-                    # Grupo dominante entre os eventos deste CC
                     grupos_cc = [
                         classif_auto.get(ev["cod"], {}).get("grupo", "Despesa Administrativa")
                         for ev in eventos
@@ -1134,9 +1229,12 @@ def main():
                         "grupo":         grupo_dominante,
                         "conta_debito":  auto["conta_debito"],
                         "conta_credito": auto["conta_credito"],
+                        "desc_debito":   auto["desc_debito"],
+                        "desc_credito":  auto["desc_credito"],
                         "historico":     "",
                     }
-                    log.append(f"CC {cc_cod}: grupo dominante → {grupo_dominante}")
+                    log.append(f"CC {cc_cod}: grupo dominante → {grupo_dominante} | "
+                               f"Déb: {auto['conta_debito']} | Créd: {auto['conta_credito']}")
 
         if not eventos:
             log.append("AVISO: Nenhum evento encontrado no PDF.")
@@ -1164,20 +1262,24 @@ def main():
                 grupo      = cfg_cc.get("grupo", auto.get("grupo", "—"))
                 conta_deb  = cfg_cc.get("conta_debito",  auto.get("conta_debito",  ""))
                 conta_cred = cfg_cc.get("conta_credito", auto.get("conta_credito", ""))
+                desc_deb   = cfg_cc.get("desc_debito",   auto.get("desc_debito",   ""))
+                desc_cred  = cfg_cc.get("desc_credito",  auto.get("desc_credito",  ""))
                 confianca  = auto.get("confianca", "")
                 ok         = bool(conta_deb and conta_cred)
 
                 linhas_prev.append({
-                    "Código":        cod_ev,
-                    "Descrição":     ev["descricao_pdf"],
-                    "Tipo":          info.get("tipo", "⚠️"),
-                    "Tipo Folha":    ev["tipo_folha_desc"],
-                    "Centro Custo":  ev["centro_custo_nome"],
-                    "Grupo":         grupo,
-                    "Confiança":     confianca,
-                    "Conta Débito":  conta_deb,
-                    "Conta Crédito": conta_cred,
-                    "Classif.":      "✅" if ok else "⚠️",
+                    "Código":              cod_ev,
+                    "Descrição":           ev["descricao_pdf"],
+                    "Tipo":                info.get("tipo", "⚠️"),
+                    "Tipo Folha":          ev["tipo_folha_desc"],
+                    "Centro Custo":        ev["centro_custo_nome"],
+                    "Grupo":               grupo,
+                    "Confiança":           confianca,
+                    "Conta Débito":        conta_deb,
+                    "Desc. Débito":        desc_deb,
+                    "Conta Crédito":       conta_cred,
+                    "Desc. Crédito":       desc_cred,
+                    "Classif.":            "✅" if ok else "⚠️",
                 })
             st.session_state.df_preview = pd.DataFrame(linhas_prev)
 
@@ -1214,7 +1316,6 @@ def main():
             ], [total, p, d, i, id_, nf, ok, nok]):
                 col_m.metric(lbl, val)
 
-            # Mostra confiança da classificação
             if "Confiança" in df.columns:
                 n_alta  = len(df[df["Confiança"] == "alta"])
                 n_media = len(df[df["Confiança"] == "media"])
