@@ -178,202 +178,157 @@ def _e_conta_ativo(classificacao: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MOTOR DE SCORING — tabelas base
+# TABELAS DE SCORING — DRE POR TIPO DE RUBRICA
 # ══════════════════════════════════════════════════════════════════════════
 
-# ─── TABELAS DRE ESPECÍFICAS POR TIPO DE RUBRICA ─────────────────────────
-# Cada rubrica tem sua própria tabela de scoring para encontrar
-# a conta DRE mais específica no plano
-
-# Salário base / dias normais / saldo salário
+# Salário base / dias normais
 DRE_SALARIO_POS = [
-    ("SALARIOS E ORDENADOS", 300),
-    ("PRO-LABORE", 200),
-    ("DESPESAS COM PESSOAL", 250),
-    ("MAO-DE-OBRA DIRETA", 280),
-    ("MAO-DE-OBRA INDIRETA", 280),
-    ("SALARIOS E ORDENADOS CUSTOS", 280),
+    ("SALARIOS E ORDENADOS", 300), ("PRO-LABORE", 200),
+    ("DESPESAS COM PESSOAL", 250), ("MAO-DE-OBRA DIRETA", 280),
+    ("MAO-DE-OBRA INDIRETA", 280), ("SALARIOS E ORDENADOS CUSTOS", 280),
 ]
 DRE_SALARIO_NEG = [
     ("A PAGAR", -300), ("A RECOLHER", -300),
     ("PROVISAO", -300), ("PROVISOES", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("HORAS EXTRAS", -100),   # não é conta de salário base
-    ("FERIAS", -100),          # não é conta de salário base
-    ("13 SALARIO", -100),
-    ("INSS", -100), ("FGTS", -100),
-    ("INDENIZACOES", -100),
-    ("ALIMENTACAO", -200),     # CRÍTICO: bloqueia 651
-    ("VALE REFEICAO", -200),   # CRÍTICO: bloqueia 672
-    ("VALE TRANSPORTE", -100),
+    ("HORAS EXTRAS", -100), ("FERIAS", -100), ("13 SALARIO", -100),
+    ("INSS", -100), ("FGTS", -100), ("INDENIZACOES", -100),
+    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300), ("VALE TRANSPORTE", -100),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500), ("CUSTOS DOS SERVICOS PRESTADOS", -500),
 ]
 
 # Horas Extras
 DRE_HORAS_EXTRAS_POS = [
-    ("HORAS EXTRAS", 500),
-    ("HORA EXTRA", 500),
-    ("DESPESAS COM PESSOAL", 100),
-    ("MAO-DE-OBRA DIRETA", 150),
+    ("HORAS EXTRAS", 500), ("HORA EXTRA", 500),
+    ("DESPESAS COM PESSOAL", 100), ("MAO-DE-OBRA DIRETA", 150),
 ]
 DRE_HORAS_EXTRAS_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("PROVISAO", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("PROVISAO", -300),
+    ("A COMPENSAR", -400), ("SALARIOS E ORDENADOS", -100),
     ("FERIAS", -100), ("13 SALARIO", -100),
     ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Férias (proventos de férias)
+# Férias
 DRE_FERIAS_POS = [
-    ("FERIAS", 400),
-    ("FERIAS CUSTOS", 450),
-    ("PROVISOES PARA FERIAS", 350),   # para folha de férias
-    ("DESPESAS COM PESSOAL", 100),
+    ("FERIAS", 400), ("FERIAS CUSTOS", 450),
+    ("PROVISOES PARA FERIAS", 350), ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_FERIAS_NEG = [
-    ("A PAGAR", -200),   # férias a pagar é passivo, mas provisão é ok
-    ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("HORAS EXTRAS", -100),
-    ("13 SALARIO", -100),
+    ("A PAGAR", -200), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("HORAS EXTRAS", -100), ("13 SALARIO", -100),
     ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("INSS SOBRE PROVISOES", -200),
-    ("FGTS SOBRE PROVISOES", -200),
+    ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# 13º Salário (proventos)
+# 13º Salário
 DRE_13_SALARIO_POS = [
-    ("13 SALARIO", 400),
-    ("13 SALARIO CUSTOS", 450),
-    ("PROVISOES PARA 13", 350),
-    ("DESPESAS COM PESSOAL", 100),
+    ("13 SALARIO", 400), ("13 SALARIO CUSTOS", 450),
+    ("PROVISOES PARA 13", 350), ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_13_SALARIO_NEG = [
-    ("A PAGAR", -200), ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("HORAS EXTRAS", -100),
-    ("FERIAS", -100),
+    ("A PAGAR", -200), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("HORAS EXTRAS", -100), ("FERIAS", -100),
     ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("INSS SOBRE PROVISOES", -200),
-    ("FGTS SOBRE PROVISOES", -200),
+    ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
 # Rescisão / Aviso Prévio / Indenizações
 DRE_RESCISAO_POS = [
-    ("INDENIZACOES E AVISO PREVIO", 500),
-    ("INDENIZACOES", 400),
-    ("AVISO PREVIO", 400),
-    ("RESCISAO", 400),
-    ("DESPESAS COM PESSOAL", 100),
+    ("INDENIZACOES E AVISO PREVIO", 500), ("INDENIZACOES", 400),
+    ("AVISO PREVIO", 400), ("RESCISAO", 400), ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_RESCISAO_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("HORAS EXTRAS", -100),
-    ("FERIAS", -100),
-    ("13 SALARIO", -100),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("HORAS EXTRAS", -100),
+    ("FERIAS", -100), ("13 SALARIO", -100),
     ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
+    ("CUSTOS DOS SERVICOS PRESTADOS", -500),
 ]
 
-# Vale Transporte (despesa da empresa)
+# Vale Transporte
 DRE_VALE_TRANSPORTE_POS = [
-    ("VALE TRANSPORTE", 500),
-    ("DESPESAS COM PESSOAL", 100),
+    ("VALE TRANSPORTE", 500), ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_VALE_TRANSPORTE_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("ALIMENTACAO", -200), ("VALE REFEICAO", -200),
-    ("HORAS EXTRAS", -100),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
+    ("VALE REFEICAO", -200), ("HORAS EXTRAS", -100),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Vale Refeição / Alimentação (despesa da empresa)
+# Vale Refeição / Alimentação
 DRE_VALE_REFEICAO_POS = [
-    ("VALE REFEICAO", 500),
-    ("ALIMENTACAO", 400),
-    ("DESPESAS COM ALIMENTACAO", 450),
-    ("ALIMENTACAO/ CESTA BASICA", 450),
-    ("CESTA BASICA", 400),
-    ("DESPESAS COM PESSOAL", 100),
+    ("VALE REFEICAO", 500), ("ALIMENTACAO", 400),
+    ("DESPESAS COM ALIMENTACAO", 450), ("ALIMENTACAO/ CESTA BASICA", 450),
+    ("CESTA BASICA", 400), ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_VALE_REFEICAO_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("VALE TRANSPORTE", -100),
-    ("HORAS EXTRAS", -100),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("VALE TRANSPORTE", -100),
+    ("HORAS EXTRAS", -100), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Assistência Médica / Plano de Saúde (despesa da empresa)
+# Assistência Médica
 DRE_ASSISTENCIA_MEDICA_POS = [
-    ("ASSISTENCIA MEDICA E SOCIAL", 500),
-    ("ASSISTENCIA MEDICA", 450),
+    ("ASSISTENCIA MEDICA E SOCIAL", 500), ("ASSISTENCIA MEDICA", 450),
     ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_ASSISTENCIA_MEDICA_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("ALIMENTACAO", -200), ("VALE REFEICAO", -200),
-    ("HORAS EXTRAS", -100),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
+    ("VALE REFEICAO", -200), ("HORAS EXTRAS", -100),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
 # Comissões
 DRE_COMISSOES_POS = [
-    ("COMISSOES SOBRE VENDAS", 500),
-    ("COMISSOES", 400),
+    ("COMISSOES SOBRE VENDAS", 500), ("COMISSOES", 400),
     ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_COMISSOES_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("ALIMENTACAO", -200), ("VALE REFEICAO", -200),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
+    ("VALE REFEICAO", -200), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
 # PIS s/ Folha
 DRE_PIS_FOLHA_POS = [
-    ("PIS S/ FOLHA", 500),
-    ("DESPESAS COM PESSOAL", 100),
+    ("PIS S/ FOLHA", 500), ("DESPESAS COM PESSOAL", 100),
 ]
 DRE_PIS_FOLHA_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100),
-    ("ALIMENTACAO", -200), ("VALE REFEICAO", -200),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
+    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
+    ("VALE REFEICAO", -200), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
 # Genérico DRE pessoal (fallback)
 DRE_PESSOAL_GENERICO_POS = [
-    ("DESPESAS COM PESSOAL", 300),
-    ("SALARIOS E ORDENADOS", 200),
-    ("PRO-LABORE", 150),
-    ("MAO-DE-OBRA DIRETA", 250),
+    ("DESPESAS COM PESSOAL", 300), ("SALARIOS E ORDENADOS", 200),
+    ("PRO-LABORE", 150), ("MAO-DE-OBRA DIRETA", 250),
     ("MAO-DE-OBRA INDIRETA", 250),
 ]
 DRE_PESSOAL_GENERICO_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("PROVISAO", -200), ("A COMPENSAR", -400),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("VALE TRANSPORTE", -100),
-    ("HORAS EXTRAS", -100),
-    ("FERIAS", -100), ("13 SALARIO", -100),
-    ("INSS", -100), ("FGTS", -100),
+    ("A PAGAR", -300), ("A RECOLHER", -300), ("PROVISAO", -200),
+    ("A COMPENSAR", -400), ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
+    ("VALE TRANSPORTE", -100), ("HORAS EXTRAS", -100),
+    ("FERIAS", -100), ("13 SALARIO", -100), ("INSS", -100), ("FGTS", -100),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# ─── PASSIVO ESPECÍFICO POR TIPO ─────────────────────────────────────────
-# Salários a Pagar (passivo para proventos normais)
+
+# ══════════════════════════════════════════════════════════════════════════
+# TABELAS DE PASSIVO POR TIPO
+# ══════════════════════════════════════════════════════════════════════════
+
 PASSIVO_SALARIOS_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR", 500),
-    ("ORDENADOS A PAGAR", 500),
-    ("FOLHA A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250),
-    ("PRO-LABORE A PAGAR", 200),
+    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
+    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
+    ("OBRIGACOES COM O PESSOAL", 250), ("PRO-LABORE A PAGAR", 200),
     ("GRATIFICACOES A PAGAR", 180),
 ]
 PASSIVO_SALARIOS_NEG = [
@@ -382,17 +337,13 @@ PASSIVO_SALARIOS_NEG = [
     ("IRRF S/ FOLHA", -200), ("PROVISAO", -200),
     ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("FERIAS A PAGAR", -100),
-    ("RESCISOES A PAGAR", -100),
+    ("FERIAS A PAGAR", -100), ("RESCISOES A PAGAR", -100),
     ("13 SALARIO A PAGAR", -100),
 ]
 
-# Férias a Pagar (passivo para proventos de férias)
 PASSIVO_FERIAS_POS = [
-    ("FERIAS A PAGAR", 500),
-    ("PROVISOES PARA FERIAS", 400),
-    ("SALARIOS E ORDENADOS A PAGAR", 200),
-    ("OBRIGACOES COM O PESSOAL", 200),
+    ("FERIAS A PAGAR", 500), ("PROVISOES PARA FERIAS", 400),
+    ("SALARIOS E ORDENADOS A PAGAR", 200), ("OBRIGACOES COM O PESSOAL", 200),
 ]
 PASSIVO_FERIAS_NEG = [
     ("DESPESA", -300), ("CUSTO", -300),
@@ -400,33 +351,24 @@ PASSIVO_FERIAS_NEG = [
     ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
     ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("13 SALARIO A PAGAR", -100),
-    ("RESCISOES A PAGAR", -100),
+    ("13 SALARIO A PAGAR", -100), ("RESCISOES A PAGAR", -100),
 ]
 
-# Rescisões a Pagar (passivo para proventos de rescisão)
 PASSIVO_RESCISAO_POS = [
-    ("RESCISOES A PAGAR", 500),
-    ("INDENIZACOES A PAGAR", 400),
-    ("SALARIOS E ORDENADOS A PAGAR", 200),
-    ("OBRIGACOES COM O PESSOAL", 200),
+    ("RESCISOES A PAGAR", 500), ("INDENIZACOES A PAGAR", 400),
+    ("SALARIOS E ORDENADOS A PAGAR", 200), ("OBRIGACOES COM O PESSOAL", 200),
 ]
 PASSIVO_RESCISAO_NEG = [
     ("DESPESA", -300), ("CUSTO", -300),
     ("INSS A RECOLHER", -150), ("FGTS A RECOLHER", -150),
-    ("PROVISAO", -100),
-    ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("FERIAS A PAGAR", -100),
-    ("13 SALARIO A PAGAR", -100),
+    ("PROVISAO", -100), ("RECEITA", -300), ("BANCO", -200),
+    ("FORNECEDORES", -300), ("A COMPENSAR", -400), ("A RECUPERAR", -300),
+    ("FERIAS A PAGAR", -100), ("13 SALARIO A PAGAR", -100),
 ]
 
-# 13º Salário a Pagar (passivo)
 PASSIVO_13_POS = [
-    ("13 SALARIO A PAGAR", 500),
-    ("PROVISOES PARA 13", 400),
-    ("SALARIOS E ORDENADOS A PAGAR", 200),
-    ("OBRIGACOES COM O PESSOAL", 200),
+    ("13 SALARIO A PAGAR", 500), ("PROVISOES PARA 13", 400),
+    ("SALARIOS E ORDENADOS A PAGAR", 200), ("OBRIGACOES COM O PESSOAL", 200),
 ]
 PASSIVO_13_NEG = [
     ("DESPESA", -300), ("CUSTO", -300),
@@ -434,20 +376,19 @@ PASSIVO_13_NEG = [
     ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
     ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("FERIAS A PAGAR", -100),
-    ("RESCISOES A PAGAR", -100),
+    ("FERIAS A PAGAR", -100), ("RESCISOES A PAGAR", -100),
 ]
 
-# ─── TABELAS DESCONTOS ────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+# TABELAS DE DESCONTO
+# ══════════════════════════════════════════════════════════════════════════
+
 DESCONTO_DEBITO_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR", 500),
-    ("ORDENADOS A PAGAR", 500),
-    ("FOLHA A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250),
-    ("PRO-LABORE A PAGAR", 200),
-    ("GRATIFICACOES A PAGAR", 180),
-    ("RESCISOES A PAGAR", 180),
+    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
+    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
+    ("OBRIGACOES COM O PESSOAL", 250), ("PRO-LABORE A PAGAR", 200),
+    ("GRATIFICACOES A PAGAR", 180), ("RESCISOES A PAGAR", 180),
 ]
 DESCONTO_DEBITO_NEG = [
     ("DESPESA", -300), ("CUSTO", -300),
@@ -455,122 +396,71 @@ DESCONTO_DEBITO_NEG = [
     ("IRRF S/ FOLHA", -200), ("PROVISAO", -200),
     ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("SALARIOS E ORDENADOS CUSTOS", -300),
-    ("SALARIOS E ORDENADOS", -150),
+    ("SALARIOS E ORDENADOS CUSTOS", -300), ("SALARIOS E ORDENADOS", -150),
 ]
 
+# INSS empregado
 DESCONTO_CRED_INSS_POS = [
-    ("INSS A RECOLHER", 500),
-    ("OBRIGACOES SOCIAIS", 200),
-    ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 200),
-    ("A RECOLHER", 100),
+    ("INSS A RECOLHER", 500), ("OBRIGACOES SOCIAIS", 200),
+    ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 200), ("A RECOLHER", 100),
 ]
 DESCONTO_CRED_INSS_NEG = [
-    ("FGTS", -100), ("IRRF", -150),
-    ("SALARIOS A PAGAR", -100), ("DESPESA", -300), ("CUSTO", -300),
-    ("PROVISAO", -150), ("A COMPENSAR", -400), ("A RECUPERAR", -300),
+    ("FGTS", -100), ("IRRF", -150), ("SALARIOS A PAGAR", -100),
+    ("DESPESA", -300), ("CUSTO", -300), ("PROVISAO", -150),
+    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
 ]
 
+# IRRF empregado
 DESCONTO_CRED_IRRF_POS = [
-    ("IRRF S/ FOLHA", 500),
-    ("IMPOSTO DE RENDA A RECOLHER", 400),
+    ("IRRF S/ FOLHA", 500), ("IMPOSTO DE RENDA A RECOLHER", 400),
     ("IRRF", 250), ("A RECOLHER", 100),
 ]
 DESCONTO_CRED_IRRF_NEG = [
-    ("INSS", -150), ("FGTS", -150),
-    ("SALARIOS A PAGAR", -100), ("DESPESA", -300), ("CUSTO", -300),
+    ("INSS", -150), ("FGTS", -150), ("SALARIOS A PAGAR", -100),
+    ("DESPESA", -300), ("CUSTO", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
     ("NF", -150), ("ALUGUEL", -150), ("APLICACAO", -150),
 ]
 
-DESCONTO_CRED_VT_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR", 500),
+# Crédito = Salários a Pagar (para todos os outros descontos)
+DESCONTO_CRED_SAL_PAGAR_POS = [
+    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
+    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
     ("OBRIGACOES COM O PESSOAL", 250),
 ]
-DESCONTO_CRED_VT_NEG = [
+DESCONTO_CRED_SAL_PAGAR_NEG = [
     ("INSS", -150), ("FGTS", -150), ("IRRF", -150),
     ("DESPESA", -300), ("CUSTO", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-DESCONTO_CRED_PLANO_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250),
-]
-DESCONTO_CRED_PLANO_NEG = [
-    ("INSS", -150), ("FGTS", -150), ("IRRF", -150),
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-DESCONTO_CRED_ADIANT_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250),
-]
-DESCONTO_CRED_ADIANT_NEG = [
-    ("INSS", -150), ("FGTS", -150), ("IRRF", -150),
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-DESCONTO_CRED_FECHAMENTO_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250),
-]
-DESCONTO_CRED_FECHAMENTO_NEG = [
-    ("INSS", -150), ("FGTS", -150), ("IRRF", -150),
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-DESCONTO_CREDITO_GENERICO_POS = [
-    # Salários a Pagar tem prioridade máxima para descontos genéricos
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR",             500),
-    ("ORDENADOS A PAGAR",            500),
-    ("FOLHA A PAGAR",                500),
-    ("OBRIGACOES COM O PESSOAL",     300),
-    # Obrigações específicas ficam abaixo
-    ("INSS A RECOLHER",              200),
-    ("FGTS A RECOLHER",              200),
-    ("IRRF S/ FOLHA",                200),
-    ("PIS S/ FOLHA A RECOLHER",      180),
-    ("CONTRIBUICOES SINDICAIS",      160),
-    ("OBRIGACOES SOCIAIS",           150),
-    ("PENSAO ALIMENTICIA A PAGAR",   150),
-    ("A RECOLHER",                    60),
-    ("A PAGAR",                       50),
-    ("RETIDO",                        60),
-    ("PASSIVO",                       30),
-]
-DESCONTO_CREDITO_GENERICO_NEG = [
-    ("DESPESA",                     -300),
-    ("CUSTO",                       -300),
-    ("FORNECEDORES",                -300),
-    ("RECEITA",                     -300),
-    ("BANCO",                       -200),
-    ("PROVISOES PARA FERIAS",       -200),
-    ("PROVISOES PARA 13",           -200),
-    ("INSS SOBRE PROVISOES",        -200),
-    ("FGTS SOBRE PROVISOES",        -200),
-    ("A COMPENSAR",                 -400),
-    ("A RECUPERAR",                 -300),
-    ("EMPRESTIMO",                  -100),
-    # Bloqueia contas DRE de salários (não são passivo)
     ("SALARIOS E ORDENADOS CUSTOS", -300),
-    ("SALARIOS E ORDENADOS",        -150),
+    ("SALARIOS E ORDENADOS", -150),
 ]
 
-# ─── CONSIGNADO ───────────────────────────────────────────────────────────
+# Sindicato
+DESCONTO_CRED_SINDICATO_POS = [
+    ("CONTRIBUICOES SINDICAIS", 500), ("MENSALIDADE SINDICAL", 500),
+    ("OBRIGACOES SOCIAIS", 250), ("A RECOLHER", 100),
+]
+DESCONTO_CRED_SINDICATO_NEG = [
+    ("DESPESA", -300), ("CUSTO", -300), ("SALARIOS A PAGAR", -100),
+    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
+]
+
+# Pensão Alimentícia
+DESCONTO_CRED_PENSAO_POS = [
+    ("PENSAO ALIMENTICIA A PAGAR", 500),
+    ("SALARIOS E ORDENADOS A PAGAR", 250), ("A PAGAR", 100),
+]
+DESCONTO_CRED_PENSAO_NEG = [
+    ("DESPESA", -300), ("CUSTO", -300),
+    ("INSS", -150), ("FGTS", -150),
+    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
+]
+
+# Consignado
 CONSIGNADO_DEBITO_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500),
-    ("SALARIOS A PAGAR", 500),
-    ("ORDENADOS A PAGAR", 500),
-    ("FOLHA A PAGAR", 500),
+    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
+    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
     ("OBRIGACOES COM O PESSOAL", 250),
 ]
 CONSIGNADO_DEBITO_NEG = [
@@ -582,12 +472,9 @@ CONSIGNADO_DEBITO_NEG = [
 ]
 
 CONSIGNADO_CREDITO_POS = [
-    ("EMPRESTIMO / CONSIGNADO", 600),
-    ("EMPRESTIMOS CONSIGNADOS", 500),
-    ("CONSIGNADOS A PAGAR", 500),
-    ("CREDITO TRABALHO", 480),
-    ("EMPRESTIMOS DE FUNCIONARIOS", 450),
-    ("EMPRESTIMO A EMPREGADOS", 400),
+    ("EMPRESTIMO / CONSIGNADO", 600), ("EMPRESTIMOS CONSIGNADOS", 500),
+    ("CONSIGNADOS A PAGAR", 500), ("CREDITO TRABALHO", 480),
+    ("EMPRESTIMOS DE FUNCIONARIOS", 450), ("EMPRESTIMO A EMPREGADOS", 400),
     ("EMPRESTIMO", 200), ("CONSIGNADO", 200),
 ]
 CONSIGNADO_CREDITO_NEG = [
@@ -598,16 +485,17 @@ CONSIGNADO_CREDITO_NEG = [
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
 ]
 
-# ─── INFORMATIVOS / ENCARGO PATRONAL ─────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+# TABELAS DE INFORMATIVOS / ENCARGO PATRONAL
+# ══════════════════════════════════════════════════════════════════════════
+
 INFORMATIVO_DEBITO_POS = [
-    ("DESPESAS COM PESSOAL", 300),
-    ("INSS CUSTOS", 300), ("FGTS CUSTOS", 300),
+    ("DESPESAS COM PESSOAL", 300), ("INSS CUSTOS", 300), ("FGTS CUSTOS", 300),
     ("ENCARGOS SOCIAIS", 280), ("CONTRIBUICAO PATRONAL", 280),
-    ("CONTRIBUICAO PREVIDENCIARIA", 280),
-    ("INSS EMPRESA", 260), ("INSS TERCEIROS", 260),
-    ("INSS ACIDENTE", 260), ("PATRONAL", 260),
-    ("INSS", 150), ("FGTS", 150),
-    ("DESPESA", 50), ("CUSTO", 50),
+    ("CONTRIBUICAO PREVIDENCIARIA", 280), ("INSS EMPRESA", 260),
+    ("INSS TERCEIROS", 260), ("INSS ACIDENTE", 260), ("PATRONAL", 260),
+    ("INSS", 150), ("FGTS", 150), ("DESPESA", 50), ("CUSTO", 50),
 ]
 INFORMATIVO_DEBITO_NEG = [
     ("A RECOLHER", -300), ("A PAGAR", -300),
@@ -620,14 +508,14 @@ INFORMATIVO_DEBITO_NEG = [
     ("A COMPENSAR", -500), ("A RECUPERAR", -400),
     ("ADIANTAMENTO", -200), ("EMPRESTIMO", -300), ("SALDO NEGATIVO", -300),
     ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
+    ("CUSTOS DOS SERVICOS PRESTADOS", -500),
 ]
 
 INFORMATIVO_CREDITO_POS = [
     ("INSS A RECOLHER", 500), ("FGTS A RECOLHER", 500),
-    ("OBRIGACOES SOCIAIS", 250),
-    ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 250),
-    ("CONTRIBUICOES SINDICAIS", 200),
-    ("PIS S/ FOLHA A RECOLHER", 200),
+    ("OBRIGACOES SOCIAIS", 250), ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 250),
+    ("CONTRIBUICOES SINDICAIS", 200), ("PIS S/ FOLHA A RECOLHER", 200),
     ("A RECOLHER", 100), ("PASSIVO", 50),
 ]
 INFORMATIVO_CREDITO_NEG = [
@@ -638,7 +526,11 @@ INFORMATIVO_CREDITO_NEG = [
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
 ]
 
-# ─── FGTS DINÂMICO ────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+# TABELAS DE FGTS DINÂMICO
+# ══════════════════════════════════════════════════════════════════════════
+
 FGTS_CREDITO_POS = [
     ("FGTS A RECOLHER", 500), ("FGTS A PAGAR", 480),
     ("FUNDO DE GARANTIA", 400), ("OBRIGACOES SOCIAIS", 200),
@@ -650,9 +542,8 @@ FGTS_CREDITO_NEG = [
 ]
 
 FGTS_DEBITO_NORMAL_POS = [
-    ("FGTS CUSTOS", 400), ("FGTS", 250),
-    ("ENCARGOS SOCIAIS", 230), ("DESPESAS COM PESSOAL", 200),
-    ("DESPESA", 80), ("CUSTO", 80),
+    ("FGTS CUSTOS", 400), ("FGTS", 250), ("ENCARGOS SOCIAIS", 230),
+    ("DESPESAS COM PESSOAL", 200), ("DESPESA", 80), ("CUSTO", 80),
 ]
 FGTS_DEBITO_NORMAL_NEG = [
     ("A RECOLHER", -300), ("A PAGAR", -300),
@@ -660,14 +551,16 @@ FGTS_DEBITO_NORMAL_NEG = [
     ("SOBRE PROVISOES", -400), ("PROVISAO", -300), ("FORNECEDOR", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
     ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
+    ("CUSTOS DOS SERVICOS PRESTADOS", -500),
 ]
 
 FGTS_DEBITO_PROVISAO_POS = [
     ("FGTS SOBRE PROVISOES PARA FERIAS", 500),
     ("FGTS SOBRE PROVISOES PARA 13", 500),
     ("FGTS SOBRE PROVISOES", 450),
-    ("PROVISOES PARA FERIAS", 300),
-    ("PROVISOES PARA 13", 300), ("PROVISAO", 200),
+    ("PROVISOES PARA FERIAS", 300), ("PROVISOES PARA 13", 300),
+    ("PROVISAO", 200),
 ]
 FGTS_DEBITO_PROVISAO_NEG = [
     ("A RECOLHER", -300), ("A PAGAR", -200),
@@ -676,33 +569,24 @@ FGTS_DEBITO_PROVISAO_NEG = [
 ]
 
 FGTS_DEBITO_RESCISAO_POS = [
-    ("FGTS RESCISORIO",              500),
-    ("MULTA RESCISORIA",             500),
-    ("GRRF",                         500),
-    ("DESPESA COM RESCISAO",         400),
-    ("INDENIZACOES E AVISO PREVIO",  350),   # conta 281/305 DRE — rescisão
-    ("INDENIZACOES",                 300),
-    ("FGTS CUSTOS",                  250),
-    ("DESPESAS COM PESSOAL",         200),
-    ("DESPESA",                       80),
-    ("CUSTO",                         80),
+    ("FGTS RESCISORIO", 500), ("MULTA RESCISORIA", 500),
+    ("GRRF", 500), ("DESPESA COM RESCISAO", 400),
+    ("INDENIZACOES E AVISO PREVIO", 350),   # ← CRÍTICO: rota para 281
+    ("INDENIZACOES", 300),
+    ("FGTS CUSTOS", 250), ("DESPESAS COM PESSOAL", 200),
+    ("DESPESA", 80), ("CUSTO", 80),
 ]
 FGTS_DEBITO_RESCISAO_NEG = [
-    ("A RECOLHER",                  -300),
-    ("A PAGAR",                     -300),
-    ("PROVISOES PARA FERIAS",       -400),
-    ("PROVISOES PARA 13",           -400),
-    ("SOBRE PROVISOES",             -400),
-    ("PROVISAO",                    -300),
-    ("FORNECEDOR",                  -300),
-    ("A COMPENSAR",                 -400),
-    ("A RECUPERAR",                 -300),
-    ("ALIMENTACAO",                 -300),
-    ("VALE REFEICAO",               -300),
-    # Bloqueia conta genérica de custos vendidos
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
+    ("A RECOLHER", -300), ("A PAGAR", -300),
+    ("PROVISOES PARA FERIAS", -400), ("PROVISOES PARA 13", -400),
+    ("SOBRE PROVISOES", -400), ("PROVISAO", -300), ("FORNECEDOR", -300),
+    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
+    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),   # ← CRÍTICO: bloqueia 464
     ("CUSTOS DOS SERVICOS PRESTADOS", -500),
+    ("CUSTOS DAS MERCADORIAS VENDIDAS", -500),
 ]
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # DETECÇÃO DE TIPO DE RUBRICA PELO NOME
@@ -710,7 +594,7 @@ FGTS_DEBITO_RESCISAO_NEG = [
 def _e_consignado(nome_norm: str) -> bool:
     termos = ["EMPRESTIMO CONSIGNADO", "CONSIGNADO", "CREDITO TRABALHO",
               "EMP CRED TRAB", "EMPRESTIMO TRABALHADOR", "CONSIG",
-              "EMP. CRED. TRAB", "EMPRESTIMO CONSIG"]
+              "EMP. CRED. TRAB", "EMPRESTIMO CONSIG", "DESC. EMPRESTIMO"]
     return any(_norm(t) in nome_norm for t in termos)
 
 def _e_fgts(nome_norm: str) -> bool:
@@ -727,55 +611,15 @@ def _e_irrf(nome_norm: str) -> bool:
               "IRRF FERIAS", "IRRF 13"]
     return any(_norm(t) in nome_norm for t in termos)
 
-def _e_vale_transporte(nome_norm: str) -> bool:
-    termos = ["VALE TRANSPORTE", "VT 6", "DESC VT", "DESCONTO VT",
-              "VALE TRANSP", "DESCONTO VALE TRANSP",
-              "VALE TRANSPORT"]  # variação sem E final
-    return any(_norm(t) in nome_norm for t in termos)
-
-def _e_plano_saude_odonto(nome_norm: str) -> bool:
-    termos = ["PLANO SAUDE", "PLANO DE SAUDE", "ODONTOLOGICO", "ODONTO",
-              "COPARTICIPACAO", "COPART", "PLANO ODONT", "DESCONTO PLANO",
-              "DESC COPARTICIPACAO",  # detecta 271
-              "DESC PLANO",           # detecta 222 e 8111
-              "DESCONTO PLANO"]
-    return any(_norm(t) in nome_norm for t in termos)
-
-def _e_adiantamento_desc(nome_norm: str) -> bool:
-    """Desconto de adiantamento salarial — crédito = Salários a Pagar."""
-    termos = ["DESC.ADIANT", "DESC ADIANT", "DESCONTO ADIANT",
-              "DESCONTO ADIANTAMENTO", "ADIANTAMENTO SALARIAL DESC",
-              "DESC.ADIANT.SALARIAL", "ADIANTAMENTO DE FERIAS",
-              "ADIANTAMENTO FERIAS"]   # detecta 937
-    return any(_norm(t) in nome_norm for t in termos)
-
-def _e_fechamento(nome_norm: str) -> bool:
-    """
-    Rubricas de fechamento/ajuste: estouro, troco, saldo, diferença.
-    Débito = Salários a Pagar, Crédito = Salários a Pagar.
-    """
-    termos = ["ESTOURO", "TROCO", "FECHAMENTO", "SALDO DE SALARIO",
-              "SALDO SALARIO", "LIQUIDO RESCISAO", "LIQUIDO FOLHA",
-              "ESTOURO MES", "ESTOURO RESCISAO", "ESTOURO SEMANA",
-              "ESTOURO CONVOCACAO"]
-    return any(_norm(t) in nome_norm for t in termos)
-
-def _e_pensao_alimenticia(nome_norm: str) -> bool:
-    return "PENSAO ALIMENTICIA" in nome_norm or "PENSAO ALIMENT" in nome_norm
-
 def _e_sindicato(nome_norm: str) -> bool:
     termos = ["SINDICATO", "SINDICAL", "MENSALIDADE SINDICAL",
               "CONTRIBUICAO SINDICAL", "CONTRIB SINDICAL",
               "CONFEDERATIVA", "ASSISTENCIAL"]
     return any(_norm(t) in nome_norm for t in termos)
 
-def _e_vale_refeicao_desc(nome_norm: str) -> bool:
-    termos = ["DESC VALE REFEICAO", "DESCONTO VALE REFEICAO",
-              "DESC. VALE REFEICAO", "DESCONTO VR",
-              "DESC VALE REFEI"]   # variação abreviada
-    return any(_norm(t) in nome_norm for t in termos)
-    
-# ── DETECÇÃO DE TIPO DE PROVENTO PARA ROTEAMENTO DRE ─────────────────────
+def _e_pensao_alimenticia(nome_norm: str) -> bool:
+    return "PENSAO ALIMENTICIA" in nome_norm or "PENSAO ALIMENT" in nome_norm
+
 def _e_horas_extras(nome_norm: str) -> bool:
     termos = ["HORAS EXTRAS", "HORA EXTRA", "HE 50", "HE 100",
               "EXTRAS 50", "EXTRAS 100", "HORA EXTRA 50", "HORA EXTRA 100",
@@ -785,10 +629,9 @@ def _e_horas_extras(nome_norm: str) -> bool:
 def _e_ferias_provento(nome_norm: str) -> bool:
     termos = ["DIAS FERIAS", "FERIAS PROPORCIONAIS", "1/3 DAS FERIAS",
               "1/3 FERIAS", "MEDIA VALOR FERIAS", "MEDIA HORAS FERIAS",
-              "FERIAS VENCIDAS", "FERIAS GOZADAS", "DIAS FERIAS",
-              "ADIANTAMENTO DE FERIAS", "ABONO PECUNIARIO",
-              "ABONO FERIAS", "MEDIA FERIAS", "FERIAS PROPORC",
-              "1/3 FERIAS PROPORCIONAIS", "FERIAS INTEGRAIS",
+              "FERIAS VENCIDAS", "FERIAS GOZADAS", "ADIANTAMENTO DE FERIAS",
+              "ABONO PECUNIARIO", "ABONO FERIAS", "MEDIA FERIAS",
+              "FERIAS PROPORC", "1/3 FERIAS PROPORCIONAIS", "FERIAS INTEGRAIS",
               "FERIAS DO MES"]
     return any(_norm(t) in nome_norm for t in termos)
 
@@ -801,12 +644,6 @@ def _e_rescisao_provento(nome_norm: str) -> bool:
               "FGTS 13O SALARIO RESCISAO", "MULTA RESCISORIA",
               "MULTA ESTABILIDADE", "INDENIZACAO ADICIONAL",
               "AVISO PREVIO DIAS IND"]
-    return any(_norm(t) in nome_norm for t in termos)
-
-def _e_multa_desconto(nome_norm: str) -> bool:
-    """Multa estabilidade como desconto — crédito = Salários a Pagar."""
-    termos = ["MULTA ESTABILIDADE", "MULTA RESCISORIA",
-              "INDENIZACAO ADICIONAL DESC"]
     return any(_norm(t) in nome_norm for t in termos)
 
 def _e_13_salario_provento(nome_norm: str) -> bool:
@@ -836,11 +673,6 @@ def _e_comissao_provento(nome_norm: str) -> bool:
 
 def _e_pis_folha_provento(nome_norm: str) -> bool:
     return "PIS S/ FOLHA" in nome_norm or "PIS FOLHA" in nome_norm
-
-def _e_adiantamento_provento(nome_norm: str) -> bool:
-    termos = ["ADIANTAMENTO SALARIAL", "ADIANTAMENTO DE FERIAS",
-              "ADIANTAMENTO 13"]
-    return any(_norm(t) in nome_norm for t in termos)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -898,71 +730,37 @@ def _melhor_conta(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# ROTEAMENTO DRE: escolhe a tabela de scoring correta pelo nome da rubrica
+# ROTEAMENTO DRE E PASSIVO POR TIPO DE RUBRICA
 # ══════════════════════════════════════════════════════════════════════════
 def _get_dre_tables_provento(nome_norm: str, tipo_folha: str) -> tuple:
-    """
-    Retorna (pos, neg, score_min) para a conta DRE de débito
-    baseado no nome da rubrica e tipo de folha.
-    """
-    # Horas Extras têm conta própria
     if _e_horas_extras(nome_norm):
         return DRE_HORAS_EXTRAS_POS, DRE_HORAS_EXTRAS_NEG, 50
-
-    # Rescisão: conta de indenizações/aviso prévio
     if tipo_folha == "4" or _e_rescisao_provento(nome_norm):
         return DRE_RESCISAO_POS, DRE_RESCISAO_NEG, 50
-
-    # 13º Salário
     if tipo_folha in ("6",) or _e_13_salario_provento(nome_norm):
         return DRE_13_SALARIO_POS, DRE_13_SALARIO_NEG, 50
-
-    # Férias
     if tipo_folha in ("3", "5") or _e_ferias_provento(nome_norm):
         return DRE_FERIAS_POS, DRE_FERIAS_NEG, 50
-
-    # Vale Transporte (provento)
     if _e_vale_transporte_provento(nome_norm):
         return DRE_VALE_TRANSPORTE_POS, DRE_VALE_TRANSPORTE_NEG, 50
-
-    # Vale Refeição / Alimentação (provento)
     if _e_vale_refeicao_provento(nome_norm):
         return DRE_VALE_REFEICAO_POS, DRE_VALE_REFEICAO_NEG, 50
-
-    # Assistência Médica (provento)
     if _e_assistencia_medica_provento(nome_norm):
         return DRE_ASSISTENCIA_MEDICA_POS, DRE_ASSISTENCIA_MEDICA_NEG, 50
-
-    # Comissões
     if _e_comissao_provento(nome_norm):
         return DRE_COMISSOES_POS, DRE_COMISSOES_NEG, 50
-
-    # PIS s/ Folha
     if _e_pis_folha_provento(nome_norm):
         return DRE_PIS_FOLHA_POS, DRE_PIS_FOLHA_NEG, 50
-
-    # Salário base (dias normais, horas normais, adiantamento, etc.)
     return DRE_SALARIO_POS, DRE_SALARIO_NEG, 50
 
 
 def _get_passivo_tables_provento(nome_norm: str, tipo_folha: str) -> tuple:
-    """
-    Retorna (pos, neg, score_min) para a conta Passivo de crédito
-    baseado no nome da rubrica e tipo de folha.
-    """
-    # Rescisão: rescisões a pagar
     if tipo_folha == "4" or _e_rescisao_provento(nome_norm):
         return PASSIVO_RESCISAO_POS, PASSIVO_RESCISAO_NEG, 100
-
-    # 13º Salário: 13 salário a pagar / provisão 13
     if tipo_folha in ("6",) or _e_13_salario_provento(nome_norm):
         return PASSIVO_13_POS, PASSIVO_13_NEG, 100
-
-    # Férias: férias a pagar / provisão férias
     if tipo_folha in ("3", "5") or _e_ferias_provento(nome_norm):
         return PASSIVO_FERIAS_POS, PASSIVO_FERIAS_NEG, 100
-
-    # Salário base: salários a pagar
     return PASSIVO_SALARIOS_POS, PASSIVO_SALARIOS_NEG, 100
 
 
@@ -1000,13 +798,16 @@ def gerar_depara_evento_conta(
         cc, dc = _melhor_conta(df_contas, FGTS_CREDITO_POS, FGTS_CREDITO_NEG,
                                score_min=100, filtro_posicao="PASSIVO")
         if tipo_folha in ("3", "6"):
-            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_PROVISAO_POS, FGTS_DEBITO_PROVISAO_NEG,
+            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_PROVISAO_POS,
+                                   FGTS_DEBITO_PROVISAO_NEG,
                                    score_min=50, filtro_posicao="PASSIVO")
         elif tipo_folha == "4":
-            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_RESCISAO_POS, FGTS_DEBITO_RESCISAO_NEG,
+            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_RESCISAO_POS,
+                                   FGTS_DEBITO_RESCISAO_NEG,
                                    score_min=50, filtro_posicao="DRE")
         else:
-            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_NORMAL_POS, FGTS_DEBITO_NORMAL_NEG,
+            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_NORMAL_POS,
+                                   FGTS_DEBITO_NORMAL_NEG,
                                    score_min=50, filtro_posicao="DRE")
         if cd and cc and validar_par_contas(cd, cc):
             return {"conta_debito": cd, "conta_credito": cc,
@@ -1022,9 +823,8 @@ def gerar_depara_evento_conta(
             return {"conta_debito": cd, "conta_credito": cc,
                     "desc_debito": dd, "desc_credito": dc}
 
-    # ── CASO 4: Proventos — roteamento específico por tipo ────────────────
+    # ── CASO 4: Proventos ─────────────────────────────────────────────────
     if evento_tipo == "Provento":
-        # Determina tabelas DRE e Passivo pelo nome/tipo da rubrica
         dre_pos, dre_neg, dre_min = _get_dre_tables_provento(nome, tipo_folha)
         pas_pos, pas_neg, pas_min = _get_passivo_tables_provento(nome, tipo_folha)
 
@@ -1033,19 +833,18 @@ def gerar_depara_evento_conta(
         cc, dc = _melhor_conta(df_contas, pas_pos, pas_neg,
                                score_min=pas_min, filtro_posicao="PASSIVO")
 
-        # Fallback: se não encontrou DRE específico, usa genérico
         if not cd:
-            cd, dd = _melhor_conta(df_contas, DRE_PESSOAL_GENERICO_POS, DRE_PESSOAL_GENERICO_NEG,
+            cd, dd = _melhor_conta(df_contas, DRE_PESSOAL_GENERICO_POS,
+                                   DRE_PESSOAL_GENERICO_NEG,
                                    score_min=30, filtro_posicao="DRE")
-        # Fallback passivo: se não encontrou específico, usa salários a pagar
         if not cc:
-            cc, dc = _melhor_conta(df_contas, PASSIVO_SALARIOS_POS, PASSIVO_SALARIOS_NEG,
+            cc, dc = _melhor_conta(df_contas, PASSIVO_SALARIOS_POS,
+                                   PASSIVO_SALARIOS_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
 
         if cd and cc and validar_par_contas(cd, cc):
             return {"conta_debito": cd, "conta_credito": cc,
                     "desc_debito": dd, "desc_credito": dc}
-        # Curto-circuito: retentar débito
         if cc:
             cd, dd = _melhor_conta(df_contas, dre_pos,
                                    dre_neg + [(_norm(cc), -1000)],
@@ -1053,71 +852,48 @@ def gerar_depara_evento_conta(
         return {"conta_debito": cd, "conta_credito": cc,
                 "desc_debito": dd, "desc_credito": dc}
 
-    # ── CASO 5: Descontos — crédito específico por tipo ───────────────────
+    # ── CASO 5: Descontos ─────────────────────────────────────────────────
     if evento_tipo in ("Desconto", "Inf. Dedutora"):
         # Débito sempre = Salários a Pagar (PASSIVO)
         cd, dd = _melhor_conta(df_contas, DESCONTO_DEBITO_POS, DESCONTO_DEBITO_NEG,
                                score_min=100, filtro_posicao="PASSIVO")
 
-        
-
-        # Crédito: roteamento por tipo de desconto
+        # Crédito: roteamento específico por tipo
         if _e_inss_desconto(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_INSS_POS, DESCONTO_CRED_INSS_NEG,
+            # INSS → INSS a Recolher
+            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_INSS_POS,
+                                   DESCONTO_CRED_INSS_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
         elif _e_irrf(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_IRRF_POS, DESCONTO_CRED_IRRF_NEG,
+            # IRRF → IRRF S/ Folha
+            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_IRRF_POS,
+                                   DESCONTO_CRED_IRRF_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
-        elif _e_vale_transporte(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_VT_POS, DESCONTO_CRED_VT_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        elif _e_plano_saude_odonto(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_PLANO_POS, DESCONTO_CRED_PLANO_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        elif _e_adiantamento_desc(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_ADIANT_POS, DESCONTO_CRED_ADIANT_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        elif _e_fechamento(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_FECHAMENTO_POS, DESCONTO_CRED_FECHAMENTO_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        elif _e_vale_refeicao_desc(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_VT_POS, DESCONTO_CRED_VT_NEG,
+        elif _e_sindicato(nome):
+            # Sindicato → Contribuições Sindicais
+            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SINDICATO_POS,
+                                   DESCONTO_CRED_SINDICATO_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
         elif _e_pensao_alimenticia(nome):
-            cc, dc = _melhor_conta(df_contas, [
-                ("PENSAO ALIMENTICIA A PAGAR", 500),
-                ("SALARIOS E ORDENADOS A PAGAR", 250),
-                ("A PAGAR", 100),
-            ], [("DESPESA",-300),("CUSTO",-300),("INSS",-150),("FGTS",-150),
-                ("A COMPENSAR",-400),("A RECUPERAR",-300)],
-                score_min=100, filtro_posicao="PASSIVO")
-        elif _e_sindicato(nome):
-            cc, dc = _melhor_conta(df_contas, [
-                ("CONTRIBUICOES SINDICAIS", 500),
-                ("MENSALIDADE SINDICAL", 500),
-                ("OBRIGACOES SOCIAIS", 250),
-                ("A RECOLHER", 100),
-            ], [("DESPESA",-300),("CUSTO",-300),("SALARIOS A PAGAR",-100),
-                ("A COMPENSAR",-400),("A RECUPERAR",-300)],
-                score_min=100, filtro_posicao="PASSIVO")
-
-                elif _e_multa_desconto(nome):
-            # Multa estabilidade como desconto — crédito = Salários a Pagar
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_FECHAMENTO_POS,
-                                   DESCONTO_CRED_FECHAMENTO_NEG,
+            # Pensão → Pensão Alimentícia a Pagar
+            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_PENSAO_POS,
+                                   DESCONTO_CRED_PENSAO_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
-        
         else:
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CREDITO_GENERICO_POS,
-                                   DESCONTO_CREDITO_GENERICO_NEG,
-                                   score_min=50, filtro_posicao="PASSIVO")
+            # TODOS OS OUTROS descontos → Salários a Pagar
+            # (VT, Plano Saúde/Odonto, Coparticipação, Adiantamento,
+            #  Estouro, Vale Refeição, Multa Estabilidade, etc.)
+            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SAL_PAGAR_POS,
+                                   DESCONTO_CRED_SAL_PAGAR_NEG,
+                                   score_min=100, filtro_posicao="PASSIVO")
 
         if cd and cc and validar_par_contas(cd, cc):
             return {"conta_debito": cd, "conta_credito": cc,
                     "desc_debito": dd, "desc_credito": dc}
+        # Curto-circuito: retentar crédito com fallback
         if cd:
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CREDITO_GENERICO_POS,
-                                   DESCONTO_CREDITO_GENERICO_NEG + [(_norm(cd), -1000)],
+            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SAL_PAGAR_POS,
+                                   DESCONTO_CRED_SAL_PAGAR_NEG + [(_norm(cd), -1000)],
                                    score_min=30, filtro_posicao="PASSIVO")
         return {"conta_debito": cd, "conta_credito": cc,
                 "desc_debito": dd, "desc_credito": dc}
@@ -1866,8 +1642,8 @@ def main():
             <p style="color:#DDDDDD; margin:6px 0 0 0;">
                 <b>Etapa 1:</b> PDF + TXT + Plano de Contas → classifica automaticamente → gera Excel.<br>
                 <b>Etapa 2:</b> Excel preenchido → gera <b>evento exemplo.xlsx</b> e <b>integra exemplo.xlsx</b>.<br>
-                <span style="color:#CC99FF;">🏛️ Tipo Folha "Empresa" → <b>Encargo Patronal</b> automático (DRE, não Ativo).</span><br>
-                <span style="color:#FFD700;">⚡ Roteamento por tipo de rubrica: HE→conta HE · Férias→conta Férias · Rescisão→conta Rescisão.</span>
+                <span style="color:#CC99FF;">🏛️ Tipo Folha "Empresa" → <b>Encargo Patronal</b> automático.</span><br>
+                <span style="color:#FFD700;">⚡ Roteamento específico: HE→HE · Férias→Férias · Rescisão→Indenizações · FGTS Rescisão→DRE (não Custos Vendidos).</span>
             </p>
         </div>""", unsafe_allow_html=True)
 
@@ -1887,16 +1663,20 @@ def main():
             "- Dias Normais/Saldo → Salários e Ordenados\n"
             "- Horas Extras/Reflexo → Horas Extras\n"
             "- Férias/1/3/Abono → Férias\n"
-            "- Rescisão/Aviso/Saldo → Indenizações\n"
-            "- 13º Salário → 13º Salário\n"
+            "- Rescisão/Aviso/13ºResc → Indenizações\n"
             "- Vale Transporte → Vale Transporte\n"
             "- Vale Refeição/Aliment. → Alimentação\n\n"
-            "**Proventos — Crédito Passivo por tipo:**\n"
+            "**Proventos — Crédito Passivo:**\n"
             "- Normal → Salários a Pagar\n"
             "- Férias → Férias a Pagar\n"
-            "- Rescisão → Rescisões a Pagar\n"
-            "- 13º → 13º Salário a Pagar\n\n"
-            "**Descontos:** D=Sal.a Pagar · C=conta específica"
+            "- Rescisão → Rescisões a Pagar\n\n"
+            "**Descontos — Crédito:**\n"
+            "- INSS → INSS a Recolher\n"
+            "- IRRF → IRRF S/ Folha\n"
+            "- Sindicato → Contrib. Sindicais\n"
+            "- **TODOS OS OUTROS → Salários a Pagar**\n"
+            "  (VT, Plano, Adiant, Estouro, VR, Multa...)\n\n"
+            "**FGTS Rescisão → DRE Indenizações** (não Custos Vendidos)"
         )
         st.markdown(f"---\n**Versão:** {VERSAO}")
 
@@ -1954,9 +1734,9 @@ def main():
                 ("Salários a Pagar (Passivo)", PASSIVO_SALARIOS_POS, PASSIVO_SALARIOS_NEG, "PASSIVO"),
                 ("Férias a Pagar (Passivo)", PASSIVO_FERIAS_POS, PASSIVO_FERIAS_NEG, "PASSIVO"),
                 ("Rescisões a Pagar (Passivo)", PASSIVO_RESCISAO_POS, PASSIVO_RESCISAO_NEG, "PASSIVO"),
-                ("13º a Pagar (Passivo)", PASSIVO_13_POS, PASSIVO_13_NEG, "PASSIVO"),
                 ("INSS a Recolher (Passivo)", DESCONTO_CRED_INSS_POS, DESCONTO_CRED_INSS_NEG, "PASSIVO"),
                 ("IRRF s/ Folha (Passivo)", DESCONTO_CRED_IRRF_POS, DESCONTO_CRED_IRRF_NEG, "PASSIVO"),
+                ("Outros Descontos → Sal. a Pagar", DESCONTO_CRED_SAL_PAGAR_POS, DESCONTO_CRED_SAL_PAGAR_NEG, "PASSIVO"),
                 ("Consignado (Ativo/Passivo)", CONSIGNADO_CREDITO_POS, CONSIGNADO_CREDITO_NEG, ""),
                 ("Encargo Patronal Débito (DRE)", INFORMATIVO_DEBITO_POS, INFORMATIVO_DEBITO_NEG, "DRE"),
                 ("FGTS a Recolher (Passivo)", FGTS_CREDITO_POS, FGTS_CREDITO_NEG, "PASSIVO"),
@@ -1966,7 +1746,7 @@ def main():
                 with cols_p[i % 4]:
                     st.markdown(f"**{lbl}**")
                     cod_t, desc_t = _melhor_conta(df_pc, pos, neg, 30, filtro_posicao=filtro)
-                    st.info(f"`{cod_t}` — {desc_t[:30] if desc_t else '—'}" if cod_t else "⚠️ Não encontrada")
+                    st.info(f"`{cod_t}` — {desc_t[:25] if desc_t else '—'}" if cod_t else "⚠️ Não encontrada")
     elif contas_file is not None:
         st.error("❌ Não foi possível carregar o Plano de Contas.")
 
