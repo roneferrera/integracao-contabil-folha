@@ -1,5 +1,5 @@
 # ============================================================
-# app_integracao_dominio.py  –  Integração Contábil Domínio V4.5
+# app_integracao_dominio.py  –  Integração Contábil Domínio V4.6
 # ============================================================
 
 import streamlit as st
@@ -12,18 +12,20 @@ from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSAO = "V4.5"
+VERSAO = "V4.6"
 
 # ══════════════════════════════════════════════════════════════════════════
-# GEMINI — importação opcional
+# GEMINI — nova SDK oficial google-genai
 # ══════════════════════════════════════════════════════════════════════════
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
     GEMINI_DISPONIVEL = True
 except ImportError:
     GEMINI_DISPONIVEL = False
 
-GEMINI_MODEL = "gemini-1.5-flash"
+# gemini-1.5-flash foi desligado — usar gemini-2.5-flash-lite (gratuito)
+GEMINI_MODEL = "gemini-2.5-flash-lite"
 
 GRUPOS_VALIDOS = [
     "Custo Direto de Produção",
@@ -67,16 +69,24 @@ FORMATO DE RESPOSTA (JSON):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# FUNÇÕES GEMINI
+# FUNÇÕES GEMINI — nova SDK
 # ══════════════════════════════════════════════════════════════════════════
 
+def _gemini_client(api_key: str):
+    """Cria e retorna um client Gemini com a nova SDK."""
+    return genai.Client(api_key=api_key)
+
+
 def gemini_testar_conexao(api_key: str) -> bool:
+    """Testa a conexão com a API Gemini."""
     if not GEMINI_DISPONIVEL:
         return False
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(GEMINI_MODEL)
-        model.generate_content("ok")
+        client = _gemini_client(api_key)
+        client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents="ok",
+        )
         return True
     except Exception:
         return False
@@ -97,13 +107,10 @@ def gemini_classificar_rubrica(
             "fonte": "fallback",
         }
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=PROMPT_SISTEMA_GEMINI,
-    )
+    client = _gemini_client(api_key)
 
-    prompt = f"""
+    prompt = f"""{PROMPT_SISTEMA_GEMINI}
+
 Classifique esta rubrica de folha de pagamento:
 
 Nome da rubrica: {nome_rubrica}
@@ -116,17 +123,29 @@ Responda APENAS com JSON válido no formato especificado.
 
     for tentativa in range(max_retries):
         try:
-            resposta = model.generate_content(prompt)
+            resposta = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.1,
+                    max_output_tokens=256,
+                ),
+            )
             texto = resposta.text.strip()
+
             if "```json" in texto:
                 texto = texto.split("```json")[1].split("```")[0].strip()
             elif "```" in texto:
                 texto = texto.split("```")[1].split("```")[0].strip()
+
             resultado = json.loads(texto)
+
             if resultado.get("grupo") not in GRUPOS_VALIDOS:
                 resultado["grupo"] = "Despesa Administrativa"
+
             resultado["fonte"] = "gemini"
             return resultado
+
         except json.JSONDecodeError:
             if tentativa < max_retries - 1:
                 time.sleep(1)
@@ -147,7 +166,7 @@ Responda APENAS com JSON válido no formato especificado.
                 "confianca": "baixa",
                 "motivo": "Erro na API Gemini",
                 "fonte": "erro",
-                "erro": erro_str[:100],
+                "erro": erro_str[:150],
             }
 
     return {
@@ -170,11 +189,7 @@ def gemini_sugerir_contas_para_rubrica(
     if not GEMINI_DISPONIVEL or not api_key or df_contas is None or df_contas.empty:
         return {"erro": "Gemini não disponível ou plano de contas não carregado"}
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=GEMINI_MODEL,
-        system_instruction=PROMPT_SISTEMA_GEMINI,
-    )
+    client = _gemini_client(api_key)
 
     col_nome = "nome_original" if "nome_original" in df_contas.columns else "nome_conta"
     df_analiticas = df_contas[df_contas["tipo"] == "A"].copy()
@@ -186,7 +201,8 @@ def gemini_sugerir_contas_para_rubrica(
         for _, row in df_analiticas.iterrows()
     ])
 
-    prompt = f"""
+    prompt = f"""{PROMPT_SISTEMA_GEMINI}
+
 Rubrica de folha de pagamento:
 - Nome: {nome_rubrica}
 - Tipo: {tipo_rubrica}
@@ -212,13 +228,23 @@ Responda APENAS com JSON válido:
 """
 
     try:
-        resposta = model.generate_content(prompt)
+        resposta = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=1024,
+            ),
+        )
         texto = resposta.text.strip()
+
         if "```json" in texto:
             texto = texto.split("```json")[1].split("```")[0].strip()
         elif "```" in texto:
             texto = texto.split("```")[1].split("```")[0].strip()
+
         return json.loads(texto)
+
     except Exception as e:
         return {"erro": str(e)[:200]}
 
@@ -252,20 +278,6 @@ def apply_tr_theme():
 
 # ══════════════════════════════════════════════════════════════════════════
 # PARSE DO PLANO DE CONTAS
-#
-# Formato confirmado do arquivo Kaph Numeric:
-#   Header linha 0:
-#     col[0] = "Plano de Contas - Completo" (Empresa)
-#     col[1] = "Unnamed: 1:Reduzido"
-#     col[2] = "Unnamed: 2:Classificação"
-#     col[3] = "Unnamed: 3:Tipo"          → S ou A
-#     col[4] = "Unnamed: 4:Descriçao"
-#   Dados:
-#     col[0] = 1000003 (código empresa)
-#     col[2] = 1, 11, 111, 11101, 11101000001 (classificação numérica)
-#     col[3] = S ou A
-#     col[4] = Nome da conta
-#   Última linha: "Total de : 746" → ignorada
 # ══════════════════════════════════════════════════════════════════════════
 def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFrame:
     ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "xlsx"
@@ -306,7 +318,6 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
         f"{len(df_raw.columns)} colunas."
     )
 
-    # ── Detecta índices das colunas por nome (flexível) ────────────────────
     cols = [str(c).strip() for c in df_raw.columns]
     log.append(f"Colunas detectadas: {cols[:6]}")
 
@@ -317,37 +328,27 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
 
     for i, c in enumerate(cols):
         cl = c.lower()
-        # Empresa: primeira coluna ou contém "plano de contas" ou "empresa"
         if idx_empresa is None and (
             i == 0
             or "plano de contas" in cl
             or (cl == "empresa" and i < 3)
         ):
             idx_empresa = i
-
-        # Classificação: "classifica" no nome ou "unnamed: 2"
         if idx_classificacao is None and (
-            "classifica" in cl
-            or "unnamed: 2" in cl
+            "classifica" in cl or "unnamed: 2" in cl
         ):
             idx_classificacao = i
-
-        # Tipo: "tipo" isolado (não ecf) ou "unnamed: 3"
         if idx_tipo is None and (
             "unnamed: 3" in cl
-            or (cl == "tipo")
+            or cl == "tipo"
             or ("tipo" in cl and "ecf" not in cl and "dlpa" not in cl and i < 6)
         ):
             idx_tipo = i
-
-        # Descrição: "descri" ou "unnamed: 4"
         if idx_descricao is None and (
-            "descri" in cl
-            or "unnamed: 4" in cl
+            "descri" in cl or "unnamed: 4" in cl
         ):
             idx_descricao = i
 
-    # Fallback para posições fixas do formato Kaph Numeric
     if idx_empresa is None:       idx_empresa = 0
     if idx_classificacao is None: idx_classificacao = 2
     if idx_tipo is None:          idx_tipo = 3
@@ -367,7 +368,6 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
         )
         return pd.DataFrame()
 
-    # ── Processa as linhas ─────────────────────────────────────────────────
     registros = []
     ignorados = 0
 
@@ -377,7 +377,6 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
         tipo_raw    = str(row.iloc[idx_tipo]).strip().upper()
         nome        = str(row.iloc[idx_descricao]).strip()
 
-        # Ignora linha de totalizador e linhas vazias
         if empresa_val.lower().startswith("total"):
             ignorados += 1
             continue
@@ -385,21 +384,15 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
             ignorados += 1
             continue
 
-        # Remove sufixo ".0" gerado pelo pandas em números float
         if classif.endswith(".0"):
             classif = classif[:-2]
 
-        # Classificação deve ser puramente numérica
         if not re.match(r'^\d+$', classif):
             ignorados += 1
             continue
-
-        # Tipo deve ser S ou A
         if tipo_raw not in ("S", "A"):
             ignorados += 1
             continue
-
-        # Nome não pode ser vazio / nan
         if not nome or nome.lower() in ("nan", "none", ""):
             ignorados += 1
             continue
@@ -459,7 +452,6 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "INDENIZACOES E AVISO PREVIO CUSTOS",
         "ASSISTENCIA MEDICA E SOCIAL CUSTOS","PIS S/ FOLHA CUSTOS",
         "INDUSTRIALIZACAO","CUSTOS DIRETOS DE PRODUCAO",
-        "MAO-DE-OBRA DIRETA",
     ],
     "Custo Direto de Serviços": [
         "CUSTOS DIRETOS DA PRODUCAO DE SERVICOS",
@@ -491,7 +483,6 @@ KWORDS_DEBITO: dict[str, list[str]] = {
         "ENERGIA ELETRICA","AGUA E ESGOTO","TELEFONE",
         "DESPESAS POSTAIS","SEGUROS","MATERIAL DE ESCRITORIO",
         "MATERIAL DE HIGIENE","DEPRECIACAO","DEPRECIACOES E AMORTIZACOES",
-        "REPRODUCOES","DESPESAS LEGAIS","LIVROS, JORNAIS",
         "COMBUSTIVEIS E LUBRIFICANTES","MATERIAIS DE CONSUMO",
         "CONDOMINIOS","GAS","BENS DE PEQUENO VALOR",
         "DESPESA SERVICOS","SERVICOS TOMADOS DE PJ",
@@ -674,8 +665,6 @@ def _idx(opcoes: list[str], valor: str) -> int:
 
 # ══════════════════════════════════════════════════════════════════════════
 # PARSE TXT RUBRICAS
-# Formato confirmado:
-#   col[0]=empresa  col[1]=?  col[2]=código  col[3]=descrição  col[4]=tipo(P/D/I/ID)
 # ══════════════════════════════════════════════════════════════════════════
 def parse_rubricas_txt(file_bytes: bytes, log: list) -> dict:
     catalog = {}
@@ -1019,32 +1008,32 @@ def gerar_arquivos_finais(
             sem_conta += 1
 
         linhas_evento.append({
-            "Código da Empresa":             empresa,
-            "Centro de custo":               cc,
+            "Código da Empresa":               empresa,
+            "Centro de custo":                 cc,
             "Código Sequencial da Integração": seq,
-            TIPO_COL:                        tipo,
-            "Descrição":                     desc,
-            "Código da Conta Débito":        debito,
-            "Código da Conta Crédito":       credito,
-            "Código do Histórico":           historico,
-            "Complemento":                   complemento,
+            TIPO_COL:                          tipo,
+            "Descrição":                       desc,
+            "Código da Conta Débito":          debito,
+            "Código da Conta Crédito":         credito,
+            "Código do Histórico":             historico,
+            "Complemento":                     complemento,
         })
         linhas_integra.append({
-            "Código da Empresa":             empresa,
-            "Separador":                     sep_val,
+            "Código da Empresa":               empresa,
+            "Separador":                       sep_val,
             "Código Sequencial da Integração": seq,
-            TIPO_COL:                        tipo,
-            "Código da Rúbrica Selecionada": seq,
+            TIPO_COL:                          tipo,
+            "Código da Rúbrica Selecionada":   seq,
         })
         linhas_integra_xls.append({
-            "Código da Empresa":             empresa,
-            "Centro de Custo":               cc,
+            "Código da Empresa":               empresa,
+            "Centro de Custo":                 cc,
             "Código Sequencial da Integração": seq,
-            TIPO_COL:                        tipo,
-            "Descrição":                     desc,
-            "Código da Conta Crédito":       credito,
-            "Código da Conta Débito":        debito,
-            "Código do Histórico":           historico,
+            TIPO_COL:                          tipo,
+            "Descrição":                       desc,
+            "Código da Conta Crédito":         credito,
+            "Código da Conta Débito":          debito,
+            "Código do Histórico":             historico,
         })
 
     log.append(f"Arquivos → Com conta: {com_conta} | Sem conta: {sem_conta}")
@@ -1112,7 +1101,7 @@ def render_secao_gemini(
     st.markdown("### 🤖 Classificação Automática de Rubricas com Gemini AI")
 
     if not GEMINI_DISPONIVEL:
-        st.warning("⚠️ Instale: `pip install google-generativeai`")
+        st.warning("⚠️ Instale: `pip install google-genai`")
         return
 
     if not api_key:
@@ -1172,77 +1161,81 @@ def render_secao_gemini(
             grupo     = resultado_grupo.get("grupo", "Despesa Administrativa")
             confianca = resultado_grupo.get("confianca", "media")
             motivo    = resultado_grupo.get("motivo", "")
+            erro_msg  = resultado_grupo.get("erro", "")
 
-            cor_conf = {
-                "alta":  "#d4edda",
-                "media": "#fff3cd",
-                "baixa": "#f8d7da",
-            }.get(confianca, "#e2e3e5")
-            emoji_conf = {
-                "alta": "🟢", "media": "🟡", "baixa": "🔴"
-            }.get(confianca, "⚪")
-
-            st.markdown(
-                f"""
-                <div style="background:{cor_conf}; border-radius:6px;
-                            padding:12px 16px; margin:8px 0;">
-                    <b>Grupo sugerido:</b> {grupo}
-                    &nbsp; {emoji_conf} {confianca.upper()}<br>
-                    <small>📝 {motivo}</small>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            if df_contas is not None and not df_contas.empty:
-                with st.spinner("Buscando contas no plano de contas..."):
-                    resultado_contas = gemini_sugerir_contas_para_rubrica(
-                        nome_rubrica=nome_rubr,
-                        tipo_rubrica=tipo_rubr,
-                        grupo_sugerido=grupo,
-                        df_contas=df_contas,
-                        api_key=api_key,
-                        top_n=5,
-                    )
-
-                if "erro" in resultado_contas:
-                    st.error(f"❌ Erro ao buscar contas: {resultado_contas['erro']}")
-                else:
-                    if resultado_contas.get("explicacao"):
-                        st.caption(f"📝 {resultado_contas['explicacao']}")
-
-                    col_d, col_c = st.columns(2)
-                    with col_d:
-                        st.markdown("**💸 Contas de Débito sugeridas:**")
-                        for conta in resultado_contas.get("contas_debito", []):
-                            score = conta.get("score", "")
-                            emoji = (
-                                "🟢" if score == "alta"
-                                else "🟡" if score == "media"
-                                else "🔴"
-                            )
-                            st.markdown(
-                                f"{emoji} `{conta.get('classificacao','?')}` "
-                                f"— {conta.get('nome','?')}"
-                            )
-                    with col_c:
-                        st.markdown("**💰 Contas de Crédito sugeridas:**")
-                        for conta in resultado_contas.get("contas_credito", []):
-                            score = conta.get("score", "")
-                            emoji = (
-                                "🟢" if score == "alta"
-                                else "🟡" if score == "media"
-                                else "🔴"
-                            )
-                            st.markdown(
-                                f"{emoji} `{conta.get('classificacao','?')}` "
-                                f"— {conta.get('nome','?')}"
-                            )
+            if resultado_grupo.get("fonte") == "erro":
+                st.error(f"❌ Erro na classificação: {erro_msg or motivo}")
             else:
-                st.info(
-                    "💡 Carregue o Plano de Contas para ver sugestões "
-                    "de contas de débito e crédito."
+                cor_conf = {
+                    "alta":  "#d4edda",
+                    "media": "#fff3cd",
+                    "baixa": "#f8d7da",
+                }.get(confianca, "#e2e3e5")
+                emoji_conf = {
+                    "alta": "🟢", "media": "🟡", "baixa": "🔴"
+                }.get(confianca, "⚪")
+
+                st.markdown(
+                    f"""
+                    <div style="background:{cor_conf}; border-radius:6px;
+                                padding:12px 16px; margin:8px 0;">
+                        <b>Grupo sugerido:</b> {grupo}
+                        &nbsp; {emoji_conf} {confianca.upper()}<br>
+                        <small>📝 {motivo}</small>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
                 )
+
+                if df_contas is not None and not df_contas.empty:
+                    with st.spinner("Buscando contas no plano de contas..."):
+                        resultado_contas = gemini_sugerir_contas_para_rubrica(
+                            nome_rubrica=nome_rubr,
+                            tipo_rubrica=tipo_rubr,
+                            grupo_sugerido=grupo,
+                            df_contas=df_contas,
+                            api_key=api_key,
+                            top_n=5,
+                        )
+
+                    if "erro" in resultado_contas:
+                        st.error(f"❌ Erro ao buscar contas: {resultado_contas['erro']}")
+                    else:
+                        if resultado_contas.get("explicacao"):
+                            st.caption(f"📝 {resultado_contas['explicacao']}")
+
+                        col_d, col_c = st.columns(2)
+                        with col_d:
+                            st.markdown("**💸 Contas de Débito sugeridas:**")
+                            for conta in resultado_contas.get("contas_debito", []):
+                                score = conta.get("score", "")
+                                emoji = (
+                                    "🟢" if score == "alta"
+                                    else "🟡" if score == "media"
+                                    else "🔴"
+                                )
+                                st.markdown(
+                                    f"{emoji} `{conta.get('classificacao','?')}` "
+                                    f"— {conta.get('nome','?')}"
+                                )
+                        with col_c:
+                            st.markdown("**💰 Contas de Crédito sugeridas:**")
+                            for conta in resultado_contas.get("contas_credito", []):
+                                score = conta.get("score", "")
+                                emoji = (
+                                    "🟢" if score == "alta"
+                                    else "🟡" if score == "media"
+                                    else "🔴"
+                                )
+                                st.markdown(
+                                    f"{emoji} `{conta.get('classificacao','?')}` "
+                                    f"— {conta.get('nome','?')}"
+                                )
+                else:
+                    st.info(
+                        "💡 Carregue o Plano de Contas para ver sugestões "
+                        "de contas de débito e crédito."
+                    )
 
     # ── Tab 2: Lote ────────────────────────────────────────────────────────
     with tab2:
@@ -1323,7 +1316,6 @@ def render_secao_gemini(
                 f"{'⚠️ ' + str(erros) + ' com erro' if erros else ''}"
             )
 
-        # Exibe resultados do cache
         if cache:
             st.markdown("#### 📊 Resultados da Classificação")
             df_res = pd.DataFrame(list(cache.values()))
@@ -1412,6 +1404,7 @@ def main():
                 e <b>integra exemplo.xlsx</b>.<br>
                 <span style="color:#FFB74D;">
                     🤖 Classificação automática de rubricas com Gemini AI
+                    (gemini-2.5-flash-lite)
                 </span>
             </p>
         </div>
@@ -1429,7 +1422,7 @@ def main():
         gemini_api_key = ""
 
         if not GEMINI_DISPONIVEL:
-            st.error("Instale: `pip install google-generativeai`")
+            st.error("Instale: `pip install google-genai`")
         else:
             try:
                 gemini_api_key = st.secrets["GEMINI_API_KEY"]
@@ -1454,8 +1447,8 @@ def main():
                         st.error("❌ Falha na conexão")
 
                 if st.session_state.get("gemini_api_key_validada") == gemini_api_key:
-                    st.markdown("🟢 **Conectado** | Flash 1.5 Free")
-                    st.caption("15 req/min · 1M tokens/dia")
+                    st.markdown("🟢 **Conectado** | 2.5 Flash Lite")
+                    st.caption("Gratuito · aistudio.google.com")
 
         st.markdown("---")
         st.markdown("### 🎨 Legenda de Tipos")
@@ -1642,18 +1635,11 @@ def main():
                         )
 
                         if df_pc is not None and n_deb == 0:
-                            st.warning(
-                                f"⚠️ Nenhuma conta de Débito para **{grupo_sel}**."
-                            )
+                            st.warning(f"⚠️ Nenhuma conta de Débito para **{grupo_sel}**.")
                         if df_pc is not None and n_cred == 0:
-                            st.warning(
-                                f"⚠️ Nenhuma conta de Crédito para **{grupo_sel}**."
-                            )
+                            st.warning(f"⚠️ Nenhuma conta de Crédito para **{grupo_sel}**.")
                         if df_pc is None:
-                            st.info(
-                                "💡 Carregue o Plano de Contas "
-                                "para sugestões automáticas."
-                            )
+                            st.info("💡 Carregue o Plano de Contas para sugestões automáticas.")
 
                         col_d, col_c, col_h = st.columns([3, 3, 2])
                         with col_d:
@@ -1701,12 +1687,10 @@ def main():
                                             border-left:4px solid {brd};
                                             padding:8px 12px; border-radius:4px;
                                             margin-top:6px; font-size:13px;">
-                                    <b>D:</b>
-                                    <code>{deb_cod or '—'}</code>
+                                    <b>D:</b> <code>{deb_cod or '—'}</code>
                                     {_nome_conta(deb_cod)}
                                     &nbsp;&nbsp;
-                                    <b>C:</b>
-                                    <code>{cred_cod or '—'}</code>
+                                    <b>C:</b> <code>{cred_cod or '—'}</code>
                                     {_nome_conta(cred_cod)}
                                 </div>
                                 """,
@@ -1720,15 +1704,9 @@ def main():
                             "historico":     hist_sel,
                         }
             else:
-                st.warning(
-                    "Nenhum Centro de Custo encontrado. "
-                    "Processe o PDF primeiro."
-                )
+                st.warning("Nenhum Centro de Custo encontrado. Processe o PDF primeiro.")
         else:
-            st.info(
-                "⬆️ Faça upload do PDF e clique em "
-                "**▶ Gerar Excel** para configurar os CCs."
-            )
+            st.info("⬆️ Faça upload do PDF e clique em **▶ Gerar Excel** para configurar os CCs.")
 
     st.markdown("---")
 
@@ -1812,9 +1790,7 @@ def main():
                     st.session_state.config_cc.get(cc_cod, {})
                     if usa_sep_bool else {}
                 )
-                ok = bool(
-                    cfg_cc.get("conta_debito") and cfg_cc.get("conta_credito")
-                )
+                ok = bool(cfg_cc.get("conta_debito") and cfg_cc.get("conta_credito"))
                 linhas_prev.append({
                     "Código":        cod_ev,
                     "Descrição":     ev["descricao_pdf"],
@@ -1833,9 +1809,7 @@ def main():
 
     # ── Resultado Etapa 1 ──────────────────────────────────────────────────
     if st.session_state.excel_config is not None:
-        st.success(
-            f"✅ Excel gerado — {st.session_state.n_eventos} evento(s)"
-        )
+        st.success(f"✅ Excel gerado — {st.session_state.n_eventos} evento(s)")
         st.download_button(
             label="⬇ Baixar Excel de Configuração",
             data=st.session_state.excel_config,
@@ -1853,14 +1827,8 @@ def main():
             i   = len(df[df["Tipo"] == "Informativa"])
             id_ = len(df[df["Tipo"] == "Inf. Dedutora"])
             nf  = len(df[df["Tipo"].str.startswith("⚠️", na=False)])
-            ok  = (
-                len(df[df["Classif."] == "✅"])
-                if "Classif." in df.columns else 0
-            )
-            nok = (
-                len(df[df["Classif."] == "⚠️"])
-                if "Classif." in df.columns else 0
-            )
+            ok  = len(df[df["Classif."] == "✅"]) if "Classif." in df.columns else 0
+            nok = len(df[df["Classif."] == "⚠️"]) if "Classif." in df.columns else 0
 
             cols_m = st.columns(8)
             for col_m, lbl, val in zip(cols_m, [
@@ -1871,16 +1839,12 @@ def main():
 
             if nok > 0 and usa_sep_bool and "Classif." in df.columns:
                 df_nok = df[df["Classif."] == "⚠️"][
-                    ["Código","Descrição","Centro Custo",
-                     "Conta Débito","Conta Crédito"]
+                    ["Código","Descrição","Centro Custo","Conta Débito","Conta Crédito"]
                 ]
                 with st.expander(
-                    f"⚠️ {nok} evento(s) sem classificação completa",
-                    expanded=True,
+                    f"⚠️ {nok} evento(s) sem classificação completa", expanded=True
                 ):
-                    st.warning(
-                        "Ajuste os CCs acima ou preencha manualmente no Excel."
-                    )
+                    st.warning("Ajuste os CCs acima ou preencha manualmente no Excel.")
                     st.dataframe(df_nok, use_container_width=True)
 
             def hl(row):
@@ -1918,9 +1882,7 @@ def main():
     # ══════════════════════════════════════════════════════════════════════
     # ETAPA 2
     # ══════════════════════════════════════════════════════════════════════
-    st.markdown(
-        "## 📥 Etapa 2 — Importar Excel Preenchido → Gerar Arquivos Finais"
-    )
+    st.markdown("## 📥 Etapa 2 — Importar Excel Preenchido → Gerar Arquivos Finais")
     st.markdown(
         "1. Baixe o Excel da Etapa 1 · "
         "2. Preencha Conta Débito e Conta Crédito · "
@@ -1982,10 +1944,7 @@ def main():
     st.markdown("---")
     st.markdown("**Log de processamento**")
     log_texto = "\n".join(st.session_state.log)
-    tem_erro  = any(
-        str(l).upper().startswith("ERRO")
-        for l in st.session_state.log
-    )
+    tem_erro  = any(str(l).upper().startswith("ERRO") for l in st.session_state.log)
     cor_borda = "#D32F2F" if tem_erro else "#388E3C"
     st.markdown(
         f"""
