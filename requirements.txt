@@ -1,10 +1,23 @@
-# requirements.txt — Integração Contábil Domínio V4.5
+# ============================================================
+# requirements.txt
+# Integração Contábil Domínio V6.5
+# ============================================================
 
-streamlit>=1.32.0
-pdfplumber>=0.10.0
-pandas>=2.0.0
-openpyxl>=3.1.0
-xlrd>=2.0.1
+# Interface web
+streamlit>=1.40.0
 
-# Nova SDK oficial do Gemini (substitui google-generativeai)
-google-genai>=1.0.0
+# Leitura de PDF
+pdfplumber>=0.11.0
+
+# Manipulação de dados
+pandas>=2.2.0
+
+# Excel — leitura e escrita de .xlsx
+openpyxl>=3.1.5
+
+# Excel — leitura de .xls (formato legado)
+# ATENÇÃO: xlrd 2.x suporta APENAS .xls, não .xlsx
+xlrd>=2.0.2
+
+# Fuzzy matching — fallback nas funções _e_* de detecção de rubrica
+rapidfuzz>=3.9.0
