@@ -1,7 +1,6 @@
 # ============================================================
-# app.py  –  Integração Contábil Domínio V6.4
-# Correção definitiva: roteamento por nome de rubrica
-# para contas DRE específicas (Férias, Rescisão, HE, VT etc.)
+# app.py  –  Integração Contábil Domínio V6.5
+# + rapidfuzz como fallback nas funções _e_* de detecção
 # ============================================================
 
 import streamlit as st
@@ -12,7 +11,13 @@ from io import BytesIO
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSAO = "V6.4"
+try:
+    from rapidfuzz import fuzz, process as rfprocess
+    RAPIDFUZZ_OK = True
+except ImportError:
+    RAPIDFUZZ_OK = False
+
+VERSAO = "V6.5"
 
 # ══════════════════════════════════════════════════════════════════════════
 # TEMA
@@ -56,6 +61,43 @@ def _norm(texto: str) -> str:
     ]:
         t = t.replace(orig, sub)
     return t
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RAPIDFUZZ — helper central
+# ══════════════════════════════════════════════════════════════════════════
+def _fuzzy_match(nome_norm: str,
+                 termos: list[str],
+                 threshold: int = 88) -> bool:
+    """
+    Retorna True se nome_norm tiver similaridade >= threshold
+    com qualquer termo da lista (token_set_ratio).
+    Usado apenas como FALLBACK quando a busca exata falha.
+    Requer rapidfuzz instalado; se ausente, retorna False.
+    """
+    if not RAPIDFUZZ_OK:
+        return False
+    termos_norm = [_norm(t) for t in termos]
+    resultado = rfprocess.extractOne(
+        nome_norm,
+        termos_norm,
+        scorer=fuzz.token_set_ratio,
+    )
+    return resultado is not None and resultado[1] >= threshold
+
+
+def _match(nome_norm: str,
+           termos: list[str],
+           threshold: int = 88) -> bool:
+    """
+    Busca exata (substring) → fallback fuzzy.
+    Essa é a função de matching usada por todas as _e_* abaixo.
+    """
+    # 1) busca exata — rápida, sem custo
+    if any(_norm(t) in nome_norm for t in termos):
+        return True
+    # 2) fallback fuzzy — só ativa se exata falhar
+    return _fuzzy_match(nome_norm, termos, threshold)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -180,8 +222,6 @@ def _e_conta_ativo(classificacao: str) -> bool:
 # ══════════════════════════════════════════════════════════════════════════
 # TABELAS DE SCORING — DRE POR TIPO DE RUBRICA
 # ══════════════════════════════════════════════════════════════════════════
-
-# Salário base / dias normais
 DRE_SALARIO_POS = [
     ("SALARIOS E ORDENADOS", 300), ("PRO-LABORE", 200),
     ("DESPESAS COM PESSOAL", 250), ("MAO-DE-OBRA DIRETA", 280),
@@ -197,7 +237,6 @@ DRE_SALARIO_NEG = [
     ("CUSTOS DOS PRODUTOS VENDIDOS", -500), ("CUSTOS DOS SERVICOS PRESTADOS", -500),
 ]
 
-# Horas Extras
 DRE_HORAS_EXTRAS_POS = [
     ("HORAS EXTRAS", 500), ("HORA EXTRA", 500),
     ("DESPESAS COM PESSOAL", 100), ("MAO-DE-OBRA DIRETA", 150),
@@ -210,7 +249,6 @@ DRE_HORAS_EXTRAS_NEG = [
     ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Férias
 DRE_FERIAS_POS = [
     ("FERIAS", 400), ("FERIAS CUSTOS", 450),
     ("PROVISOES PARA FERIAS", 350), ("DESPESAS COM PESSOAL", 100),
@@ -223,7 +261,6 @@ DRE_FERIAS_NEG = [
     ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# 13º Salário
 DRE_13_SALARIO_POS = [
     ("13 SALARIO", 400), ("13 SALARIO CUSTOS", 450),
     ("PROVISOES PARA 13", 350), ("DESPESAS COM PESSOAL", 100),
@@ -236,7 +273,6 @@ DRE_13_SALARIO_NEG = [
     ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Rescisão / Aviso Prévio / Indenizações
 DRE_RESCISAO_POS = [
     ("INDENIZACOES E AVISO PREVIO", 500), ("INDENIZACOES", 400),
     ("AVISO PREVIO", 400), ("RESCISAO", 400), ("DESPESAS COM PESSOAL", 100),
@@ -250,7 +286,6 @@ DRE_RESCISAO_NEG = [
     ("CUSTOS DOS SERVICOS PRESTADOS", -500),
 ]
 
-# Vale Transporte
 DRE_VALE_TRANSPORTE_POS = [
     ("VALE TRANSPORTE", 500), ("DESPESAS COM PESSOAL", 100),
 ]
@@ -261,7 +296,6 @@ DRE_VALE_TRANSPORTE_NEG = [
     ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Vale Refeição / Alimentação
 DRE_VALE_REFEICAO_POS = [
     ("VALE REFEICAO", 500), ("ALIMENTACAO", 400),
     ("DESPESAS COM ALIMENTACAO", 450), ("ALIMENTACAO/ CESTA BASICA", 450),
@@ -273,7 +307,6 @@ DRE_VALE_REFEICAO_NEG = [
     ("HORAS EXTRAS", -100), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Assistência Médica
 DRE_ASSISTENCIA_MEDICA_POS = [
     ("ASSISTENCIA MEDICA E SOCIAL", 500), ("ASSISTENCIA MEDICA", 450),
     ("DESPESAS COM PESSOAL", 100),
@@ -285,7 +318,6 @@ DRE_ASSISTENCIA_MEDICA_NEG = [
     ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Comissões
 DRE_COMISSOES_POS = [
     ("COMISSOES SOBRE VENDAS", 500), ("COMISSOES", 400),
     ("DESPESAS COM PESSOAL", 100),
@@ -296,7 +328,6 @@ DRE_COMISSOES_NEG = [
     ("VALE REFEICAO", -200), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# PIS s/ Folha
 DRE_PIS_FOLHA_POS = [
     ("PIS S/ FOLHA", 500), ("DESPESAS COM PESSOAL", 100),
 ]
@@ -306,7 +337,6 @@ DRE_PIS_FOLHA_NEG = [
     ("VALE REFEICAO", -200), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
 ]
 
-# Genérico DRE pessoal (fallback)
 DRE_PESSOAL_GENERICO_POS = [
     ("DESPESAS COM PESSOAL", 300), ("SALARIOS E ORDENADOS", 200),
     ("PRO-LABORE", 150), ("MAO-DE-OBRA DIRETA", 250),
@@ -324,7 +354,6 @@ DRE_PESSOAL_GENERICO_NEG = [
 # ══════════════════════════════════════════════════════════════════════════
 # TABELAS DE PASSIVO POR TIPO
 # ══════════════════════════════════════════════════════════════════════════
-
 PASSIVO_SALARIOS_POS = [
     ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
     ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
@@ -383,7 +412,6 @@ PASSIVO_13_NEG = [
 # ══════════════════════════════════════════════════════════════════════════
 # TABELAS DE DESCONTO
 # ══════════════════════════════════════════════════════════════════════════
-
 DESCONTO_DEBITO_POS = [
     ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
     ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
@@ -399,7 +427,6 @@ DESCONTO_DEBITO_NEG = [
     ("SALARIOS E ORDENADOS CUSTOS", -300), ("SALARIOS E ORDENADOS", -150),
 ]
 
-# INSS empregado
 DESCONTO_CRED_INSS_POS = [
     ("INSS A RECOLHER", 500), ("OBRIGACOES SOCIAIS", 200),
     ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 200), ("A RECOLHER", 100),
@@ -410,7 +437,6 @@ DESCONTO_CRED_INSS_NEG = [
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
 ]
 
-# IRRF empregado
 DESCONTO_CRED_IRRF_POS = [
     ("IRRF S/ FOLHA", 500), ("IMPOSTO DE RENDA A RECOLHER", 400),
     ("IRRF", 250), ("A RECOLHER", 100),
@@ -422,7 +448,6 @@ DESCONTO_CRED_IRRF_NEG = [
     ("NF", -150), ("ALUGUEL", -150), ("APLICACAO", -150),
 ]
 
-# Crédito = Salários a Pagar (para todos os outros descontos)
 DESCONTO_CRED_SAL_PAGAR_POS = [
     ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
     ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
@@ -436,7 +461,6 @@ DESCONTO_CRED_SAL_PAGAR_NEG = [
     ("SALARIOS E ORDENADOS", -150),
 ]
 
-# Sindicato
 DESCONTO_CRED_SINDICATO_POS = [
     ("CONTRIBUICOES SINDICAIS", 500), ("MENSALIDADE SINDICAL", 500),
     ("OBRIGACOES SOCIAIS", 250), ("A RECOLHER", 100),
@@ -446,7 +470,6 @@ DESCONTO_CRED_SINDICATO_NEG = [
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
 ]
 
-# Pensão Alimentícia
 DESCONTO_CRED_PENSAO_POS = [
     ("PENSAO ALIMENTICIA A PAGAR", 500),
     ("SALARIOS E ORDENADOS A PAGAR", 250), ("A PAGAR", 100),
@@ -457,7 +480,6 @@ DESCONTO_CRED_PENSAO_NEG = [
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
 ]
 
-# Consignado
 CONSIGNADO_DEBITO_POS = [
     ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
     ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
@@ -489,7 +511,6 @@ CONSIGNADO_CREDITO_NEG = [
 # ══════════════════════════════════════════════════════════════════════════
 # TABELAS DE INFORMATIVOS / ENCARGO PATRONAL
 # ══════════════════════════════════════════════════════════════════════════
-
 INFORMATIVO_DEBITO_POS = [
     ("DESPESAS COM PESSOAL", 300), ("INSS CUSTOS", 300), ("FGTS CUSTOS", 300),
     ("ENCARGOS SOCIAIS", 280), ("CONTRIBUICAO PATRONAL", 280),
@@ -530,7 +551,6 @@ INFORMATIVO_CREDITO_NEG = [
 # ══════════════════════════════════════════════════════════════════════════
 # TABELAS DE FGTS DINÂMICO
 # ══════════════════════════════════════════════════════════════════════════
-
 FGTS_CREDITO_POS = [
     ("FGTS A RECOLHER", 500), ("FGTS A PAGAR", 480),
     ("FUNDO DE GARANTIA", 400), ("OBRIGACOES SOCIAIS", 200),
@@ -571,7 +591,7 @@ FGTS_DEBITO_PROVISAO_NEG = [
 FGTS_DEBITO_RESCISAO_POS = [
     ("FGTS RESCISORIO", 500), ("MULTA RESCISORIA", 500),
     ("GRRF", 500), ("DESPESA COM RESCISAO", 400),
-    ("INDENIZACOES E AVISO PREVIO", 350),   # ← CRÍTICO: rota para 281
+    ("INDENIZACOES E AVISO PREVIO", 350),
     ("INDENIZACOES", 300),
     ("FGTS CUSTOS", 250), ("DESPESAS COM PESSOAL", 200),
     ("DESPESA", 80), ("CUSTO", 80),
@@ -582,49 +602,51 @@ FGTS_DEBITO_RESCISAO_NEG = [
     ("SOBRE PROVISOES", -400), ("PROVISAO", -300), ("FORNECEDOR", -300),
     ("A COMPENSAR", -400), ("A RECUPERAR", -300),
     ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),   # ← CRÍTICO: bloqueia 464
+    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
     ("CUSTOS DOS SERVICOS PRESTADOS", -500),
     ("CUSTOS DAS MERCADORIAS VENDIDAS", -500),
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# DETECÇÃO DE TIPO DE RUBRICA PELO NOME
+# DETECÇÃO DE TIPO DE RUBRICA — exata + fallback rapidfuzz
 # ══════════════════════════════════════════════════════════════════════════
 def _e_consignado(nome_norm: str) -> bool:
     termos = ["EMPRESTIMO CONSIGNADO", "CONSIGNADO", "CREDITO TRABALHO",
               "EMP CRED TRAB", "EMPRESTIMO TRABALHADOR", "CONSIG",
               "EMP. CRED. TRAB", "EMPRESTIMO CONSIG", "DESC. EMPRESTIMO"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_fgts(nome_norm: str) -> bool:
+    # FGTS é sigla curta — só exata, sem fuzzy (evita falsos positivos)
     return "FGTS" in nome_norm or "F.G.T.S" in nome_norm
 
 def _e_inss_desconto(nome_norm: str) -> bool:
     termos = ["I.N.S.S", "INSS FERIAS", "INSS SOBRE RESCISAO",
               "INSS 13", "INSS DIFERENCA", "INSS EMPREGADO",
               "INSS SOBRE RESCISAO", "INSS SAL"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_irrf(nome_norm: str) -> bool:
     termos = ["IMPOSTO DE RENDA", "IRRF", "I.R.R.F", "IR FONTE",
               "IRRF FERIAS", "IRRF 13"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_sindicato(nome_norm: str) -> bool:
     termos = ["SINDICATO", "SINDICAL", "MENSALIDADE SINDICAL",
               "CONTRIBUICAO SINDICAL", "CONTRIB SINDICAL",
               "CONFEDERATIVA", "ASSISTENCIAL"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_pensao_alimenticia(nome_norm: str) -> bool:
-    return "PENSAO ALIMENTICIA" in nome_norm or "PENSAO ALIMENT" in nome_norm
+    termos = ["PENSAO ALIMENTICIA", "PENSAO ALIMENT"]
+    return _match(nome_norm, termos, threshold=90)
 
 def _e_horas_extras(nome_norm: str) -> bool:
     termos = ["HORAS EXTRAS", "HORA EXTRA", "HE 50", "HE 100",
               "EXTRAS 50", "EXTRAS 100", "HORA EXTRA 50", "HORA EXTRA 100",
               "REFLEXO EXTRAS", "REFLEXO HE", "DSR EXTRAS", "REFLEXO EXTRA"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=85)
 
 def _e_ferias_provento(nome_norm: str) -> bool:
     termos = ["DIAS FERIAS", "FERIAS PROPORCIONAIS", "1/3 DAS FERIAS",
@@ -633,7 +655,7 @@ def _e_ferias_provento(nome_norm: str) -> bool:
               "ABONO PECUNIARIO", "ABONO FERIAS", "MEDIA FERIAS",
               "FERIAS PROPORC", "1/3 FERIAS PROPORCIONAIS", "FERIAS INTEGRAIS",
               "FERIAS DO MES"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=85)
 
 def _e_rescisao_provento(nome_norm: str) -> bool:
     termos = ["RESCISAO", "AVISO PREVIO", "INDENIZACAO", "INDENIZACOES",
@@ -644,35 +666,37 @@ def _e_rescisao_provento(nome_norm: str) -> bool:
               "FGTS 13O SALARIO RESCISAO", "MULTA RESCISORIA",
               "MULTA ESTABILIDADE", "INDENIZACAO ADICIONAL",
               "AVISO PREVIO DIAS IND"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=85)
 
 def _e_13_salario_provento(nome_norm: str) -> bool:
     termos = ["13 SALARIO INTEGRAL", "13 SALARIO ADIANTADO",
               "13 SALARIO RESCISAO", "13 SAL", "DECIMO TERCEIRO",
               "MEDIA HORAS 13", "MEDIA VALOR 13", "VANTAGENS 13",
               "13o SALARIO", "13 SALARIO INTEGRAL RESCISAO"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=85)
 
 def _e_vale_transporte_provento(nome_norm: str) -> bool:
     termos = ["VALE TRANSPORTE", "VT EMPRESA", "VALE TRANSP"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_vale_refeicao_provento(nome_norm: str) -> bool:
     termos = ["VALE REFEICAO", "AUXILIO REFEICAO", "VALE ALIMENTACAO",
               "AUXILIO ALIMENTACAO", "CESTA BASICA", "ALIMENTACAO"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_assistencia_medica_provento(nome_norm: str) -> bool:
     termos = ["ASSISTENCIA MEDICA", "PLANO SAUDE EMPRESA",
               "PLANO ODONTO EMPRESA", "REEMBOLSO PLANO"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_comissao_provento(nome_norm: str) -> bool:
     termos = ["COMISSAO", "COMISSOES", "REFLEXO COMISSOES"]
-    return any(_norm(t) in nome_norm for t in termos)
+    return _match(nome_norm, termos, threshold=88)
 
 def _e_pis_folha_provento(nome_norm: str) -> bool:
-    return "PIS S/ FOLHA" in nome_norm or "PIS FOLHA" in nome_norm
+    # PIS S/ FOLHA é específico — threshold alto
+    termos = ["PIS S/ FOLHA", "PIS FOLHA"]
+    return _match(nome_norm, termos, threshold=92)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -765,7 +789,7 @@ def _get_passivo_tables_provento(nome_norm: str, tipo_folha: str) -> tuple:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MOTOR PRINCIPAL: gerar De/Para por evento — V6.4
+# MOTOR PRINCIPAL: gerar De/Para por evento
 # ══════════════════════════════════════════════════════════════════════════
 def gerar_depara_evento_conta(
     evento_cod:  str,
@@ -783,7 +807,6 @@ def gerar_depara_evento_conta(
     nome = _norm(evento_nome)
     e_encargo = (tipo_folha == "2") or (grupo == "Encargo Patronal")
 
-    # ── CASO 1: Consignado ────────────────────────────────────────────────
     if _e_consignado(nome) and evento_tipo in ("Desconto", "Inf. Dedutora"):
         cd, dd = _melhor_conta(df_contas, CONSIGNADO_DEBITO_POS, CONSIGNADO_DEBITO_NEG,
                                score_min=100, filtro_posicao="PASSIVO")
@@ -793,7 +816,6 @@ def gerar_depara_evento_conta(
             return {"conta_debito": cd, "conta_credito": cc,
                     "desc_debito": dd, "desc_credito": dc}
 
-    # ── CASO 2: FGTS dinâmico ─────────────────────────────────────────────
     if _e_fgts(nome) and evento_tipo in ("Informativa", "Inf. Dedutora"):
         cc, dc = _melhor_conta(df_contas, FGTS_CREDITO_POS, FGTS_CREDITO_NEG,
                                score_min=100, filtro_posicao="PASSIVO")
@@ -813,7 +835,6 @@ def gerar_depara_evento_conta(
             return {"conta_debito": cd, "conta_credito": cc,
                     "desc_debito": dd, "desc_credito": dc}
 
-    # ── CASO 3: Encargo Patronal ──────────────────────────────────────────
     if e_encargo:
         cd, dd = _melhor_conta(df_contas, INFORMATIVO_DEBITO_POS, INFORMATIVO_DEBITO_NEG,
                                score_min=50, filtro_posicao="DRE")
@@ -823,7 +844,6 @@ def gerar_depara_evento_conta(
             return {"conta_debito": cd, "conta_credito": cc,
                     "desc_debito": dd, "desc_credito": dc}
 
-    # ── CASO 4: Proventos ─────────────────────────────────────────────────
     if evento_tipo == "Provento":
         dre_pos, dre_neg, dre_min = _get_dre_tables_provento(nome, tipo_folha)
         pas_pos, pas_neg, pas_min = _get_passivo_tables_provento(nome, tipo_folha)
@@ -852,37 +872,27 @@ def gerar_depara_evento_conta(
         return {"conta_debito": cd, "conta_credito": cc,
                 "desc_debito": dd, "desc_credito": dc}
 
-    # ── CASO 5: Descontos ─────────────────────────────────────────────────
     if evento_tipo in ("Desconto", "Inf. Dedutora"):
-        # Débito sempre = Salários a Pagar (PASSIVO)
         cd, dd = _melhor_conta(df_contas, DESCONTO_DEBITO_POS, DESCONTO_DEBITO_NEG,
                                score_min=100, filtro_posicao="PASSIVO")
 
-        # Crédito: roteamento específico por tipo
         if _e_inss_desconto(nome):
-            # INSS → INSS a Recolher
             cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_INSS_POS,
                                    DESCONTO_CRED_INSS_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
         elif _e_irrf(nome):
-            # IRRF → IRRF S/ Folha
             cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_IRRF_POS,
                                    DESCONTO_CRED_IRRF_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
         elif _e_sindicato(nome):
-            # Sindicato → Contribuições Sindicais
             cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SINDICATO_POS,
                                    DESCONTO_CRED_SINDICATO_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
         elif _e_pensao_alimenticia(nome):
-            # Pensão → Pensão Alimentícia a Pagar
             cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_PENSAO_POS,
                                    DESCONTO_CRED_PENSAO_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
         else:
-            # TODOS OS OUTROS descontos → Salários a Pagar
-            # (VT, Plano Saúde/Odonto, Coparticipação, Adiantamento,
-            #  Estouro, Vale Refeição, Multa Estabilidade, etc.)
             cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SAL_PAGAR_POS,
                                    DESCONTO_CRED_SAL_PAGAR_NEG,
                                    score_min=100, filtro_posicao="PASSIVO")
@@ -890,7 +900,6 @@ def gerar_depara_evento_conta(
         if cd and cc and validar_par_contas(cd, cc):
             return {"conta_debito": cd, "conta_credito": cc,
                     "desc_debito": dd, "desc_credito": dc}
-        # Curto-circuito: retentar crédito com fallback
         if cd:
             cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SAL_PAGAR_POS,
                                    DESCONTO_CRED_SAL_PAGAR_NEG + [(_norm(cd), -1000)],
@@ -898,7 +907,6 @@ def gerar_depara_evento_conta(
         return {"conta_debito": cd, "conta_credito": cc,
                 "desc_debito": dd, "desc_credito": dc}
 
-    # ── CASO 6: Informativas genéricas ────────────────────────────────────
     if evento_tipo == "Informativa":
         cd, dd = _melhor_conta(df_contas, INFORMATIVO_DEBITO_POS, INFORMATIVO_DEBITO_NEG,
                                score_min=30, filtro_posicao="DRE")
@@ -1071,7 +1079,7 @@ def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFr
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# KEYWORDS POR GRUPO (mantidas para filtros de CC)
+# KEYWORDS POR GRUPO
 # ══════════════════════════════════════════════════════════════════════════
 KWORDS_DEBITO: dict[str, list[str]] = {
     "Custo Direto de Produção": [
@@ -1583,8 +1591,8 @@ def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) 
         linhas_integra_xls.append({
             "Código da Empresa": empresa, "Centro de Custo": cc,
             "Código Sequencial da Integração": seq, TIPO_COL: tipo,
-            "Descrição": desc, "Código da Conta Crédito": credito,
-            "Código da Conta Débito": debito, "Código do Histórico": historico,
+            "Descrição": desc, "Código da Conta Débito": debito,
+            "Código da Conta Crédito": credito, "Código do Histórico": historico,
         })
     log.append(f"Arquivos → Com conta: {com_conta} | Sem conta: {sem_conta} | CC corrigido: {cc_count}")
 
@@ -1643,7 +1651,8 @@ def main():
                 <b>Etapa 1:</b> PDF + TXT + Plano de Contas → classifica automaticamente → gera Excel.<br>
                 <b>Etapa 2:</b> Excel preenchido → gera <b>evento exemplo.xlsx</b> e <b>integra exemplo.xlsx</b>.<br>
                 <span style="color:#CC99FF;">🏛️ Tipo Folha "Empresa" → <b>Encargo Patronal</b> automático.</span><br>
-                <span style="color:#FFD700;">⚡ Roteamento específico: HE→HE · Férias→Férias · Rescisão→Indenizações · FGTS Rescisão→DRE (não Custos Vendidos).</span>
+                <span style="color:#FFD700;">⚡ Detecção de rubricas: busca exata + fallback rapidfuzz
+                {"✅ ativo" if RAPIDFUZZ_OK else "⚠️ não instalado — pip install rapidfuzz"}.</span>
             </p>
         </div>""", unsafe_allow_html=True)
 
@@ -1651,13 +1660,17 @@ def main():
         st.markdown("### ⚙️ Configurações")
         cod_empresa = st.text_input("Código da empresa", value="45")
         st.markdown("---")
+        st.markdown(f"### 🔍 rapidfuzz\n{'✅ Ativo' if RAPIDFUZZ_OK else '⚠️ Não instalado'}")
+        if not RAPIDFUZZ_OK:
+            st.code("pip install rapidfuzz")
+        st.markdown("---")
         st.markdown("### 🎨 Legenda")
         for cor, txt in [("🟢","Provento"),("🔴","Desconto"),("🔵","Informativa"),
                          ("🟡","Inf. Dedutora"),("🟣","Encargo Patronal"),
                          ("🟠","Campos editáveis"),("🌿","Preenchimento auto"),("⭐","Curto-circuito")]:
             st.markdown(f"{cor} {txt}")
         st.markdown("---")
-        st.markdown("### 📋 Roteamento V6.4")
+        st.markdown("### 📋 Roteamento V6.5")
         st.markdown(
             "**Proventos — Débito DRE por tipo:**\n"
             "- Dias Normais/Saldo → Salários e Ordenados\n"
@@ -1674,23 +1687,27 @@ def main():
             "- INSS → INSS a Recolher\n"
             "- IRRF → IRRF S/ Folha\n"
             "- Sindicato → Contrib. Sindicais\n"
-            "- **TODOS OS OUTROS → Salários a Pagar**\n"
-            "  (VT, Plano, Adiant, Estouro, VR, Multa...)\n\n"
-            "**FGTS Rescisão → DRE Indenizações** (não Custos Vendidos)"
+            "- **TODOS OS OUTROS → Salários a Pagar**\n\n"
+            "**Fuzzy threshold por tipo:**\n"
+            "- Horas Extras / Férias / Rescisão / 13º → 85%\n"
+            "- Consignado / INSS / IRRF / VT / VR → 88%\n"
+            "- Pensão Alimentícia → 90%\n"
+            "- PIS s/ Folha → 92%\n"
+            "- FGTS → exata apenas (sigla curta)"
         )
         st.markdown(f"---\n**Versão:** {VERSAO}")
 
     _defaults = {
-        "log": [f"Pronto. Versão {VERSAO}"], "excel_config": None,
-        "evento_xlsx": None, "integra_xls": None, "df_preview": None,
-        "n_eventos": 0, "df_contas": None, "eventos_parsed": None,
-        "catalog_parsed": None, "config_cc": {}, "classif_auto": {},
+        "log": [f"Pronto. Versão {VERSAO} | rapidfuzz: {'ativo' if RAPIDFUZZ_OK else 'não instalado'}"],
+        "excel_config": None, "evento_xlsx": None, "integra_xls": None,
+        "df_preview": None, "n_eventos": 0, "df_contas": None,
+        "eventos_parsed": None, "catalog_parsed": None,
+        "config_cc": {}, "classif_auto": {},
         "_contas_fid": None, "_contas_name": None,
     }
     for k, v in _defaults.items():
         if k not in st.session_state: st.session_state[k] = v
 
-    # ── ETAPA 1 ────────────────────────────────────────────────────────────
     st.markdown("## 📋 Etapa 1 — Gerar Excel para Preenchimento")
     col1, col2, col3 = st.columns(3)
     with col1: pdf_file = st.file_uploader("1️⃣ PDF — Rubricas Não Configuradas", type=["pdf"], key="pdf_e1")
@@ -1715,14 +1732,14 @@ def main():
     df_pc = st.session_state.df_contas
     if df_pc is not None and not df_pc.empty:
         n_a = len(df_pc[df_pc["tipo"]=="A"]); n_s = len(df_pc[df_pc["tipo"]=="S"])
-        n_f = len(df_pc[(df_pc["tipo"]=="A") & (df_pc.get("score_folha", pd.Series(dtype=int)) >= SCORE_MINIMO_FOLHA)]) if "score_folha" in df_pc.columns else 0
+        n_f = len(df_pc[(df_pc["tipo"]=="A") & (df_pc["score_folha"] >= SCORE_MINIMO_FOLHA)]) if "score_folha" in df_pc.columns else 0
         n_dre = len(df_pc[(df_pc["tipo"]=="A") & df_pc["classificacao"].apply(_e_conta_dre)])
         n_pas = len(df_pc[(df_pc["tipo"]=="A") & df_pc["classificacao"].apply(_e_conta_passivo)])
         st.success(f"✅ **{st.session_state._contas_name}**: {len(df_pc)} contas "
                    f"({n_a} analíticas · {n_s} sintéticas · **{n_f}** de folha · "
                    f"**{n_dre}** DRE · **{n_pas}** Passivo)")
 
-        with st.expander("🔍 Preview das contas-chave detectadas (V6.4)", expanded=False):
+        with st.expander("🔍 Preview das contas-chave detectadas (V6.5)", expanded=False):
             previews = [
                 ("Salários (DRE)", DRE_SALARIO_POS, DRE_SALARIO_NEG, "DRE"),
                 ("Horas Extras (DRE)", DRE_HORAS_EXTRAS_POS, DRE_HORAS_EXTRAS_NEG, "DRE"),
@@ -1807,7 +1824,7 @@ def main():
         with st.spinner("Lendo rubricas.txt..."): catalog = parse_rubricas_txt(txt_file.read(), log)
         with st.spinner("Lendo PDF..."): eventos = parse_nao_configurados_pdf(pdf_file.read(), log)
         st.session_state.eventos_parsed = eventos; st.session_state.catalog_parsed = catalog
-        with st.spinner("🔍 Classificando com regras V6.4..."):
+        with st.spinner("🔍 Classificando com regras V6.5 + rapidfuzz..."):
             ca = classificar_todos_eventos(eventos, catalog, df_pc, log)
             st.session_state.classif_auto = ca
         if usa_sep_bool:
