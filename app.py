@@ -1,1955 +1,691 @@
-# ============================================================
-# app.py  –  Integração Contábil Domínio V6.5
-# + rapidfuzz como fallback nas funções _e_* de detecção
-# ============================================================
-
-import streamlit as st
-import pdfplumber
-import pandas as pd
+"""
+Integrador Contábil da Folha — Domínio Sistemas
+Motor 100% determinístico (regex + regras de substring). Sem IA, sem APIs.
+Nenhum código, classificação ou nome de conta de um plano específico fica fixo
+no programa: a estrutura é lida do plano importado e confirmada pelo usuário.
+Executar: pip install -r requirements.txt && streamlit run app.py
+"""
+import io
+import json
 import re
-from io import BytesIO
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+import unicodedata
+from difflib import SequenceMatcher
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
 
 try:
-    from rapidfuzz import fuzz, process as rfprocess
-    RAPIDFUZZ_OK = True
+    import pdfplumber
 except ImportError:
-    RAPIDFUZZ_OK = False
+    pdfplumber = None
 
-VERSAO = "V6.5"
+# =====================================================================
+# 0. PARÂMETROS
+# =====================================================================
+NOME_PADRAO_SEM_SEPARADOR = "Geral"
+LIMIAR_SIMILARIDADE = 0.60
+PASTA_PERFIS = Path("perfis")
 
-# ══════════════════════════════════════════════════════════════════════════
-# TEMA
-# ══════════════════════════════════════════════════════════════════════════
-def apply_tr_theme():
-    st.markdown("""
-        <style>
-        html, body, [class*="css"] {
-            font-family: 'Segoe UI', 'Arial', sans-serif; color: #444444;
-        }
-        h1, h2, h3 { color: #FF8000; font-weight: 700; }
-        section[data-testid="stSidebar"] { background-color: #444444; }
-        section[data-testid="stSidebar"] * { color: #FFFFFF !important; }
-        .stButton > button {
-            background-color: #FF8000; color: #FFFFFF;
-            border: none; border-radius: 4px; font-weight: bold;
-        }
-        .stButton > button:hover { background-color: #D64001; }
-        .stDownloadButton > button {
-            background-color: #FF8000; color: #FFFFFF;
-            border: none; border-radius: 4px; font-weight: bold;
-        }
-        .stDownloadButton > button:hover { background-color: #D64001; }
-        div[data-testid="stExpander"] { border: 1px solid #FF8000; border-radius: 6px; }
-        </style>
-    """, unsafe_allow_html=True)
+# Confirme os cabeçalhos com o layout de importação da sua versão da Domínio
+COLS_EVENTO = ["Código da Empresa", "Separador", "Código Sequencial", "Tipo de Integração",
+               "Código da Rubrica", "Descrição da Rubrica", "Conta Débito", "Conta Crédito",
+               "Histórico Padrão"]
+
+SECOES = {  # título normalizado no PDF -> nome interno
+    "FOLHA NORMAL": "Folha Normal", "FOLHA MENSAL": "Folha Normal",
+    "ADIANTAMENTO": "Adiantamento", "13O SALARIO": "13º Salário",
+    "FERIAS": "Férias", "RESCISAO": "Rescisão", "EMPRESA": "Empresa",
+    "PROVISAO DE FERIAS": "Provisão de Férias",
+    "PROVISAO DE 13O": "Provisão de 13º", "PROVISAO DE 13O SALARIO": "Provisão de 13º",
+    "INFORMACOES INSS": "Informações INSS",
+}
+SECOES_DE_ITENS = {"Empresa", "Provisão de Férias", "Provisão de 13º", "Informações INSS"}
+TIPO_INTEGRACAO = {s: s for s in set(SECOES.values())}
+
+# Catálogo fixo da Domínio: Configurar Integração > aba Empresa (não depende do plano).
+# (descrição, natureza, competência)  competência: "M" mensal | "F" férias | "13" 13º
+ITENS_EMPRESA = {
+    1: ("INSS Empresa", "INSS", "M"), 2: ("INSS Terceiros", "INSS", "M"),
+    3: ("INSS Acid. Trabalho", "INSS", "M"), 4: ("INSS Pro-Lab", "INSS_SOCIO", "M"),
+    5: ("PIS", "PIS", "M"), 6: ("INSS Empresa 13o.", "INSS", "13"),
+    7: ("INSS Terceiros 13o.", "INSS", "13"), 8: ("INSS Acid. Trabalho 13o.", "INSS", "13"),
+    9: ("INSS Pro-Lab/Aut. 13o.", "INSS_SOCIO", "M"), 10: ("PIS 13o.", "PIS", "13"),
+    11: ("INSS Empresa Férias", "INSS", "F"), 12: ("INSS Terceiros Férias", "INSS", "F"),
+    13: ("INSS Acid. Trabalho Férias", "INSS", "F"), 14: ("PIS Férias", "PIS", "F"),
+    15: ("Dedução 13o. lic. maternidade", "DEDUCAO", "M"),
+    16: ("INSS Empresa CCT", "INSS", "M"), 17: ("INSS Terceiros CCT", "INSS", "M"),
+    18: ("INSS Acid. Trabalho CCT", "INSS", "M"), 19: ("INSS Empresa 13° CCT", "INSS", "13"),
+    20: ("INSS Terceiros 13° CCT", "INSS", "13"), 21: ("INSS Acid. Trabalho 13° CCT", "INSS", "13"),
+    22: ("INSS Empresa 13º Indenizado", "INSS", "13"),
+    23: ("INSS Terceiros 13º Indenizado", "INSS", "13"),
+    24: ("INSS Acid. Trabalho 13º Indenizado", "INSS", "13"),
+    25: ("Isenção Filantropia INSS Mensal Empresa", "ISENCAO", "M"),
+    26: ("Isenção Filantropia INSS Mensal RAT", "ISENCAO", "M"),
+    27: ("Isenção Filantropia INSS Mensal Pró-Labore", "ISENCAO", "M"),
+    28: ("Isenção Filantropia INSS Férias Empresa", "ISENCAO", "F"),
+    29: ("Isenção Filantropia INSS Férias RAT", "ISENCAO", "F"),
+    30: ("Isenção Filantropia INSS 13º Empresa", "ISENCAO", "13"),
+    31: ("Isenção Filantropia INSS 13º RAT", "ISENCAO", "13"),
+    32: ("Isenção Filantropia INSS 13º Pró-Labore", "ISENCAO", "13"),
+    33: ("INSS Receita Bruta", "CPRB", "M"),
+    34: ("Isenção Filantropia INSS Mensal Terceiros", "ISENCAO", "M"),
+    35: ("Isenção Filantropia INSS Férias Terceiros", "ISENCAO", "F"),
+    36: ("Isenção Filantropia 13º Terceiros", "ISENCAO", "13"),
+    38: ("GRCS Patronal", "SIND_PATRONAL", "M"),
+    39: ("INSS Empresa Mensal Dirigente sindical", "INSS", "M"),
+    40: ("INSS Terceiros Mensal Dirigente sindical", "INSS", "M"),
+    41: ("INSS Acid. Trabalho Mensal Dirigente sindical", "INSS", "M"),
+    42: ("INSS Empresa Férias Dirigente sindical", "INSS", "F"),
+    43: ("INSS Terceiros Férias Dirigente sindical", "INSS", "F"),
+    44: ("INSS Acid. Trabalho Férias Dirigente sindical", "INSS", "F"),
+    45: ("INSS Empresa 13ª Dirigente sindical", "INSS", "13"),
+    46: ("INSS Terceiros 13ª Dirigente sindical", "INSS", "13"),
+    47: ("INSS Acid. Trabalho 13ª Dirigente sindical", "INSS", "13"),
+    48: ("INSS Aut.", "AUTONOMO", "M"), 49: ("Adicional ao SENAI", "SENAI", "M"),
+    50: ("Adicional ao SENAI 13º", "SENAI", "13"),
+}
+
+# =====================================================================
+# 1. NORMALIZAÇÃO E BUSCA DE TERMOS
+# =====================================================================
+def norm(txt) -> str:
+    if txt is None:
+        return ""
+    s = unicodedata.normalize("NFKD", str(txt))
+    s = "".join(c for c in s if not unicodedata.combining(c)).upper()
+    s = re.sub(r"\b(?:[A-Z]\.){2,}[A-Z]?\.?", lambda m: m.group(0).replace(".", ""), s)
+    s = re.sub(r"[^A-Z0-9%]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# NORMALIZAÇÃO
-# ══════════════════════════════════════════════════════════════════════════
-def _norm(texto: str) -> str:
-    t = texto.upper()
-    for orig, sub in [
-        ("Ã","A"),("Á","A"),("Â","A"),("À","A"),("Ä","A"),
-        ("É","E"),("Ê","E"),("È","E"),("Ë","E"),
-        ("Í","I"),("Î","I"),("Ï","I"),
-        ("Ó","O"),("Ô","O"),("Õ","O"),("Ö","O"),
-        ("Ú","U"),("Û","U"),("Ü","U"),
-        ("Ç","C"),("Ñ","N"),
-    ]:
-        t = t.replace(orig, sub)
-    return t
+def tem(d: str, *termos) -> bool:
+    """Palavra inteira; termo terminado em '*' = prefixo."""
+    for t in termos:
+        if t.endswith("*"):
+            pat = r"(?<![A-Z0-9])" + re.escape(t[:-1])
+        else:
+            pat = r"(?<![A-Z0-9])" + re.escape(t) + r"(?![A-Z0-9%])"
+        if re.search(pat, d):
+            return True
+    return False
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# RAPIDFUZZ — helper central
-# ══════════════════════════════════════════════════════════════════════════
-def _fuzzy_match(nome_norm: str,
-                 termos: list[str],
-                 threshold: int = 88) -> bool:
-    """
-    Retorna True se nome_norm tiver similaridade >= threshold
-    com qualquer termo da lista (token_set_ratio).
-    Usado apenas como FALLBACK quando a busca exata falha.
-    Requer rapidfuzz instalado; se ausente, retorna False.
-    """
-    if not RAPIDFUZZ_OK:
+RE_13 = re.compile(r"(?<![A-Z0-9])13O?(?![A-Z0-9])")
+def e13(d): return bool(RE_13.search(d)) or tem(d, "DECIMO TERCEIRO", "DECIMO*")
+
+# =====================================================================
+# 2. CONCEITOS CONTÁBEIS (vocabulário geral — não depende de nenhum plano)
+# =====================================================================
+CONCEITOS = {
+    "@SAL": ["SALARIO*", "ORDENADO*", "REMUNERAC*", "VENCIMENTOS"],
+    "@PAGAR": ["PAGAR"],
+    "@RECOLHER": ["RECOLHER", "PAGAR"],
+    "@PROV": ["PROVIS*"],
+    "@FER": ["FERIAS"],
+    "@13": e13,
+    "@INSS": ["INSS", "PREVIDENCIA*", "CPP"],
+    "@FGTS": ["FGTS", "FUNDO DE GARANTIA"],
+    "@PIS": ["PIS"],
+    "@IRRF": ["IRRF", "IR RETIDO", "IR FONTE", "IMPOSTO DE RENDA RETIDO", "IR S FOLHA"],
+    "@PROLAB": ["PRO LAB*", "PROLAB*"],
+    "@SINDIC": ["SINDICA*"],
+    "@ADIANT": ["ADIANT*", "ADTO*"],
+}
+
+
+def casa(d, termo):
+    c = CONCEITOS.get(termo)
+    if c is None:
+        return tem(d, termo)
+    return c(d) if callable(c) else tem(d, *c)
+
+
+# Escopos: G = grupo do separador | GD = grupo, senão qualquer custo/despesa
+#          A = Ativo | P = Passivo/PL | R = Receita | D = Custo/Despesa
+G, GD = "G", "GD"
+ESC_ROT = {G: "grupo do separador", GD: "grupo ou outra despesa", "A": "Ativo",
+           "P": "Passivo/PL", "R": "Receita", "D": "Custo/Despesa"}
+_ENC = ["@PROV", "@INSS", "@FGTS", "@PIS"]
+_NAO_IRRF = ["ALUGUE*", "APLICAC*", "JUROS", "PJ", "SERVICO*", "TERCEIRO*", "CAPITAL", "@PROV"]
+
+ALVOS = {
+    # ---- DRE: dentro do grupo do separador
+    "SALARIOS": (G, "Salários e Ordenados", [(["@SAL"], ["@PAGAR", "@PROV", "@13", "@FER", "@ADIANT",
+                 "FAMILIA", "MATERN*", "@INSS", "@FGTS", "@PIS", "@PROLAB"])]),
+    "PRO_LABORE": (G, "Pró-labore", [(["@PROLAB"], ["@PAGAR", "@INSS"]),
+                   (["HONORARIOS", "DIRETORIA"], ["@PAGAR"])]),
+    "HE": (G, "Horas Extras", [(["HORAS EXTRA*"], []), (["HORA EXTRA*"], []), (["EXTRAORDINAR*"], [])]),
+    "PREMIOS": (G, "Prêmios e Gratificações", [(["PREMIO*"], ["SEGURO*"]),
+                (["GRATIFICAC*"], ["@PAGAR", "@13"])]),
+    "COMISSOES": (G, "Comissões", [(["COMISS*"], ["BANCARI*", "@PAGAR"])]),
+    "DECIMO": (G, "13º Salário", [(["@13"], _ENC + ["@PAGAR"])]),
+    "FERIAS": (G, "Férias", [(["@FER"], _ENC + ["@PAGAR"])]),
+    "INSS": (G, "INSS (encargo)", [(["@INSS"], ["@PROV", "@RECOLHER", "@13", "@FER", "RECEITA BRUTA",
+             "RETIDO", "PRIVADA"]), (["ENCARGOS SOCIAIS"], ["@PROV"])]),
+    "FGTS": (G, "FGTS (encargo)", [(["@FGTS"], ["@PROV", "@RECOLHER", "@13", "@FER"]),
+             (["ENCARGOS SOCIAIS"], ["@PROV"])]),
+    "PIS": (G, "PIS s/ Folha", [(["@PIS"], ["@PROV", "@RECOLHER", "RETIDO", "COFINS"])]),
+    "INDENIZ": (G, "Indenizações e Aviso Prévio", [(["INDENIZ*"], []), (["AVISO PREVIO"], []),
+                (["RESCIS*"], ["@PAGAR"])]),
+    "ASSIST": (G, "Assistência Médica", [(["ASSISTENCIA MEDICA"], []), (["PLANO DE SAUDE"], []),
+               (["SAUDE"], []), (["ASSISTENCIA*"], ["CONTRIB*"])]),
+    "VT": (G, "Vale-Transporte", [(["VALE TRANSP*"], []), (["TRANSPORTE"], ["FRETE*", "CARRETO*", "SERV*"])]),
+    "ALIM": (G, "Alimentação / VR", [(["ALIMENTAC*"], []), (["REFEIC*"], []), (["CESTA*"], [])]),
+    "BOLSA": (G, "Bolsa-Auxílio / Estágio", [(["BOLSA*"], []), (["ESTAGI*"], [])]),
+    "SEGURO": (G, "Seguro de Vida", [(["SEGURO DE VIDA"], []), (["SEGURO*"], [])]),
+    "TREIN": (G, "Treinamento", [(["TREINAMENT*"], []), (["CAPACITAC*"], []), (["CURSO*"], [])]),
+    "D_PROV_FER": (G, "Férias - Provisão (DRE)", [(["@FER", "@PROV"], ["@INSS", "@FGTS", "@PIS"])]),
+    "D_INSS_FER": (G, "INSS s/ Férias - Provisão (DRE)", [(["@INSS", "@FER", "@PROV"], [])]),
+    "D_FGTS_FER": (G, "FGTS s/ Férias - Provisão (DRE)", [(["@FGTS", "@FER", "@PROV"], [])]),
+    "D_PROV_13": (G, "13º - Provisão (DRE)", [(["@13", "@PROV"], ["@INSS", "@FGTS", "@PIS"])]),
+    "D_INSS_13": (G, "INSS s/ 13º - Provisão (DRE)", [(["@INSS", "@13", "@PROV"], [])]),
+    "D_FGTS_13": (G, "FGTS s/ 13º - Provisão (DRE)", [(["@FGTS", "@13", "@PROV"], [])]),
+    # ---- Passivo
+    "SAL_PAGAR": ("P", "Salários a Pagar", [(["@SAL", "@PAGAR"], ["@PROLAB", "@FER", "@13", "RESCIS*",
+                  "FAMILIA", "MATERN*", "@PROV"]), (["FOLHA DE PAGAMENTO"], ["@PROV"])]),
+    "FER_PAGAR": ("P", "Férias a Pagar", [(["@FER", "@PAGAR"], _ENC)]),
+    "RESC_PAGAR": ("P", "Rescisões a Pagar", [(["RESCIS*", "@PAGAR"], [])]),
+    "PROLAB_PAGAR": ("P", "Pró-labore a Pagar", [(["@PROLAB", "@PAGAR"], []),
+                     (["HONORARIOS", "DIRETORIA", "@PAGAR"], [])]),
+    "INSS_REC": ("P", "INSS a Recolher", [(["@INSS", "@RECOLHER"], ["RETIDO", "RECEITA BRUTA", "@PROV",
+                 "AUTONOMO*", "PARCELAMENT*"])]),
+    "FGTS_REC": ("P", "FGTS a Recolher", [(["@FGTS", "@RECOLHER"], ["@PROV", "PARCELAMENT*"])]),
+    "IRRF_REC": ("P", "IRRF s/ Folha a Recolher", [(["@IRRF", "FOLHA"], ["@PROV"]),
+                 (["@IRRF", "@RECOLHER"], _NAO_IRRF), (["@IRRF"], _NAO_IRRF + ["RECUPERAR", "COMPENSAR"])]),
+    "PIS_REC": ("P", "PIS s/ Folha a Recolher", [(["@PIS", "FOLHA", "@RECOLHER"], ["@PROV"]),
+                (["@PIS", "FOLHA"], ["@PROV"])]),
+    "SIND_REC": ("P", "Contribuição Sindical a Recolher", [(["@SINDIC", "@RECOLHER"], ["PATRONAL"]),
+                 (["@SINDIC"], ["PATRONAL"])]),
+    "EMPREST": ("P", "Empréstimos Consignados a Repassar", [(["CONSIGNAD*"], []),
+                (["EMPRESTIMO*", "EMPREGADO*"], []), (["CREDITO DO TRABALHADOR"], [])]),
+    "PENSAO": ("P", "Pensão Alimentícia a Repassar", [(["PENSA*"], [])]),
+    "P_PROV_FER": ("P", "Provisão de Férias", [(["@PROV", "@FER"], ["@INSS", "@FGTS", "@PIS"])]),
+    "P_INSS_FER": ("P", "INSS s/ Provisão de Férias", [(["@INSS", "@PROV", "@FER"], [])]),
+    "P_FGTS_FER": ("P", "FGTS s/ Provisão de Férias", [(["@FGTS", "@PROV", "@FER"], [])]),
+    "P_PIS_FER": ("P", "PIS s/ Provisão de Férias", [(["@PIS", "@PROV", "@FER"], [])]),
+    "P_PROV_13": ("P", "Provisão de 13º", [(["@PROV", "@13"], ["@INSS", "@FGTS", "@PIS"])]),
+    "P_INSS_13": ("P", "INSS s/ Provisão de 13º", [(["@INSS", "@PROV", "@13"], [])]),
+    "P_FGTS_13": ("P", "FGTS s/ Provisão de 13º", [(["@FGTS", "@PROV", "@13"], [])]),
+    "P_PIS_13": ("P", "PIS s/ Provisão de 13º", [(["@PIS", "@PROV", "@13"], [])]),
+    "CPRB_REC": ("P", "CPRB a Recolher", [(["@INSS", "RECEITA BRUTA"], []), (["CPRB"], []),
+                 (["CONTRIBUICAO PREVIDENCIARIA", "RECEITA"], [])]),
+    # ---- Ativo
+    "ADIANT_SAL": ("A", "Adiantamento de Salário", [(["@ADIANT", "@SAL"], ["@13", "@FER", "FORNECEDOR*",
+                   "CLIENTE*"]), (["@ADIANT", "EMPREGADO*"], ["@13", "@FER"]),
+                   (["@ADIANT", "FUNCIONARIO*"], ["@13", "@FER"])]),
+    "ADIANT_13": ("A", "Adiantamento de 13º", [(["@ADIANT", "@13"], [])]),
+    "ADIANT_FER": ("A", "Adiantamento de Férias", [(["@ADIANT", "@FER"], [])]),
+    "INSS_COMP": ("A", "INSS a Compensar", [(["@INSS", "COMPENSAR"], ["RECEITA BRUTA"]),
+                  (["@INSS", "RECUPERAR"], [])]),
+    "BENEF_INSS": ("A", "Sal.-Família/Maternidade a Compensar", [(["MATERN*", "COMPENSAR"], []),
+                   (["FAMILIA", "COMPENSAR"], []), (["MATERN*", "RECUPERAR"], []),
+                   (["FAMILIA", "RECUPERAR"], []), (["@INSS", "COMPENSAR"], ["RECEITA BRUTA", "RETIDO"]),
+                   (["@INSS", "RECUPERAR"], [])]),
+    # ---- Dedução da receita
+    "CPRB_DED": ("R", "(-) CPRB / INSS s/ Receita Bruta", [(["@INSS", "RECEITA BRUTA"], ["@RECOLHER"]),
+                 (["CPRB"], ["@RECOLHER"]), (["CONTRIBUICAO PREVIDENCIARIA", "RECEITA"], ["@RECOLHER"])]),
+    # ---- Despesas fora do grupo de pessoal
+    "SIND_PAT": (GD, "Contribuição Sindical Patronal", [(["@SINDIC", "PATRONAL"], []),
+                 (["CONTRIBUICAO SINDICAL"], ["@RECOLHER"])]),
+    "TAXAS_DIV": ("D", "Taxas e Contribuições Diversas", [(["TAXAS DIVERSAS"], []),
+                  (["CONTRIBUICOES DIVERSAS"], []), (["TAXAS*"], [])]),
+}
+
+# Contas de obrigação/direito com o colaborador: itens patronais nunca podem usá-las
+ALVOS_COLABORADOR = ("SAL_PAGAR", "PROLAB_PAGAR", "FER_PAGAR", "RESC_PAGAR",
+                     "ADIANT_SAL", "ADIANT_13", "ADIANT_FER", "EMPREST", "PENSAO")
+OBRIGACOES_GUIA = ("INSS_REC", "FGTS_REC", "IRRF_REC", "PIS_REC", "SIND_REC", "CPRB_REC")
+
+
+def casa_alvo(d, alvo):
+    return any(all(casa(d, x) for x in m) and not any(casa(d, x) for x in n)
+               for m, n in ALVOS[alvo][2])
+
+# =====================================================================
+# 3. PLANO DE CONTAS GENÉRICO
+# =====================================================================
+def _segs(c) -> tuple:
+    return tuple(p for p in re.split(r"\D+", str(c)) if p)
+
+
+def dentro(segs, grupo) -> bool:
+    """segs é o próprio grupo ou descendente dele (com ou sem pontos na máscara)."""
+    if not grupo:
         return False
-    termos_norm = [_norm(t) for t in termos]
-    resultado = rfprocess.extractOne(
-        nome_norm,
-        termos_norm,
-        scorer=fuzz.token_set_ratio,
-    )
-    return resultado is not None and resultado[1] >= threshold
-
-
-def _match(nome_norm: str,
-           termos: list[str],
-           threshold: int = 88) -> bool:
-    """
-    Busca exata (substring) → fallback fuzzy.
-    Essa é a função de matching usada por todas as _e_* abaixo.
-    """
-    # 1) busca exata — rápida, sem custo
-    if any(_norm(t) in nome_norm for t in termos):
+    if segs == grupo:
         return True
-    # 2) fallback fuzzy — só ativa se exata falhar
-    return _fuzzy_match(nome_norm, termos, threshold)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# ANTI CURTO-CIRCUITO
-# ══════════════════════════════════════════════════════════════════════════
-def validar_par_contas(conta_debito: str, conta_credito: str) -> bool:
-    if not conta_debito or not conta_credito:
-        return True
-    return str(conta_debito).strip() != str(conta_credito).strip()
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# SCORE GERAL DE FOLHA
-# ══════════════════════════════════════════════════════════════════════════
-PALAVRAS_FOLHA_POSITIVO: list[tuple[str, int]] = [
-    ("SALARIOS E ORDENADOS A PAGAR", 10), ("SALARIOS A PAGAR", 10),
-    ("PRO-LABORE A PAGAR", 10), ("GRATIFICACOES A PAGAR", 10),
-    ("FERIAS A PAGAR", 10), ("RESCISOES A PAGAR", 10),
-    ("13 SALARIO A PAGAR", 10), ("PENSAO ALIMENTICIA A PAGAR", 10),
-    ("COMISSOES A PAGAR", 10), ("AUTONOMOS A PAGAR", 10),
-    ("INDENIZACOES A PAGAR", 10), ("PREMIOS E BONIFICACOES", 10),
-    ("INSS A RECOLHER", 10), ("INSS SOBRE PROVISOES", 10),
-    ("FGTS A RECOLHER", 10), ("FGTS SOBRE PROVISOES", 10),
-    ("PIS S/ FOLHA A RECOLHER", 10), ("IRRF S/ FOLHA", 10),
-    ("CONTRIBUICOES SINDICAIS", 10), ("PROVISOES PARA FERIAS", 10),
-    ("PROVISOES PARA 13", 10), ("INSS SOBRE PROVISOES PARA FERIAS", 10),
-    ("INSS SOBRE PROVISOES PARA 13", 10), ("FGTS SOBRE PROVISOES PARA FERIAS", 10),
-    ("FGTS SOBRE PROVISOES PARA 13", 10), ("OBRIGACOES COM O PESSOAL", 10),
-    ("OBRIGACOES SOCIAIS", 10), ("OBRIGACOES TRABALHISTA", 10),
-    ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 10), ("PROVISOES", 8),
-    ("DESPESAS COM PESSOAL", 10), ("SALARIOS E ORDENADOS", 8),
-    ("PRO-LABORE", 8), ("PREMIOS E GRATIFICACOES", 8),
-    ("INDENIZACOES E AVISO PREVIO", 8), ("ASSISTENCIA MEDICA E SOCIAL", 8),
-    ("VALE TRANSPORTE", 7), ("VALE REFEICAO", 7),
-    ("ALIMENTACAO/ CESTA BASICA", 7), ("DESPESAS COM ALIMENTACAO", 7),
-    ("PENSAO ALIMENTICIA", 7), ("COMISSOES SOBRE VENDAS", 7),
-    ("COMISSOES", 7), ("HORAS EXTRAS", 7), ("PIS S/ FOLHA", 7),
-    ("MAO-DE-OBRA DIRETA", 10), ("MAO-DE-OBRA INDIRETA", 10),
-    ("SALARIOS E ORDENADOS CUSTOS", 10), ("PRO-LABORE CUSTOS", 10),
-    ("FERIAS CUSTOS", 10), ("INSS CUSTOS", 10), ("FGTS CUSTOS", 10),
-    ("INSS EMPRESA", 10), ("INSS TERCEIROS", 10), ("INSS ACIDENTE", 10),
-    ("INSS PATRONAL", 10), ("ENCARGOS SOCIAIS", 10),
-    ("CONTRIBUICAO PREVIDENCIARIA", 10), ("CONTRIBUICAO PATRONAL", 10),
-    ("IMPOSTO DE RENDA A RECOLHER", 6), ("IMPOSTO DE RENDA RETIDO", 6),
-    ("IRRF", 6), ("INSS", 5), ("FGTS", 5),
-    ("FOLHA DE PAGAMENTO", 8), ("REMUNERACAO", 6),
-    ("PESSOAL", 5), ("TRABALHISTA", 5), ("PREVIDENCIARIA", 5),
-    ("PATRONAL", 8), ("EMPREGADOS", 5), ("FUNCIONARIOS", 5),
-    ("EMPRESTIMO / CONSIGNADO", 8), ("EMPRESTIMOS CONSIGNADOS", 8),
-]
-
-PALAVRAS_FOLHA_NEGATIVO: list[tuple[str, int]] = [
-    ("FORNECEDORES NACIONAIS", -50), ("FORNECEDORES ESTRANGEIROS", -50),
-    ("FORNECEDORES DO GRUPO", -50), ("FORNECEDORES", -40),
-    ("CLIENTES NACIONAIS", -50), ("CLIENTES ESTRANGEIROS", -50),
-    ("CLIENTES RELACIONADOS", -50), ("CLIENTES", -40),
-    ("MERCADORIAS PARA REVENDA", -50), ("MATERIA-PRIMA", -30),
-    ("ESTOQUE", -40), ("ALMOXARIFADO", -30),
-    ("PRODUTOS ACABADOS", -40), ("PRODUTOS SEMI ACABADOS", -40),
-    ("IMOVEIS", -40), ("MAQUINAS E EQUIPAMENTOS", -40),
-    ("VEICULOS", -40), ("MOVEIS E UTENSILIOS", -40),
-    ("COMPUTADORES E ACESSORIOS", -40), ("INSTALACOES", -40),
-    ("FERRAMENTAS E ACESSORIOS", -40), ("SOFTWARES", -40),
-    ("MARCAS E PATENTES", -40), ("DEPRECIACAO DE EDIFICIOS", -30),
-    ("DEPRECIACAO DE MOVEIS", -30), ("DEPRECIACAO DE MAQUINAS", -30),
-    ("DEPRECIACAO DE VEICULOS", -30), ("BANCO DO BRASIL", -30),
-    ("BANCO ITAU", -30), ("BANCO BRADESCO", -30),
-    ("BANCO SANTANDER", -30), ("BANCO INTER", -30),
-    ("BANCO C6", -30), ("BANCO NU", -30), ("BANCO CORA", -30),
-    ("BANCO DAYCOVAL", -30), ("CAIXA ECONOMICA", -30),
-    ("CAIXA GERAL", -30), ("FUNDO FIXO DE CAIXA", -30),
-    ("APLICACOES FINANCEIRAS", -30), ("APLICACOES BANCO", -30),
-    ("CHEQUE ESPECIAL", -30), ("EMPRESTIMOS BANCOS", -30),
-    ("FINANCIAMENTO BANCO", -30), ("IPI A RECOLHER", -30),
-    ("ICMS A RECOLHER", -30), ("ISS A RECOLHER", -30),
-    ("PIS A RECOLHER", -30), ("COFINS A RECOLHER", -30),
-    ("SIMPLES NACIONAL A RECOLHER", -30), ("VENDA DE PRODUTOS", -50),
-    ("VENDA DE MERCADORIAS", -50), ("SERVICOS PRESTADOS", -40),
-    ("RECEITA", -40), ("CAPITAL SOCIAL", -50), ("RESERVAS", -40),
-    ("LUCROS OU PREJUIZOS", -40), ("DIVIDENDOS", -40),
-    ("RESULTADO DO EXERCICIO", -40), ("APURACAO DO RESULTADO", -40),
-    ("ADIANTAMENTO A SOCIOS", -30), ("ADIANTAMENTO A FORNECEDORES", -20),
-    ("TITULOS A RECEBER", -30), ("DEPOSITOS JUDICIAIS", -30),
-    ("INVESTIMENTOS", -30), ("PARTICIPACOES SOCIETARIAS", -30),
-    ("IPI A RECUPERAR", -30), ("ICMS A RECUPERAR", -30),
-    ("PIS A RECUPERAR", -30), ("COFINS A RECUPERAR", -30),
-    ("A COMPENSAR", -50), ("A RECUPERAR", -50),
-    ("SALDO NEGATIVO", -50), ("ADIANTAMENTO DE SALARIO", -30),
-    ("ADIANTAMENTO DE 13", -30), ("ADIANTAMENTO DE FERIAS", -30),
-]
-
-SCORE_MINIMO_FOLHA = 5
-
-
-def calcular_score_folha(nome_conta_norm: str) -> int:
-    score = 0
-    for termo, peso in PALAVRAS_FOLHA_POSITIVO:
-        if _norm(termo) in nome_conta_norm:
-            score += peso
-    for termo, peso in PALAVRAS_FOLHA_NEGATIVO:
-        if _norm(termo) in nome_conta_norm:
-            score += peso
-    return score
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# CLASSIFICAÇÃO DE CONTAS POR POSIÇÃO NO PLANO
-# ══════════════════════════════════════════════════════════════════════════
-def _e_conta_dre(classificacao: str) -> bool:
-    c = str(classificacao).strip()
-    return c.startswith("3") or c.startswith("4")
-
-def _e_conta_passivo(classificacao: str) -> bool:
-    c = str(classificacao).strip()
-    return c.startswith("2")
-
-def _e_conta_ativo(classificacao: str) -> bool:
-    c = str(classificacao).strip()
-    return c.startswith("1")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# TABELAS DE SCORING — DRE POR TIPO DE RUBRICA
-# ══════════════════════════════════════════════════════════════════════════
-DRE_SALARIO_POS = [
-    ("SALARIOS E ORDENADOS", 300), ("PRO-LABORE", 200),
-    ("DESPESAS COM PESSOAL", 250), ("MAO-DE-OBRA DIRETA", 280),
-    ("MAO-DE-OBRA INDIRETA", 280), ("SALARIOS E ORDENADOS CUSTOS", 280),
-]
-DRE_SALARIO_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300),
-    ("PROVISAO", -300), ("PROVISOES", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("HORAS EXTRAS", -100), ("FERIAS", -100), ("13 SALARIO", -100),
-    ("INSS", -100), ("FGTS", -100), ("INDENIZACOES", -100),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300), ("VALE TRANSPORTE", -100),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500), ("CUSTOS DOS SERVICOS PRESTADOS", -500),
-]
-
-DRE_HORAS_EXTRAS_POS = [
-    ("HORAS EXTRAS", 500), ("HORA EXTRA", 500),
-    ("DESPESAS COM PESSOAL", 100), ("MAO-DE-OBRA DIRETA", 150),
-]
-DRE_HORAS_EXTRAS_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("PROVISAO", -300),
-    ("A COMPENSAR", -400), ("SALARIOS E ORDENADOS", -100),
-    ("FERIAS", -100), ("13 SALARIO", -100),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_FERIAS_POS = [
-    ("FERIAS", 400), ("FERIAS CUSTOS", 450),
-    ("PROVISOES PARA FERIAS", 350), ("DESPESAS COM PESSOAL", 100),
-]
-DRE_FERIAS_NEG = [
-    ("A PAGAR", -200), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("HORAS EXTRAS", -100), ("13 SALARIO", -100),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_13_SALARIO_POS = [
-    ("13 SALARIO", 400), ("13 SALARIO CUSTOS", 450),
-    ("PROVISOES PARA 13", 350), ("DESPESAS COM PESSOAL", 100),
-]
-DRE_13_SALARIO_NEG = [
-    ("A PAGAR", -200), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("HORAS EXTRAS", -100), ("FERIAS", -100),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_RESCISAO_POS = [
-    ("INDENIZACOES E AVISO PREVIO", 500), ("INDENIZACOES", 400),
-    ("AVISO PREVIO", 400), ("RESCISAO", 400), ("DESPESAS COM PESSOAL", 100),
-]
-DRE_RESCISAO_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("HORAS EXTRAS", -100),
-    ("FERIAS", -100), ("13 SALARIO", -100),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-    ("CUSTOS DOS SERVICOS PRESTADOS", -500),
-]
-
-DRE_VALE_TRANSPORTE_POS = [
-    ("VALE TRANSPORTE", 500), ("DESPESAS COM PESSOAL", 100),
-]
-DRE_VALE_TRANSPORTE_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
-    ("VALE REFEICAO", -200), ("HORAS EXTRAS", -100),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_VALE_REFEICAO_POS = [
-    ("VALE REFEICAO", 500), ("ALIMENTACAO", 400),
-    ("DESPESAS COM ALIMENTACAO", 450), ("ALIMENTACAO/ CESTA BASICA", 450),
-    ("CESTA BASICA", 400), ("DESPESAS COM PESSOAL", 100),
-]
-DRE_VALE_REFEICAO_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("VALE TRANSPORTE", -100),
-    ("HORAS EXTRAS", -100), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_ASSISTENCIA_MEDICA_POS = [
-    ("ASSISTENCIA MEDICA E SOCIAL", 500), ("ASSISTENCIA MEDICA", 450),
-    ("DESPESAS COM PESSOAL", 100),
-]
-DRE_ASSISTENCIA_MEDICA_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
-    ("VALE REFEICAO", -200), ("HORAS EXTRAS", -100),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_COMISSOES_POS = [
-    ("COMISSOES SOBRE VENDAS", 500), ("COMISSOES", 400),
-    ("DESPESAS COM PESSOAL", 100),
-]
-DRE_COMISSOES_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
-    ("VALE REFEICAO", -200), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_PIS_FOLHA_POS = [
-    ("PIS S/ FOLHA", 500), ("DESPESAS COM PESSOAL", 100),
-]
-DRE_PIS_FOLHA_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("A COMPENSAR", -400),
-    ("SALARIOS E ORDENADOS", -100), ("ALIMENTACAO", -200),
-    ("VALE REFEICAO", -200), ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-DRE_PESSOAL_GENERICO_POS = [
-    ("DESPESAS COM PESSOAL", 300), ("SALARIOS E ORDENADOS", 200),
-    ("PRO-LABORE", 150), ("MAO-DE-OBRA DIRETA", 250),
-    ("MAO-DE-OBRA INDIRETA", 250),
-]
-DRE_PESSOAL_GENERICO_NEG = [
-    ("A PAGAR", -300), ("A RECOLHER", -300), ("PROVISAO", -200),
-    ("A COMPENSAR", -400), ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("VALE TRANSPORTE", -100), ("HORAS EXTRAS", -100),
-    ("FERIAS", -100), ("13 SALARIO", -100), ("INSS", -100), ("FGTS", -100),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# TABELAS DE PASSIVO POR TIPO
-# ══════════════════════════════════════════════════════════════════════════
-PASSIVO_SALARIOS_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
-    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250), ("PRO-LABORE A PAGAR", 200),
-    ("GRATIFICACOES A PAGAR", 180),
-]
-PASSIVO_SALARIOS_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("INSS A RECOLHER", -200), ("FGTS A RECOLHER", -200),
-    ("IRRF S/ FOLHA", -200), ("PROVISAO", -200),
-    ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("FERIAS A PAGAR", -100), ("RESCISOES A PAGAR", -100),
-    ("13 SALARIO A PAGAR", -100),
-]
-
-PASSIVO_FERIAS_POS = [
-    ("FERIAS A PAGAR", 500), ("PROVISOES PARA FERIAS", 400),
-    ("SALARIOS E ORDENADOS A PAGAR", 200), ("OBRIGACOES COM O PESSOAL", 200),
-]
-PASSIVO_FERIAS_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("INSS A RECOLHER", -150), ("FGTS A RECOLHER", -150),
-    ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
-    ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("13 SALARIO A PAGAR", -100), ("RESCISOES A PAGAR", -100),
-]
-
-PASSIVO_RESCISAO_POS = [
-    ("RESCISOES A PAGAR", 500), ("INDENIZACOES A PAGAR", 400),
-    ("SALARIOS E ORDENADOS A PAGAR", 200), ("OBRIGACOES COM O PESSOAL", 200),
-]
-PASSIVO_RESCISAO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("INSS A RECOLHER", -150), ("FGTS A RECOLHER", -150),
-    ("PROVISAO", -100), ("RECEITA", -300), ("BANCO", -200),
-    ("FORNECEDORES", -300), ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("FERIAS A PAGAR", -100), ("13 SALARIO A PAGAR", -100),
-]
-
-PASSIVO_13_POS = [
-    ("13 SALARIO A PAGAR", 500), ("PROVISOES PARA 13", 400),
-    ("SALARIOS E ORDENADOS A PAGAR", 200), ("OBRIGACOES COM O PESSOAL", 200),
-]
-PASSIVO_13_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("INSS A RECOLHER", -150), ("FGTS A RECOLHER", -150),
-    ("INSS SOBRE PROVISOES", -200), ("FGTS SOBRE PROVISOES", -200),
-    ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("FERIAS A PAGAR", -100), ("RESCISOES A PAGAR", -100),
-]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# TABELAS DE DESCONTO
-# ══════════════════════════════════════════════════════════════════════════
-DESCONTO_DEBITO_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
-    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250), ("PRO-LABORE A PAGAR", 200),
-    ("GRATIFICACOES A PAGAR", 180), ("RESCISOES A PAGAR", 180),
-]
-DESCONTO_DEBITO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("INSS A RECOLHER", -200), ("FGTS A RECOLHER", -200),
-    ("IRRF S/ FOLHA", -200), ("PROVISAO", -200),
-    ("RECEITA", -300), ("BANCO", -200), ("FORNECEDORES", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("SALARIOS E ORDENADOS CUSTOS", -300), ("SALARIOS E ORDENADOS", -150),
-]
-
-DESCONTO_CRED_INSS_POS = [
-    ("INSS A RECOLHER", 500), ("OBRIGACOES SOCIAIS", 200),
-    ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 200), ("A RECOLHER", 100),
-]
-DESCONTO_CRED_INSS_NEG = [
-    ("FGTS", -100), ("IRRF", -150), ("SALARIOS A PAGAR", -100),
-    ("DESPESA", -300), ("CUSTO", -300), ("PROVISAO", -150),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-DESCONTO_CRED_IRRF_POS = [
-    ("IRRF S/ FOLHA", 500), ("IMPOSTO DE RENDA A RECOLHER", 400),
-    ("IRRF", 250), ("A RECOLHER", 100),
-]
-DESCONTO_CRED_IRRF_NEG = [
-    ("INSS", -150), ("FGTS", -150), ("SALARIOS A PAGAR", -100),
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("NF", -150), ("ALUGUEL", -150), ("APLICACAO", -150),
-]
-
-DESCONTO_CRED_SAL_PAGAR_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
-    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250),
-]
-DESCONTO_CRED_SAL_PAGAR_NEG = [
-    ("INSS", -150), ("FGTS", -150), ("IRRF", -150),
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("SALARIOS E ORDENADOS CUSTOS", -300),
-    ("SALARIOS E ORDENADOS", -150),
-]
-
-DESCONTO_CRED_SINDICATO_POS = [
-    ("CONTRIBUICOES SINDICAIS", 500), ("MENSALIDADE SINDICAL", 500),
-    ("OBRIGACOES SOCIAIS", 250), ("A RECOLHER", 100),
-]
-DESCONTO_CRED_SINDICATO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300), ("SALARIOS A PAGAR", -100),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-DESCONTO_CRED_PENSAO_POS = [
-    ("PENSAO ALIMENTICIA A PAGAR", 500),
-    ("SALARIOS E ORDENADOS A PAGAR", 250), ("A PAGAR", 100),
-]
-DESCONTO_CRED_PENSAO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("INSS", -150), ("FGTS", -150),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-CONSIGNADO_DEBITO_POS = [
-    ("SALARIOS E ORDENADOS A PAGAR", 500), ("SALARIOS A PAGAR", 500),
-    ("ORDENADOS A PAGAR", 500), ("FOLHA A PAGAR", 500),
-    ("OBRIGACOES COM O PESSOAL", 250),
-]
-CONSIGNADO_DEBITO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300), ("BANCOS", -300),
-    ("FORNECEDORES", -300), ("EMPRESTIMOS", -150), ("CONSIGNADO", -150),
-    ("RECEITA", -300), ("INSS", -150), ("FGTS", -150), ("IRRF", -150),
-    ("SALARIOS E ORDENADOS CUSTOS", -300), ("SALARIOS E ORDENADOS", -150),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-CONSIGNADO_CREDITO_POS = [
-    ("EMPRESTIMO / CONSIGNADO", 600), ("EMPRESTIMOS CONSIGNADOS", 500),
-    ("CONSIGNADOS A PAGAR", 500), ("CREDITO TRABALHO", 480),
-    ("EMPRESTIMOS DE FUNCIONARIOS", 450), ("EMPRESTIMO A EMPREGADOS", 400),
-    ("EMPRESTIMO", 200), ("CONSIGNADO", 200),
-]
-CONSIGNADO_CREDITO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("SALARIOS A PAGAR", -150), ("ORDENADOS A PAGAR", -150),
-    ("FORNECEDORES", -300), ("RECEITA", -300),
-    ("INSS", -150), ("FGTS", -150), ("IRRF", -150),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# TABELAS DE INFORMATIVOS / ENCARGO PATRONAL
-# ══════════════════════════════════════════════════════════════════════════
-INFORMATIVO_DEBITO_POS = [
-    ("DESPESAS COM PESSOAL", 300), ("INSS CUSTOS", 300), ("FGTS CUSTOS", 300),
-    ("ENCARGOS SOCIAIS", 280), ("CONTRIBUICAO PATRONAL", 280),
-    ("CONTRIBUICAO PREVIDENCIARIA", 280), ("INSS EMPRESA", 260),
-    ("INSS TERCEIROS", 260), ("INSS ACIDENTE", 260), ("PATRONAL", 260),
-    ("INSS", 150), ("FGTS", 150), ("DESPESA", 50), ("CUSTO", 50),
-]
-INFORMATIVO_DEBITO_NEG = [
-    ("A RECOLHER", -300), ("A PAGAR", -300),
-    ("PROVISOES PARA FERIAS", -400), ("PROVISOES PARA 13", -400),
-    ("INSS SOBRE PROVISOES", -400), ("FGTS SOBRE PROVISOES", -400),
-    ("PIS SOBRE PROVISOES", -400), ("PROVISAO", -300),
-    ("OBRIGACOES COM O PESSOAL", -300), ("OBRIGACOES SOCIAIS", -300),
-    ("OBRIGACOES TRABALHISTA", -300), ("FORNECEDORES", -300),
-    ("RECEITA", -300), ("BANCO", -200),
-    ("A COMPENSAR", -500), ("A RECUPERAR", -400),
-    ("ADIANTAMENTO", -200), ("EMPRESTIMO", -300), ("SALDO NEGATIVO", -300),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-    ("CUSTOS DOS SERVICOS PRESTADOS", -500),
-]
-
-INFORMATIVO_CREDITO_POS = [
-    ("INSS A RECOLHER", 500), ("FGTS A RECOLHER", 500),
-    ("OBRIGACOES SOCIAIS", 250), ("OBRIGACOES TRABALHISTAS E PREVIDENCIARIA", 250),
-    ("CONTRIBUICOES SINDICAIS", 200), ("PIS S/ FOLHA A RECOLHER", 200),
-    ("A RECOLHER", 100), ("PASSIVO", 50),
-]
-INFORMATIVO_CREDITO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300),
-    ("SALARIOS A PAGAR", -200), ("ORDENADOS A PAGAR", -200),
-    ("PROVISOES PARA FERIAS", -200), ("PROVISOES PARA 13", -200),
-    ("FORNECEDORES", -300), ("RECEITA", -300), ("BANCO", -200),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# TABELAS DE FGTS DINÂMICO
-# ══════════════════════════════════════════════════════════════════════════
-FGTS_CREDITO_POS = [
-    ("FGTS A RECOLHER", 500), ("FGTS A PAGAR", 480),
-    ("FUNDO DE GARANTIA", 400), ("OBRIGACOES SOCIAIS", 200),
-]
-FGTS_CREDITO_NEG = [
-    ("DESPESA", -300), ("CUSTO", -300), ("PROVISAO", -200),
-    ("SALARIOS A PAGAR", -200), ("INSS", -100), ("FORNECEDOR", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-FGTS_DEBITO_NORMAL_POS = [
-    ("FGTS CUSTOS", 400), ("FGTS", 250), ("ENCARGOS SOCIAIS", 230),
-    ("DESPESAS COM PESSOAL", 200), ("DESPESA", 80), ("CUSTO", 80),
-]
-FGTS_DEBITO_NORMAL_NEG = [
-    ("A RECOLHER", -300), ("A PAGAR", -300),
-    ("PROVISOES PARA FERIAS", -400), ("PROVISOES PARA 13", -400),
-    ("SOBRE PROVISOES", -400), ("PROVISAO", -300), ("FORNECEDOR", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-    ("CUSTOS DOS SERVICOS PRESTADOS", -500),
-]
-
-FGTS_DEBITO_PROVISAO_POS = [
-    ("FGTS SOBRE PROVISOES PARA FERIAS", 500),
-    ("FGTS SOBRE PROVISOES PARA 13", 500),
-    ("FGTS SOBRE PROVISOES", 450),
-    ("PROVISOES PARA FERIAS", 300), ("PROVISOES PARA 13", 300),
-    ("PROVISAO", 200),
-]
-FGTS_DEBITO_PROVISAO_NEG = [
-    ("A RECOLHER", -300), ("A PAGAR", -200),
-    ("DESPESA", -150), ("CUSTO", -150), ("FORNECEDOR", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-]
-
-FGTS_DEBITO_RESCISAO_POS = [
-    ("FGTS RESCISORIO", 500), ("MULTA RESCISORIA", 500),
-    ("GRRF", 500), ("DESPESA COM RESCISAO", 400),
-    ("INDENIZACOES E AVISO PREVIO", 350),
-    ("INDENIZACOES", 300),
-    ("FGTS CUSTOS", 250), ("DESPESAS COM PESSOAL", 200),
-    ("DESPESA", 80), ("CUSTO", 80),
-]
-FGTS_DEBITO_RESCISAO_NEG = [
-    ("A RECOLHER", -300), ("A PAGAR", -300),
-    ("PROVISOES PARA FERIAS", -400), ("PROVISOES PARA 13", -400),
-    ("SOBRE PROVISOES", -400), ("PROVISAO", -300), ("FORNECEDOR", -300),
-    ("A COMPENSAR", -400), ("A RECUPERAR", -300),
-    ("ALIMENTACAO", -300), ("VALE REFEICAO", -300),
-    ("CUSTOS DOS PRODUTOS VENDIDOS", -500),
-    ("CUSTOS DOS SERVICOS PRESTADOS", -500),
-    ("CUSTOS DAS MERCADORIAS VENDIDAS", -500),
-]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# DETECÇÃO DE TIPO DE RUBRICA — exata + fallback rapidfuzz
-# ══════════════════════════════════════════════════════════════════════════
-def _e_consignado(nome_norm: str) -> bool:
-    termos = ["EMPRESTIMO CONSIGNADO", "CONSIGNADO", "CREDITO TRABALHO",
-              "EMP CRED TRAB", "EMPRESTIMO TRABALHADOR", "CONSIG",
-              "EMP. CRED. TRAB", "EMPRESTIMO CONSIG", "DESC. EMPRESTIMO"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_fgts(nome_norm: str) -> bool:
-    # FGTS é sigla curta — só exata, sem fuzzy (evita falsos positivos)
-    return "FGTS" in nome_norm or "F.G.T.S" in nome_norm
-
-def _e_inss_desconto(nome_norm: str) -> bool:
-    termos = ["I.N.S.S", "INSS FERIAS", "INSS SOBRE RESCISAO",
-              "INSS 13", "INSS DIFERENCA", "INSS EMPREGADO",
-              "INSS SOBRE RESCISAO", "INSS SAL"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_irrf(nome_norm: str) -> bool:
-    termos = ["IMPOSTO DE RENDA", "IRRF", "I.R.R.F", "IR FONTE",
-              "IRRF FERIAS", "IRRF 13"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_sindicato(nome_norm: str) -> bool:
-    termos = ["SINDICATO", "SINDICAL", "MENSALIDADE SINDICAL",
-              "CONTRIBUICAO SINDICAL", "CONTRIB SINDICAL",
-              "CONFEDERATIVA", "ASSISTENCIAL"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_pensao_alimenticia(nome_norm: str) -> bool:
-    termos = ["PENSAO ALIMENTICIA", "PENSAO ALIMENT"]
-    return _match(nome_norm, termos, threshold=90)
-
-def _e_horas_extras(nome_norm: str) -> bool:
-    termos = ["HORAS EXTRAS", "HORA EXTRA", "HE 50", "HE 100",
-              "EXTRAS 50", "EXTRAS 100", "HORA EXTRA 50", "HORA EXTRA 100",
-              "REFLEXO EXTRAS", "REFLEXO HE", "DSR EXTRAS", "REFLEXO EXTRA"]
-    return _match(nome_norm, termos, threshold=85)
-
-def _e_ferias_provento(nome_norm: str) -> bool:
-    termos = ["DIAS FERIAS", "FERIAS PROPORCIONAIS", "1/3 DAS FERIAS",
-              "1/3 FERIAS", "MEDIA VALOR FERIAS", "MEDIA HORAS FERIAS",
-              "FERIAS VENCIDAS", "FERIAS GOZADAS", "ADIANTAMENTO DE FERIAS",
-              "ABONO PECUNIARIO", "ABONO FERIAS", "MEDIA FERIAS",
-              "FERIAS PROPORC", "1/3 FERIAS PROPORCIONAIS", "FERIAS INTEGRAIS",
-              "FERIAS DO MES"]
-    return _match(nome_norm, termos, threshold=85)
-
-def _e_rescisao_provento(nome_norm: str) -> bool:
-    termos = ["RESCISAO", "AVISO PREVIO", "INDENIZACAO", "INDENIZACOES",
-              "SALDO DE SALARIO DIAS", "SALDO SALARIO",
-              "13 SALARIO INTEGRAL RESCISAO", "13 SAL RESCISAO",
-              "FERIAS PROPORCIONAIS RESCISAO", "1/3 FERIAS PROPORCIONAIS RESCISAO",
-              "ESTOURO RESCISAO", "F.G.T.S DE RESCISAO",
-              "FGTS 13O SALARIO RESCISAO", "MULTA RESCISORIA",
-              "MULTA ESTABILIDADE", "INDENIZACAO ADICIONAL",
-              "AVISO PREVIO DIAS IND"]
-    return _match(nome_norm, termos, threshold=85)
-
-def _e_13_salario_provento(nome_norm: str) -> bool:
-    termos = ["13 SALARIO INTEGRAL", "13 SALARIO ADIANTADO",
-              "13 SALARIO RESCISAO", "13 SAL", "DECIMO TERCEIRO",
-              "MEDIA HORAS 13", "MEDIA VALOR 13", "VANTAGENS 13",
-              "13o SALARIO", "13 SALARIO INTEGRAL RESCISAO"]
-    return _match(nome_norm, termos, threshold=85)
-
-def _e_vale_transporte_provento(nome_norm: str) -> bool:
-    termos = ["VALE TRANSPORTE", "VT EMPRESA", "VALE TRANSP"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_vale_refeicao_provento(nome_norm: str) -> bool:
-    termos = ["VALE REFEICAO", "AUXILIO REFEICAO", "VALE ALIMENTACAO",
-              "AUXILIO ALIMENTACAO", "CESTA BASICA", "ALIMENTACAO"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_assistencia_medica_provento(nome_norm: str) -> bool:
-    termos = ["ASSISTENCIA MEDICA", "PLANO SAUDE EMPRESA",
-              "PLANO ODONTO EMPRESA", "REEMBOLSO PLANO"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_comissao_provento(nome_norm: str) -> bool:
-    termos = ["COMISSAO", "COMISSOES", "REFLEXO COMISSOES"]
-    return _match(nome_norm, termos, threshold=88)
-
-def _e_pis_folha_provento(nome_norm: str) -> bool:
-    # PIS S/ FOLHA é específico — threshold alto
-    termos = ["PIS S/ FOLHA", "PIS FOLHA"]
-    return _match(nome_norm, termos, threshold=92)
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# MOTOR DE SCORING
-# ══════════════════════════════════════════════════════════════════════════
-def _score_conta(nome_norm: str,
-                 pos: list[tuple[str, int]],
-                 neg: list[tuple[str, int]]) -> int:
-    score = 0
-    for t, p in pos:
-        if _norm(t) in nome_norm:
-            score += p
-    for t, p in neg:
-        if _norm(t) in nome_norm:
-            score += p
-    return score
-
-
-def _melhor_conta(
-    df_contas: pd.DataFrame,
-    pos: list[tuple[str, int]],
-    neg: list[tuple[str, int]],
-    score_min: int = 1,
-    filtro_posicao: str = "",
-) -> tuple[str, str]:
-    df_a = df_contas[df_contas["tipo"] == "A"].copy()
-    if df_a.empty:
-        return "", ""
-
-    if filtro_posicao == "DRE":
-        mask = df_a["classificacao"].apply(_e_conta_dre)
-        df_filtrado = df_a[mask]
-        if df_filtrado.empty:
-            df_filtrado = df_a
-    elif filtro_posicao == "PASSIVO":
-        mask = df_a["classificacao"].apply(_e_conta_passivo)
-        df_filtrado = df_a[mask]
-        if df_filtrado.empty:
-            df_filtrado = df_a
-    elif filtro_posicao == "ATIVO":
-        mask = df_a["classificacao"].apply(_e_conta_ativo)
-        df_filtrado = df_a[mask]
-        if df_filtrado.empty:
-            df_filtrado = df_a
+    if len(grupo) == 1:
+        alvo = segs[0] if len(segs) == 1 else "".join(segs)
+        return alvo.startswith(grupo[0]) and alvo != grupo[0]
+    return len(segs) > len(grupo) and segs[:len(grupo)] == grupo
+
+
+def _prefixos(segs):
+    if len(segs) == 1:
+        s = segs[0]
+        return [(s[:k],) for k in range(1, len(s))]
+    return [segs[:k] for k in range(1, len(segs))]
+
+
+@st.cache_data(show_spinner=False)
+def carregar_plano(dados: bytes, nome: str):
+    if nome.lower().endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(dados), sep=None, engine="python", dtype=str)
     else:
-        df_filtrado = df_a
+        df = pd.read_excel(io.BytesIO(dados), dtype=str)
+    ren = {}
+    for c in df.columns:
+        n = norm(c)
+        if "REDUZ" in n: ren[c] = "reduzido"
+        elif "CLASSIF" in n: ren[c] = "classificacao"
+        elif n.startswith("TIPO"): ren[c] = "tipo"
+        elif "DESCRI" in n or n in ("NOME", "NOME DA CONTA"): ren[c] = "descricao"
+    df = df.rename(columns=ren)
+    falta = {"reduzido", "classificacao", "descricao"} - set(df.columns)
+    if falta:
+        raise ValueError(f"Colunas não encontradas no plano: {falta}")
+    cols = ["reduzido", "classificacao", "descricao"] + (["tipo"] if "tipo" in df.columns else [])
+    df = df[cols].dropna(subset=["reduzido", "classificacao"]).copy()
+    for c in cols:
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    df["reduzido"] = df["reduzido"].str.replace(r"\.0$", "", regex=True)
+    df["classificacao"] = df["classificacao"].map(
+        lambda c: c[:-2] if re.fullmatch(r"\d+\.0", c) else c)
+    df = df.drop_duplicates(subset=["reduzido", "classificacao"])
+    df["segs"] = df["classificacao"].map(_segs)
+    df = df[df["segs"].map(len) > 0].reset_index(drop=True)
 
-    best_score, best_red, best_nome = -9999, "", ""
-    for _, row in df_filtrado.iterrows():
-        s = _score_conta(row["nome_conta"], pos, neg)
-        if s > best_score:
-            best_score, best_red, best_nome = s, row["reduzido"], row["nome_original"]
-
-    return (best_red, best_nome) if best_score >= score_min else ("", "")
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# ROTEAMENTO DRE E PASSIVO POR TIPO DE RUBRICA
-# ══════════════════════════════════════════════════════════════════════════
-def _get_dre_tables_provento(nome_norm: str, tipo_folha: str) -> tuple:
-    if _e_horas_extras(nome_norm):
-        return DRE_HORAS_EXTRAS_POS, DRE_HORAS_EXTRAS_NEG, 50
-    if tipo_folha == "4" or _e_rescisao_provento(nome_norm):
-        return DRE_RESCISAO_POS, DRE_RESCISAO_NEG, 50
-    if tipo_folha in ("6",) or _e_13_salario_provento(nome_norm):
-        return DRE_13_SALARIO_POS, DRE_13_SALARIO_NEG, 50
-    if tipo_folha in ("3", "5") or _e_ferias_provento(nome_norm):
-        return DRE_FERIAS_POS, DRE_FERIAS_NEG, 50
-    if _e_vale_transporte_provento(nome_norm):
-        return DRE_VALE_TRANSPORTE_POS, DRE_VALE_TRANSPORTE_NEG, 50
-    if _e_vale_refeicao_provento(nome_norm):
-        return DRE_VALE_REFEICAO_POS, DRE_VALE_REFEICAO_NEG, 50
-    if _e_assistencia_medica_provento(nome_norm):
-        return DRE_ASSISTENCIA_MEDICA_POS, DRE_ASSISTENCIA_MEDICA_NEG, 50
-    if _e_comissao_provento(nome_norm):
-        return DRE_COMISSOES_POS, DRE_COMISSOES_NEG, 50
-    if _e_pis_folha_provento(nome_norm):
-        return DRE_PIS_FOLHA_POS, DRE_PIS_FOLHA_NEG, 50
-    return DRE_SALARIO_POS, DRE_SALARIO_NEG, 50
-
-
-def _get_passivo_tables_provento(nome_norm: str, tipo_folha: str) -> tuple:
-    if tipo_folha == "4" or _e_rescisao_provento(nome_norm):
-        return PASSIVO_RESCISAO_POS, PASSIVO_RESCISAO_NEG, 100
-    if tipo_folha in ("6",) or _e_13_salario_provento(nome_norm):
-        return PASSIVO_13_POS, PASSIVO_13_NEG, 100
-    if tipo_folha in ("3", "5") or _e_ferias_provento(nome_norm):
-        return PASSIVO_FERIAS_POS, PASSIVO_FERIAS_NEG, 100
-    return PASSIVO_SALARIOS_POS, PASSIVO_SALARIOS_NEG, 100
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# MOTOR PRINCIPAL: gerar De/Para por evento
-# ══════════════════════════════════════════════════════════════════════════
-def gerar_depara_evento_conta(
-    evento_cod:  str,
-    evento_nome: str,
-    evento_tipo: str,
-    grupo:       str,
-    df_contas:   pd.DataFrame,
-    tipo_folha:  str = "1",
-) -> dict:
-    vazio = {"conta_debito": "", "conta_credito": "",
-             "desc_debito": "", "desc_credito": ""}
-    if df_contas is None or df_contas.empty:
-        return vazio
-
-    nome = _norm(evento_nome)
-    e_encargo = (tipo_folha == "2") or (grupo == "Encargo Patronal")
-
-    if _e_consignado(nome) and evento_tipo in ("Desconto", "Inf. Dedutora"):
-        cd, dd = _melhor_conta(df_contas, CONSIGNADO_DEBITO_POS, CONSIGNADO_DEBITO_NEG,
-                               score_min=100, filtro_posicao="PASSIVO")
-        cc, dc = _melhor_conta(df_contas, CONSIGNADO_CREDITO_POS, CONSIGNADO_CREDITO_NEG,
-                               score_min=100, filtro_posicao="")
-        if cd and cc and validar_par_contas(cd, cc):
-            return {"conta_debito": cd, "conta_credito": cc,
-                    "desc_debito": dd, "desc_credito": dc}
-
-    if _e_fgts(nome) and evento_tipo in ("Informativa", "Inf. Dedutora"):
-        cc, dc = _melhor_conta(df_contas, FGTS_CREDITO_POS, FGTS_CREDITO_NEG,
-                               score_min=100, filtro_posicao="PASSIVO")
-        if tipo_folha in ("3", "6"):
-            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_PROVISAO_POS,
-                                   FGTS_DEBITO_PROVISAO_NEG,
-                                   score_min=50, filtro_posicao="PASSIVO")
-        elif tipo_folha == "4":
-            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_RESCISAO_POS,
-                                   FGTS_DEBITO_RESCISAO_NEG,
-                                   score_min=50, filtro_posicao="DRE")
-        else:
-            cd, dd = _melhor_conta(df_contas, FGTS_DEBITO_NORMAL_POS,
-                                   FGTS_DEBITO_NORMAL_NEG,
-                                   score_min=50, filtro_posicao="DRE")
-        if cd and cc and validar_par_contas(cd, cc):
-            return {"conta_debito": cd, "conta_credito": cc,
-                    "desc_debito": dd, "desc_credito": dc}
-
-    if e_encargo:
-        cd, dd = _melhor_conta(df_contas, INFORMATIVO_DEBITO_POS, INFORMATIVO_DEBITO_NEG,
-                               score_min=50, filtro_posicao="DRE")
-        cc, dc = _melhor_conta(df_contas, INFORMATIVO_CREDITO_POS, INFORMATIVO_CREDITO_NEG,
-                               score_min=50, filtro_posicao="PASSIVO")
-        if cd and cc and validar_par_contas(cd, cc):
-            return {"conta_debito": cd, "conta_credito": cc,
-                    "desc_debito": dd, "desc_credito": dc}
-
-    if evento_tipo == "Provento":
-        dre_pos, dre_neg, dre_min = _get_dre_tables_provento(nome, tipo_folha)
-        pas_pos, pas_neg, pas_min = _get_passivo_tables_provento(nome, tipo_folha)
-
-        cd, dd = _melhor_conta(df_contas, dre_pos, dre_neg,
-                               score_min=dre_min, filtro_posicao="DRE")
-        cc, dc = _melhor_conta(df_contas, pas_pos, pas_neg,
-                               score_min=pas_min, filtro_posicao="PASSIVO")
-
-        if not cd:
-            cd, dd = _melhor_conta(df_contas, DRE_PESSOAL_GENERICO_POS,
-                                   DRE_PESSOAL_GENERICO_NEG,
-                                   score_min=30, filtro_posicao="DRE")
-        if not cc:
-            cc, dc = _melhor_conta(df_contas, PASSIVO_SALARIOS_POS,
-                                   PASSIVO_SALARIOS_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-
-        if cd and cc and validar_par_contas(cd, cc):
-            return {"conta_debito": cd, "conta_credito": cc,
-                    "desc_debito": dd, "desc_credito": dc}
-        if cc:
-            cd, dd = _melhor_conta(df_contas, dre_pos,
-                                   dre_neg + [(_norm(cc), -1000)],
-                                   score_min=20, filtro_posicao="DRE")
-        return {"conta_debito": cd, "conta_credito": cc,
-                "desc_debito": dd, "desc_credito": dc}
-
-    if evento_tipo in ("Desconto", "Inf. Dedutora"):
-        cd, dd = _melhor_conta(df_contas, DESCONTO_DEBITO_POS, DESCONTO_DEBITO_NEG,
-                               score_min=100, filtro_posicao="PASSIVO")
-
-        if _e_inss_desconto(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_INSS_POS,
-                                   DESCONTO_CRED_INSS_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        elif _e_irrf(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_IRRF_POS,
-                                   DESCONTO_CRED_IRRF_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        elif _e_sindicato(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SINDICATO_POS,
-                                   DESCONTO_CRED_SINDICATO_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        elif _e_pensao_alimenticia(nome):
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_PENSAO_POS,
-                                   DESCONTO_CRED_PENSAO_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-        else:
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SAL_PAGAR_POS,
-                                   DESCONTO_CRED_SAL_PAGAR_NEG,
-                                   score_min=100, filtro_posicao="PASSIVO")
-
-        if cd and cc and validar_par_contas(cd, cc):
-            return {"conta_debito": cd, "conta_credito": cc,
-                    "desc_debito": dd, "desc_credito": dc}
-        if cd:
-            cc, dc = _melhor_conta(df_contas, DESCONTO_CRED_SAL_PAGAR_POS,
-                                   DESCONTO_CRED_SAL_PAGAR_NEG + [(_norm(cd), -1000)],
-                                   score_min=30, filtro_posicao="PASSIVO")
-        return {"conta_debito": cd, "conta_credito": cc,
-                "desc_debito": dd, "desc_credito": dc}
-
-    if evento_tipo == "Informativa":
-        cd, dd = _melhor_conta(df_contas, INFORMATIVO_DEBITO_POS, INFORMATIVO_DEBITO_NEG,
-                               score_min=30, filtro_posicao="DRE")
-        cc, dc = _melhor_conta(df_contas, INFORMATIVO_CREDITO_POS, INFORMATIVO_CREDITO_NEG,
-                               score_min=30, filtro_posicao="PASSIVO")
-        if cd and cc and validar_par_contas(cd, cc):
-            return {"conta_debito": cd, "conta_credito": cc,
-                    "desc_debito": dd, "desc_credito": dc}
-
-    return vazio
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# CLASSIFICADOR LOCAL DE RUBRICAS
-# ══════════════════════════════════════════════════════════════════════════
-KWORDS_RUBRICA: dict[str, list[str]] = {
-    "Custo Direto de Produção": [
-        "MATERIA PRIMA","MATERIAL APLICADO","MAO DE OBRA DIRETA",
-        "SALARIOS E ORDENADOS CUSTOS","PRO LABORE CUSTOS",
-        "13 SALARIO CUSTOS","FERIAS CUSTOS","INSS CUSTOS",
-        "FGTS CUSTOS","INDUSTRIALIZACAO","PRODUCAO",
-    ],
-    "Custo Direto de Serviços": [
-        "SERVICOS PRESTADOS","MAO DE OBRA","PRESTACAO DE SERVICO",
-        "TERCEIRIZACAO","SUBCONTRATACAO","CUSTOS SERVICOS",
-    ],
-    "Custo Indireto de Produção": [
-        "OVERHEAD","MANUTENCAO","DEPRECIACAO","ENERGIA ELETRICA",
-        "AGUA ESGOTO","COMBUSTIVEL","ALUGUEL EQUIPAMENTO",
-        "MATERIAL CONSUMO INDIRETO","LOCACAO","CONDOMINIO",
-    ],
-    "Despesa com Vendas": [
-        "COMISSAO","COMISSOES","PROPAGANDA","PUBLICIDADE",
-        "BONIFICACAO","REPRESENTACAO","FRETE VENDA",
-    ],
-    "Despesa Financeira": [
-        "JUROS","IOF","TARIFA BANCARIA","VARIACAO CAMBIAL",
-        "VARIACAO MONETARIA","DESCONTO CONCEDIDO","MORA",
-        "EMPRESTIMO","FINANCIAMENTO",
-    ],
-    "Despesa Não Operacional": [
-        "IRPJ","CSLL","PROVISAO IR","PROVISAO CSLL",
-        "PERDA","ALIENACAO","SINISTRO","BAIXA ATIVO",
-    ],
-    "Despesa Administrativa": [
-        "SALARIO","ORDENADO","PRO LABORE","GRATIFICACAO",
-        "BONUS","PREMIO","HORAS EXTRAS","ADICIONAL NOTURNO",
-        "ADICIONAL","INSALUBRIDADE","PERICULOSIDADE",
-        "FERIAS","ABONO","13 SALARIO","AVISO PREVIO",
-        "RESCISAO","INDENIZACAO","LICENCA","AFASTAMENTO",
-        "REPOUSO","DSR","REFLEXO","MEDIA","DIFERENCA",
-        "ADIANTAMENTO","VALE TRANSPORTE","VALE REFEICAO",
-        "ALIMENTACAO","CESTA BASICA","AUXILIO","REEMBOLSO",
-        "PARTICIPACAO LUCROS","PLR","COMPL SALARIAL",
-        "DESC ADIANT","DESCONTO ADIANT","INSS","FGTS",
-        "IMPOSTO DE RENDA","IRRF","PENSAO ALIMENTICIA",
-        "PLANO SAUDE","PLANO ODONTOLOGICO","COPARTICIPACAO",
-        "EMPRESTIMO CONSIGNADO","SINDICATO","CONTRIBUICAO",
-        "DIAS NORMAIS","HORAS NORMAIS","SALDO SALARIO",
-        "ESTOURO","TROCO","FECHAMENTO","DIAS FERIAS",
-    ],
-    "Encargo Patronal": [
-        "INSS EMPRESA","INSS TERCEIROS","INSS ACID","INSS ACIDENTE",
-        "INSS PATRONAL","ENCARGO PATRONAL","CONTRIBUICAO PATRONAL",
-        "CONTRIBUICAO PREVIDENCIARIA PATRONAL",
-        "RAT","FAP","SISTEMA S","SESI","SENAI","SEBRAE","SESC","SENAC",
-        "INSS 13","INSS FERIAS","INSS EMPRESA FERIAS","INSS EMPRESA 13",
-    ],
-}
-
-TIPOS_NAO_CUSTO = {"Desconto", "Informativa", "Inf. Dedutora"}
-
-
-def classificar_rubrica_local(nome_rubrica: str, tipo_rubrica: str, tipo_folha: str = "1") -> dict:
-    if tipo_folha == "2":
-        return {"grupo": "Encargo Patronal", "confianca": "alta"}
-    nome_norm = _norm(nome_rubrica)
-    grupos_candidatos = list(KWORDS_RUBRICA.keys())
-    if tipo_rubrica in TIPOS_NAO_CUSTO:
-        grupos_candidatos = [g for g in grupos_candidatos if "Custo" not in g]
-    scores: dict[str, int] = {g: 0 for g in grupos_candidatos}
-    for grupo in grupos_candidatos:
-        for kw in KWORDS_RUBRICA[grupo]:
-            if _norm(kw) in nome_norm:
-                scores[grupo] += len(kw.split())
-    melhor = max(scores, key=lambda g: scores[g])
-    s = scores[melhor]
-    if s >= 4:   c = "alta"
-    elif s >= 2: c = "media"
-    elif s >= 1: c = "baixa"
+    pos = {s: i for i, s in enumerate(df["segs"])}
+    df["anc"] = [[pos[p] for p in _prefixos(s) if p in pos] for s in df["segs"]]  # raiz primeiro
+    pais = {j for a in df["anc"] for j in a}
+    inferido = ["S" if i in pais else "A" for i in range(len(df))]
+    if "tipo" in df.columns:
+        t = df["tipo"].str.upper().str[:1]
+        df["tipo"] = [x if x in ("A", "S") else inf for x, inf in zip(t, inferido)]
     else:
-        melhor, c = "Despesa Administrativa", "baixa"
-    return {"grupo": melhor, "confianca": c}
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# PARSE DO PLANO DE CONTAS
-# ══════════════════════════════════════════════════════════════════════════
-def parse_plano_contas(file_bytes: bytes, filename: str, log: list) -> pd.DataFrame:
-    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else "xlsx"
-    df_raw = None
-    if ext == "xlsx":
-        try:
-            df_raw = pd.read_excel(BytesIO(file_bytes), sheet_name=0, header=0, dtype=str, engine="openpyxl")
-            log.append("Plano de Contas: lido como .xlsx.")
-        except Exception as e:
-            log.append(f"ERRO ao abrir .xlsx: {e}"); return pd.DataFrame()
-    else:
-        for engine in ["xlrd", "openpyxl"]:
-            try:
-                df_raw = pd.read_excel(BytesIO(file_bytes), sheet_name=0, header=0, dtype=str, engine=engine)
-                log.append(f"Plano de Contas: lido como .xls (engine={engine})."); break
-            except Exception as e:
-                log.append(f"  engine={engine} falhou: {e}"); df_raw = None
-    if df_raw is None:
-        log.append("ERRO: Não foi possível abrir o Plano de Contas."); return pd.DataFrame()
-
-    cols = [str(c).strip() for c in df_raw.columns]
-    idx_empresa = idx_reduzido = idx_classificacao = idx_tipo = idx_descricao = None
-    for i, c in enumerate(cols):
-        cl = c.lower()
-        if idx_empresa is None and (i == 0 or "plano de contas" in cl or (cl == "empresa" and i < 3)):
-            idx_empresa = i
-        if idx_reduzido is None and ("reduzido" in cl or "unnamed: 1" in cl):
-            idx_reduzido = i
-        if idx_classificacao is None and ("classifica" in cl or "unnamed: 2" in cl):
-            idx_classificacao = i
-        if idx_tipo is None and ("unnamed: 3" in cl or cl == "tipo" or ("tipo" in cl and "ecf" not in cl and i < 6)):
-            idx_tipo = i
-        if idx_descricao is None and ("descri" in cl or "unnamed: 4" in cl):
-            idx_descricao = i
-
-    if idx_empresa is None:       idx_empresa = 0
-    if idx_reduzido is None:      idx_reduzido = 1
-    if idx_classificacao is None: idx_classificacao = 2
-    if idx_tipo is None:          idx_tipo = 3
-    if idx_descricao is None:     idx_descricao = 4
-
-    registros, ignorados = [], 0
-    for _, row in df_raw.iterrows():
-        empresa_val = str(row.iloc[idx_empresa]).strip()
-        reduzido    = str(row.iloc[idx_reduzido]).strip()
-        classif     = str(row.iloc[idx_classificacao]).strip()
-        tipo_raw    = str(row.iloc[idx_tipo]).strip().upper()
-        nome        = str(row.iloc[idx_descricao]).strip()
-        if empresa_val.lower().startswith("total"): ignorados += 1; continue
-        if empresa_val.lower() in ("nan","none",""): ignorados += 1; continue
-        if classif.endswith(".0"): classif = classif[:-2]
-        if not re.match(r'^\d+$', classif): ignorados += 1; continue
-        if tipo_raw not in ("S","A"): ignorados += 1; continue
-        if not nome or nome.lower() in ("nan","none",""): ignorados += 1; continue
-        if reduzido.endswith(".0"): reduzido = reduzido[:-2]
-        if reduzido.lower() in ("nan","none",""): reduzido = classif
-        nome_norm   = _norm(nome)
-        score_folha = calcular_score_folha(nome_norm)
-        registros.append({
-            "reduzido": reduzido, "classificacao": classif,
-            "nome_conta": nome_norm, "nome_original": nome,
-            "tipo": tipo_raw, "score_folha": score_folha,
-        })
-
-    df = pd.DataFrame(registros).drop_duplicates(subset=["classificacao"]).reset_index(drop=True)
-    n_a = len(df[df["tipo"] == "A"]); n_s = len(df[df["tipo"] == "S"])
-    n_folha = len(df[(df["tipo"] == "A") & (df["score_folha"] >= SCORE_MINIMO_FOLHA)])
-    n_dre = len(df[(df["tipo"] == "A") & df["classificacao"].apply(_e_conta_dre)])
-    n_pas = len(df[(df["tipo"] == "A") & df["classificacao"].apply(_e_conta_passivo)])
-    log.append(f"Plano de Contas OK: {len(df)} contas ({n_a} analíticas · {n_s} sintéticas · "
-               f"{ignorados} ignoradas · {n_folha} de folha · {n_dre} DRE · {n_pas} Passivo)")
+        df["tipo"] = inferido
+    df["desc_norm"] = df["descricao"].map(norm)
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# KEYWORDS POR GRUPO
-# ══════════════════════════════════════════════════════════════════════════
-KWORDS_DEBITO: dict[str, list[str]] = {
-    "Custo Direto de Produção": [
-        "MATERIA-PRIMA","MATERIAL APLICADO","MAO-DE-OBRA DIRETA",
-        "SALARIOS E ORDENADOS CUSTOS","PRO-LABORE CUSTOS",
-        "13 SALARIO CUSTOS","FERIAS CUSTOS","INSS CUSTOS","FGTS CUSTOS",
-        "INDUSTRIALIZACAO","CUSTOS DIRETOS DE PRODUCAO",
-    ],
-    "Custo Direto de Serviços": [
-        "CUSTOS DIRETOS DA PRODUCAO DE SERVICOS","MAO-DE-OBRA DIRETA",
-        "SALARIOS E ORDENADOS","INSS","FGTS","FERIAS","13 SALARIO",
-        "CUSTOS SERVICOS","VALE TRANSPORTE","ALIMENTACAO",
-    ],
-    "Custo Indireto de Produção": [
-        "MAO-DE-OBRA INDIRETA","MATERIAIS DE CONSUMO INDIRETO",
-        "ALUGUEIS","DEPRECIACOES","COMBUSTIVEIS","ENERGIA ELETRICA",
-        "AGUA E ESGOTO","CUSTOS INDIRETOS","MANUTENCAO","LOCACAO",
-    ],
-    "Despesa Administrativa": [
-        "DESPESAS COM PESSOAL","SALARIOS E ORDENADOS","PRO-LABORE",
-        "PREMIOS E GRATIFICACOES","13 SALARIO","FERIAS","INSS","FGTS",
-        "INDENIZACOES","ASSISTENCIA MEDICA","VALE TRANSPORTE",
-        "PIS S/ FOLHA","ALIMENTACAO","VALE REFEICAO","HORAS EXTRAS",
-        "PENSAO ALIMENTICIA","CESTA BASICA","COMISSOES",
-        "ALUGUEIS","ENERGIA ELETRICA","AGUA E ESGOTO","TELEFONE",
-        "SEGUROS","MATERIAL DE ESCRITORIO","DEPRECIACAO",
-        "COMBUSTIVEIS","MATERIAIS DE CONSUMO","CONDOMINIOS",
-        "DESPESAS GERAIS","FRETES E CARRETOS","MANUTENCAO",
-        "VIAGENS","REFEICOES","SERVICOS TOMADOS","BENS DE PEQUENO VALOR",
-    ],
-    "Despesa com Vendas": [
-        "DESPESAS COM VENDAS","COMISSOES SOBRE VENDAS","COMISSOES",
-        "PROPAGANDA E PUBLICIDADE","BONIFICACAO","FRETES E CARRETOS",
-        "MANUTENCAO DE VEICULOS","VIAGENS","ALUGUEIS",
-    ],
-    "Despesa Financeira": [
-        "DESPESAS FINANCEIRAS","JUROS PASSIVOS","VARIACOES MONETARIAS",
-        "VARIACOES CAMBIAIS","DESCONTOS FINANCEIROS CONCEDIDOS",
-        "JUROS DE MORA","JUROS E COMISSOES BANCARIAS",
-        "JUROS SOBRE EMPRESTIMOS","MULTAS PASSIVAS","TARIFA BANCARIA",
-        "EMPRESTIMO / FINANCIAMENTO","IOF",
-    ],
-    "Despesa Não Operacional": [
-        "DESPESAS NAO OPERACIONAIS","PERDAS NA ALIENACAO",
-        "RESULTADO NEGATIVO NA ALIENACAO","RESULTADO NEGATIVO DE SINISTRO",
-        "OUTRAS BAIXAS DO ATIVO","BAIXAS DE INVESTIMENTOS",
-        "BAIXAS DE IMOBILIZADO","PROVISAO IRPJ","PROVISAO CSLL",
-        "PERDAS POR FALTA NO INVENTARIO",
-    ],
-    "Encargo Patronal": [
-        "DESPESAS COM PESSOAL","INSS","ENCARGOS SOCIAIS",
-        "CONTRIBUICAO PREVIDENCIARIA","CONTRIBUICAO PATRONAL",
-        "SALARIOS E ORDENADOS","CUSTOS DIRETOS",
-        "MAO-DE-OBRA DIRETA","MAO-DE-OBRA INDIRETA",
-        "INSS CUSTOS","FGTS CUSTOS",
-    ],
-}
-
-KWORDS_CREDITO: dict[str, list[str]] = {
-    "Custo Direto de Produção": [
-        "SALARIOS E ORDENADOS A PAGAR","PRO-LABORE A PAGAR",
-        "FERIAS A PAGAR","13 SALARIO A PAGAR","INSS A RECOLHER",
-        "FGTS A RECOLHER","PROVISOES PARA FERIAS","PROVISOES PARA 13",
-        "OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS","PROVISOES",
-        "OBRIGACOES TRABALHISTA",
-    ],
-    "Custo Direto de Serviços": [
-        "SALARIOS E ORDENADOS A PAGAR","FERIAS A PAGAR","13 SALARIO A PAGAR",
-        "INSS A RECOLHER","FGTS A RECOLHER","PROVISOES PARA FERIAS",
-        "PROVISOES PARA 13","OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS",
-        "PROVISOES","OBRIGACOES TRABALHISTA",
-    ],
-    "Custo Indireto de Produção": [
-        "SALARIOS E ORDENADOS A PAGAR","FERIAS A PAGAR","INSS A RECOLHER",
-        "FGTS A RECOLHER","PROVISOES PARA FERIAS","PROVISOES PARA 13",
-        "OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS","PROVISOES",
-        "CONTAS A PAGAR","ALUGUEIS A PAGAR",
-    ],
-    "Despesa Administrativa": [
-        "SALARIOS E ORDENADOS A PAGAR","PRO-LABORE A PAGAR",
-        "GRATIFICACOES A PAGAR","FERIAS A PAGAR","RESCISOES A PAGAR",
-        "13 SALARIO A PAGAR","PENSAO ALIMENTICIA A PAGAR",
-        "COMISSOES A PAGAR","AUTONOMOS A PAGAR","INDENIZACOES A PAGAR",
-        "INSS A RECOLHER","FGTS A RECOLHER","PIS S/ FOLHA A RECOLHER",
-        "IRRF S/ FOLHA","CONTRIBUICOES SINDICAIS",
-        "PROVISOES PARA FERIAS","PROVISOES PARA 13",
-        "INSS SOBRE PROVISOES","FGTS SOBRE PROVISOES",
-        "OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS","PROVISOES",
-        "OBRIGACOES TRABALHISTA","CONTAS A PAGAR",
-        "ENERGIA ELETRICA A PAGAR","TELEFONE A PAGAR",
-        "ALUGUEIS A PAGAR","OUTRAS OBRIGACOES",
-    ],
-    "Despesa com Vendas": [
-        "SALARIOS E ORDENADOS A PAGAR","FERIAS A PAGAR","13 SALARIO A PAGAR",
-        "INSS A RECOLHER","FGTS A RECOLHER","PROVISOES PARA FERIAS",
-        "PROVISOES PARA 13","OBRIGACOES COM O PESSOAL","OBRIGACOES SOCIAIS",
-        "PROVISOES","OBRIGACOES TRABALHISTA","CONTAS A PAGAR","OUTRAS OBRIGACOES",
-    ],
-    "Despesa Financeira": [
-        "CONTAS A PAGAR","OUTRAS OBRIGACOES",
-        "IMPOSTOS E CONTRIBUICOES A RECOLHER",
-    ],
-    "Despesa Não Operacional": [
-        "CONTAS A PAGAR","OUTRAS OBRIGACOES",
-        "IMPOSTOS E CONTRIBUICOES A RECOLHER",
-        "PROVISAO PARA IMPOSTO DE RENDA S/ LUCRO",
-        "PROVISAO P/ CONTRIBUICAO SOCIAL S/ LUCRO",
-        "IMPOSTO DE RENDA A RECOLHER","CONTRIBUICAO SOCIAL A RECOLHER",
-    ],
-    "Encargo Patronal": [
-        "INSS A RECOLHER","OBRIGACOES SOCIAIS","OBRIGACOES TRABALHISTA",
-        "OBRIGACOES TRABALHISTAS E PREVIDENCIARIA",
-        "IMPOSTOS E CONTRIBUICOES A RECOLHER",
-        "CONTRIBUICOES SINDICAIS","PIS S/ FOLHA A RECOLHER",
-    ],
-}
-
-GRUPOS_LISTA = [
-    "Despesa Administrativa","Despesa com Vendas","Despesa Financeira",
-    "Despesa Não Operacional","Custo Direto de Produção",
-    "Custo Direto de Serviços","Custo Indireto de Produção",
-    "Encargo Patronal","Outro",
-]
+NAT_ROT = {"A": "Ativo", "P": "Passivo/PL", "R": "Receita", "D": "Custo/Despesa",
+           "X": "Ignorar (apuração/compensação)", "": "(decidir no nível abaixo)"}
+ROT_NAT = {v: k for k, v in NAT_ROT.items()}
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# FUNÇÕES DE FILTRO / FORMATAÇÃO
-# ══════════════════════════════════════════════════════════════════════════
-def _analiticas(df: pd.DataFrame) -> pd.DataFrame:
-    return df[df["tipo"] == "A"].copy() if not df.empty else df
-
-def _analiticas_folha(df: pd.DataFrame) -> pd.DataFrame:
-    df_a = _analiticas(df)
-    if df_a.empty: return df_a
-    if "score_folha" in df_a.columns:
-        f = df_a[df_a["score_folha"] >= SCORE_MINIMO_FOLHA]
-        return f if not f.empty else df_a
-    return df_a
-
-def _fmt_opcoes(df_f: pd.DataFrame) -> list[str]:
-    return [""] + [f"{r['reduzido']} - {r['nome_original']}" for _, r in df_f.iterrows()]
-
-def _conta_bate(nome: str, kws: list[str]) -> bool:
-    return any(_norm(k) in nome for k in kws)
-
-def filtrar_contas_por_grupo(df_contas: pd.DataFrame, grupo: str,
-                              aplicar_filtro_folha: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
-    df_a = _analiticas_folha(df_contas) if (aplicar_filtro_folha and grupo != "Outro") else _analiticas(df_contas)
-    if df_a.empty: return pd.DataFrame(), pd.DataFrame()
-    kw_d = KWORDS_DEBITO.get(grupo, [])
-    kw_c = KWORDS_CREDITO.get(grupo, [])
-    df_d = df_a[df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_d))] if (kw_d and grupo != "Outro") else df_a
-    df_c = df_a[df_a["nome_conta"].apply(lambda n: _conta_bate(n, kw_c))] if (kw_c and grupo != "Outro") else df_a
-    return df_d, df_c
-
-def classificar_contas(df_contas: pd.DataFrame, grupo: str) -> tuple[list[str], list[str]]:
-    df_d, df_c = filtrar_contas_por_grupo(df_contas, grupo)
-    return _fmt_opcoes(df_d), _fmt_opcoes(df_c)
-
-def extrair_codigo(opcao: str) -> str:
-    if not opcao or " - " not in opcao: return opcao or ""
-    return opcao.split(" - ")[0].strip()
-
-def extrair_descricao(opcao: str) -> str:
-    if not opcao or " - " not in opcao: return ""
-    p = opcao.split(" - ", 1)
-    return p[1].strip() if len(p) > 1 else ""
-
-def buscar_conta_por_reduzido(df_contas: pd.DataFrame, reduzido: str) -> str:
-    if df_contas is None or df_contas.empty or not reduzido: return ""
-    r = df_contas[df_contas["reduzido"] == str(reduzido).strip()]
-    return r.iloc[0]["nome_original"] if not r.empty else ""
-
-def _idx(opcoes: list[str], valor: str) -> int:
-    if not valor: return 0
-    for i, op in enumerate(opcoes):
-        if op.startswith(valor): return i
-    return 0
+def natureza_desc(d) -> str:
+    if tem(d, "APURAC*", "ENCERRAMENTO*", "CONTAS DE COMPENSACAO", "COMPENSACAO ATIVA",
+           "COMPENSACAO PASSIVA"):
+        return "X"
+    if tem(d, "PASSIVO", "PATRIMONIO LIQUIDO"):
+        return "P"
+    if tem(d, "ATIVO"):
+        return "A"
+    r, dsp = tem(d, "RECEITA*"), tem(d, "CUSTO*", "DESPESA*")
+    if r and not dsp: return "R"
+    if dsp and not r: return "D"
+    return ""
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# CLASSIFICAÇÃO AUTOMÁTICA
-# ══════════════════════════════════════════════════════════════════════════
-def classificar_todos_eventos(eventos: list, catalog: dict,
-                               df_contas: pd.DataFrame | None, log: list) -> dict:
-    resultado: dict[str, dict] = {}
-    chaves = {(ev["cod"], ev["tipo_folha"]) for ev in eventos}
-    for cod, tipo_folha in chaves:
-        info  = catalog.get(cod, {})
-        nome  = info.get("descricao", cod)
-        tipo  = info.get("tipo", "Provento")
-        cl    = classificar_rubrica_local(nome, tipo, tipo_folha)
-        grupo = cl["grupo"]; conf = cl["confianca"]
-        cd = cc = dd = dc = ""
-        curto = False
-        if df_contas is not None and not df_contas.empty:
-            dep = gerar_depara_evento_conta(cod, nome, tipo, grupo, df_contas, tipo_folha)
-            cd, cc, dd, dc = dep["conta_debito"], dep["conta_credito"], dep["desc_debito"], dep["desc_credito"]
-            if not validar_par_contas(cd, cc):
-                curto = True; cd = dd = ""
-                log.append(f"⚠️ CURTO-CIRCUITO: {cod} ({nome}) — Débito resetado.")
-        resultado[f"{cod}_{tipo_folha}"] = {
-            "grupo": grupo, "confianca": conf,
-            "conta_debito": cd, "conta_credito": cc,
-            "desc_debito": dd, "desc_credito": dc,
-            "tipo_folha": tipo_folha, "curto_circuito": curto,
-        }
-    n_a = sum(1 for v in resultado.values() if v["confianca"] == "alta")
-    n_m = sum(1 for v in resultado.values() if v["confianca"] == "media")
-    n_b = sum(1 for v in resultado.values() if v["confianca"] == "baixa")
-    n_p = sum(1 for v in resultado.values() if v["grupo"] == "Encargo Patronal")
-    n_c = sum(1 for v in resultado.values() if v.get("curto_circuito"))
-    log.append(f"Classificação: {len(resultado)} rubricas → 🟢{n_a} alta · 🟡{n_m} média · 🔴{n_b} baixa · "
-               f"🏛️{n_p} Patronal · ⚡{n_c} curto-circuito")
-    return resultado
-
-
-def classificar_eventos_por_grupo_cc(eventos: list, catalog: dict, grupo_cc: str,
-                                      df_contas: pd.DataFrame, log: list) -> dict:
-    resultado: dict[str, dict] = {}
-    for ev in eventos:
-        cod = ev["cod"]; tf = ev["tipo_folha"]
-        info = catalog.get(cod, {}); nome = info.get("descricao", cod); tipo = info.get("tipo", "Provento")
-        grupo_ef = "Encargo Patronal" if tf == "2" else grupo_cc
-        dep = gerar_depara_evento_conta(cod, nome, tipo, grupo_ef, df_contas, tf)
-        curto = False
-        if not validar_par_contas(dep["conta_debito"], dep["conta_credito"]):
-            curto = True; dep["conta_debito"] = dep["desc_debito"] = ""
-            log.append(f"⚠️ CURTO-CIRCUITO (CC): {cod} ({nome}) — Débito resetado.")
-        resultado[f"{cod}_{tf}"] = {
-            "grupo": grupo_ef, "confianca": "manual" if tf != "2" else "alta",
-            "conta_debito": dep["conta_debito"], "conta_credito": dep["conta_credito"],
-            "desc_debito": dep["desc_debito"], "desc_credito": dep["desc_credito"],
-            "tipo_folha": tf, "curto_circuito": curto,
-        }
-    log.append(f"CC '{grupo_cc}': {len(resultado)} evento(s).")
-    return resultado
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# PARSE TXT RUBRICAS
-# ══════════════════════════════════════════════════════════════════════════
-def parse_rubricas_txt(file_bytes: bytes, log: list) -> dict:
-    catalog = {}
-    TIPO_MAP = {"P": "Provento", "D": "Desconto", "I": "Informativa", "ID": "Inf. Dedutora"}
-    try:
-        texto = file_bytes.decode("latin-1", errors="replace")
-    except Exception as e:
-        log.append(f"ERRO ao decodificar rubricas.txt: {e}"); return catalog
-    for raw in texto.splitlines():
-        raw = raw.strip()
-        if not raw: continue
-        partes = raw.split("\t")
-        if len(partes) < 5: continue
-        cod = partes[2].strip(); descricao = partes[3].strip(); tipo_raw = partes[4].strip().upper()
-        if not cod: continue
-        tipo_norm = TIPO_MAP.get(tipo_raw)
-        if tipo_norm is None: continue
-        if cod not in catalog:
-            catalog[cod] = {"tipo": tipo_norm, "descricao": descricao}
-    log.append(f"rubricas.txt: {len(catalog)} código(s).")
-    return catalog
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# PARSE PDF
-# ══════════════════════════════════════════════════════════════════════════
-IGNORE_PATTERNS = [
-    r"^RELAÇÃO DE RUBRICAS", r"^Página", r"^Emissão",
-    r"^Hora:", r"^Empresa:", r"^Código\s+Descrição", r"^\s*$",
-]
-SECAO_TIPO_FOLHA = {
-    "Folha Normal": "1", "Empresa": "2", "Férias": "3",
-    "Rescisão": "4", "Provisão de Férias": "5",
-    "Provisão de 13º": "6", "Provisão de 13o": "6",
-}
-SECAO_TIPO_FOLHA_DESC = {
-    "1": "Folha Normal", "2": "Empresa", "3": "Férias",
-    "4": "Rescisão", "5": "Provisão de Férias", "6": "Provisão de 13º",
-}
-RE_SECAO = re.compile(
-    r"^(Folha Normal|Empresa|Férias|Rescisão|"
-    r"Provisão de Férias|Provisão de 13º|Provisão de 13o)$",
-    re.IGNORECASE,
-)
-RE_CC    = re.compile(r"^Centro de Custo:\s*(\d+)\s+(.+)$", re.IGNORECASE)
-RE_EVENT = re.compile(r"^\s*(\d+)\s+(.+)$")
-
-
-def should_ignore(line: str) -> bool:
-    return any(re.search(p, line, re.IGNORECASE) for p in IGNORE_PATTERNS)
-
-
-def parse_nao_configurados_pdf(file_bytes: bytes, log: list) -> list:
-    eventos, vistos = [], set()
-    tipo_folha_atual = "1"; cc_cod_atual = cc_nome_atual = ""
-    with pdfplumber.open(BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if not text: continue
-            for raw in text.splitlines():
-                line = raw.strip()
-                if not line: continue
-                m = RE_SECAO.match(line)
-                if m:
-                    sec = m.group(1).strip()
-                    for k, v in SECAO_TIPO_FOLHA.items():
-                        if k.lower() in sec.lower():
-                            tipo_folha_atual = v; break
-                    continue
-                m = RE_CC.match(line)
-                if m:
-                    cc_cod_atual = m.group(1).strip(); cc_nome_atual = m.group(2).strip(); continue
-                if should_ignore(line): continue
-                m = RE_EVENT.match(line)
-                if m:
-                    cod = m.group(1).strip(); desc = m.group(2).strip()
-                    if not cod.isdigit(): continue
-                    chave = (cod, tipo_folha_atual, cc_cod_atual)
-                    if chave not in vistos:
-                        vistos.add(chave)
-                        eventos.append({
-                            "cod": cod, "descricao_pdf": desc,
-                            "tipo_folha": tipo_folha_atual,
-                            "tipo_folha_desc": SECAO_TIPO_FOLHA_DESC.get(tipo_folha_atual, tipo_folha_atual),
-                            "centro_custo_cod": cc_cod_atual,
-                            "centro_custo_nome": cc_nome_atual,
-                        })
-    por_folha: dict[str, int] = {}
-    for ev in eventos:
-        d = ev["tipo_folha_desc"]; por_folha[d] = por_folha.get(d, 0) + 1
-    log.append(f"PDF: {len(eventos)} evento(s). [{' · '.join(f'{k}: {v}' for k,v in por_folha.items())}]")
-    return eventos
-
-
-def get_centros_custo_unicos(eventos: list) -> list[tuple[str, str]]:
-    vistos: dict[str, str] = {}
-    for ev in eventos:
-        cod = ev["centro_custo_cod"]; nome = ev["centro_custo_nome"]
-        if cod and cod not in vistos: vistos[cod] = nome
-    return list(vistos.items())
-
-
-def get_eventos_por_cc(eventos: list, cc_cod: str) -> list:
-    return [ev for ev in eventos if ev["centro_custo_cod"] == cc_cod]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-# GERA EXCEL — ETAPA 1
-# ══════════════════════════════════════════════════════════════════════════
-def gerar_excel_configuracao(eventos, catalog, cod_empresa, log,
-                              usa_separador=False, config_cc=None,
-                              df_contas=None, classif_auto=None) -> bytes:
+def tabela_naturezas(plano, salvo):
+    """Grupos de 1º e 2º nível com a natureza sugerida (ou a salva no perfil)."""
+    auto = plano["desc_norm"].map(natureza_desc)
     linhas = []
-    for ev in eventos:
-        cod = ev["cod"]; tf = ev["tipo_folha"]
-        info = catalog.get(cod, {}); tipo = info.get("tipo", "⚠️ Não encontrado")
-        desc_rubr = info.get("descricao", ev["descricao_pdf"]); cc_cod = ev["centro_custo_cod"]
-        cd = cc = hist = grupo = dd = dc = ""
-        curto = False
-        chave_auto = f"{cod}_{tf}"
-        if usa_separador and config_cc and cc_cod in config_cc:
-            cfg = config_cc[cc_cod]; hist = cfg.get("historico", "")
-            grupo = "Encargo Patronal" if tf == "2" else cfg.get("grupo", "")
-            if df_contas is not None and not df_contas.empty and grupo:
-                dep = gerar_depara_evento_conta(cod, desc_rubr, tipo, grupo, df_contas, tf)
-                cd, cc, dd, dc = dep["conta_debito"], dep["conta_credito"], dep["desc_debito"], dep["desc_credito"]
-                if not validar_par_contas(cd, cc):
-                    curto = True; cd = dd = ""
-        elif classif_auto and chave_auto in classif_auto:
-            auto = classif_auto[chave_auto]
-            grupo = auto.get("grupo",""); cd = auto.get("conta_debito",""); cc = auto.get("conta_credito","")
-            dd = auto.get("desc_debito",""); dc = auto.get("desc_credito",""); curto = auto.get("curto_circuito", False)
-        obs = "⚡ CURTO-CIRCUITO: Débito resetado" if curto else ""
-        linhas.append({
-            "Cód. Empresa": cod_empresa, "Cód. Evento": cod,
-            "Descrição (PDF)": ev["descricao_pdf"], "Descrição (Rubricas)": desc_rubr,
-            "Tipo Rubrica": tipo, "Tipo Folha (Nº)": tf,
-            "Tipo Folha": ev["tipo_folha_desc"], "Cód. Centro de Custo": cc_cod,
-            "Centro de Custo": ev["centro_custo_nome"], "Grupo de Despesa": grupo,
-            "Usa Separador": "Sim" if usa_separador else "Não",
-            "Conta Débito": cd, "Descrição Conta Débito": dd,
-            "Conta Crédito": cc, "Descrição Conta Crédito": dc,
-            "Cód. Histórico": "", "Histórico": hist, "Observação": obs,
+    for r in [i for i, a in enumerate(plano["anc"]) if not a]:
+        cr = plano.at[r, "classificacao"]
+        vr = salvo.get(cr, auto[r])
+        linhas.append({"Classificação": cr, "Descrição": plano.at[r, "descricao"], "Nível": 1,
+                       "Natureza": NAT_ROT.get(vr, NAT_ROT[""])})
+        for i, a in enumerate(plano["anc"]):
+            if len(a) == 1 and a[0] == r and plano.at[i, "tipo"] == "S":
+                ci = plano.at[i, "classificacao"]
+                vi = salvo.get(ci, "" if auto[r] else auto[i])
+                linhas.append({"Classificação": ci, "Descrição": plano.at[i, "descricao"], "Nível": 2,
+                               "Natureza": NAT_ROT.get(vi, NAT_ROT[""])})
+    return pd.DataFrame(linhas)
+
+
+def aplicar_naturezas(plano, ov):
+    """Níveis 1-2: vence o mais profundo definido na tabela. Abaixo disso: detecção automática."""
+    auto = plano["desc_norm"].map(natureza_desc).tolist()
+    cls = plano["classificacao"].tolist()
+    out = []
+    for i, anc in enumerate(plano["anc"]):
+        cadeia = list(anc) + [i]
+        v = next((ov[cls[j]] for j in reversed(cadeia[:2]) if ov.get(cls[j])), "")
+        if not v:
+            v = next((auto[j] for j in cadeia[2:] if auto[j]), "")
+        out.append(v or "?")
+    return out
+
+
+class Resolvedor:
+    def __init__(self, plano):
+        self.an = plano[plano["tipo"] == "A"]
+        self.idx = plano.drop_duplicates("reduzido").set_index("reduzido")
+        self.ov = {}
+        self.cache = {}
+
+    @staticmethod
+    def chave(alvo, grupo):
+        return f"{alvo}@{grupo if ALVOS[alvo][0] in (G, GD) else '*'}"
+
+    def candidatos(self, alvo, grupo):
+        escopo, _, alts = ALVOS[alvo]
+        bases = []
+        if escopo in (G, GD) and grupo:
+            gs = _segs(grupo)
+            bases.append(self.an[self.an["segs"].apply(lambda s: dentro(s, gs))])
+        if escopo == GD:
+            bases.append(self.an[self.an["nat"] == "D"])
+        if escopo in ("A", "P", "R", "D"):
+            bases.append(self.an[self.an["nat"] == escopo])
+        for base in bases:
+            for must, nots in alts:
+                ok = base["desc_norm"].apply(
+                    lambda d: all(casa(d, x) for x in must) and not any(casa(d, x) for x in nots))
+                c = base[ok]
+                if not c.empty:
+                    return c.assign(_n=c["desc_norm"].str.len()).sort_values(["_n", "classificacao"])
+        return self.an.iloc[0:0]
+
+    def sugestao(self, alvo, grupo):
+        k = (alvo, grupo)
+        if k not in self.cache:
+            c = self.candidatos(alvo, grupo)
+            self.cache[k] = ((c.iloc[0]["reduzido"], c.iloc[0]["descricao"], len(c))
+                             if not c.empty else ("", "", 0))
+        return self.cache[k]
+
+    def valida(self, cod):
+        return bool(cod) and cod in self.idx.index and self.idx.loc[cod, "tipo"] == "A"
+
+    def conta(self, alvo, grupo):
+        k = self.chave(alvo, grupo)
+        if k in self.ov:  # a tabela de contas-chave governa o que é usado
+            v = self.ov[k]
+            return (v, self.idx.loc[v, "descricao"]) if self.valida(v) else None
+        cod, desc, _ = self.sugestao(alvo, grupo)
+        return (cod, desc) if cod else None
+
+    def no_escopo(self, cod, alvo, grupo):
+        esc, row = ALVOS[alvo][0], self.idx.loc[cod]
+        if esc in (G, GD):
+            return dentro(row["segs"], _segs(grupo or "")) or (esc == GD and row["nat"] == "D")
+        return row["nat"] == esc
+
+    def resolver(self, alvos, grupo):
+        if not alvos:
+            return "", "", ""
+        for a in alvos:
+            r = self.conta(a, grupo)
+            if r:
+                aviso = "" if a == alvos[0] else f"alternativa: {ALVOS[alvos[0]][1]} → {ALVOS[a][1]}"
+                return r[0], r[1], aviso
+        return "", "", f"❌ sem conta '{ALVOS[alvos[0]][1]}'"
+
+
+def grupos_resultado(plano):
+    """Grupo imediato de cada conta analítica de salários com natureza Custo/Despesa."""
+    out, vistos = [], set()
+    desc = plano["desc_norm"].tolist()
+    for i in range(len(plano)):
+        if plano.at[i, "tipo"] != "A" or plano.at[i, "nat"] != "D" or not casa_alvo(desc[i], "SALARIOS"):
+            continue
+        anc = plano.at[i, "anc"]
+        if not anc or anc[-1] in vistos:
+            continue
+        g = anc[-1]
+        vistos.add(g)
+        out.append({
+            "mascara": plano.at[g, "classificacao"], "descricao": plano.at[g, "descricao"],
+            "pai": plano.at[anc[-2], "descricao"] if len(anc) >= 2 else "",
+            "cadeia": " ".join(desc[j] for j in list(plano.at[g, "anc"]) + [g]),
         })
-    df = pd.DataFrame(linhas)
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Configuração", index=False)
-        _formatar_planilha_config(writer.sheets["Configuração"], df)
-        if df_contas is not None and not df_contas.empty:
-            df_exp = df_contas[["reduzido","classificacao","nome_original","tipo","score_folha"]].copy()
-            df_exp.columns = ["Código Reduzido","Classificação","Nome da Conta","Tipo (S/A)","Score Folha"]
-            df_exp.to_excel(writer, sheet_name="Plano de Contas", index=False)
-            _formatar_planilha_saida(writer.sheets["Plano de Contas"])
-    output.seek(0); log.append(f"Excel gerado: {len(linhas)} linha(s).")
-    return output.read()
+    return sorted(out, key=lambda c: c["mascara"])
 
 
-def _formatar_planilha_config(ws, df: pd.DataFrame):
-    borda = Border(left=Side(style="thin"), right=Side(style="thin"),
-                   top=Side(style="thin"), bottom=Side(style="thin"))
-    larguras = {"A":12,"B":12,"C":38,"D":38,"E":16,"F":14,"G":20,"H":18,
-                "I":22,"J":22,"K":14,"L":16,"M":38,"N":16,"O":38,"P":14,"Q":42,"R":30}
-    for col, w in larguras.items(): ws.column_dimensions[col].width = w
-    COLS_EDIT = {12,14,16,17,18}; COLS_AUTO = {13,15}; COLS_INFO = {10,11}
-    TIPO_COR = {"Provento":"D4EDDA","Desconto":"F8D7DA","Informativa":"CCE5FF","Inf. Dedutora":"FFF3CD"}
-    COR_EMP = "E8D5FF"; COR_CC = "FFD700"
-    for ci, cell in enumerate(ws[1], 1):
-        if ci in COLS_EDIT:   cell.fill = PatternFill("solid", fgColor="FF8000"); cell.font = Font(bold=True, color="FFFFFF", size=10)
-        elif ci in COLS_AUTO: cell.fill = PatternFill("solid", fgColor="28A745"); cell.font = Font(bold=True, color="FFFFFF", size=10)
-        elif ci in COLS_INFO: cell.fill = PatternFill("solid", fgColor="6C757D"); cell.font = Font(bold=True, color="FFFFFF", size=10)
-        else:                 cell.fill = PatternFill("solid", fgColor="444444"); cell.font = Font(bold=True, color="FFFFFF", size=10)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = borda
-    ws.row_dimensions[1].height = 32
-    for ri, row in enumerate(ws.iter_rows(min_row=2), 2):
-        tv = ws.cell(ri, 5).value or ""; tf = ws.cell(ri, 6).value or ""; obs = ws.cell(ri, 18).value or ""
-        if "CURTO-CIRCUITO" in str(obs).upper(): cor = COR_CC
-        elif str(tf).strip() == "2":             cor = COR_EMP
-        else:                                    cor = TIPO_COR.get(tv, "E2E3E5")
-        for ci, cell in enumerate(row, 1):
-            cell.border = borda; cell.alignment = Alignment(vertical="center", wrap_text=True)
-            if ci in COLS_EDIT:   cell.fill = PatternFill("solid", fgColor="FFF8F0"); cell.font = Font(size=10)
-            elif ci in COLS_AUTO: cell.fill = PatternFill("solid", fgColor="F0FFF4"); cell.font = Font(size=10, italic=True)
-            else:                 cell.fill = PatternFill("solid", fgColor=cor);      cell.font = Font(size=10)
-        ws.row_dimensions[ri].height = 18
-    ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
+def sugerir_grupo(nome_sep, cands):
+    n = norm(nome_sep)
+    if tem(n, "VENDA*", "COMERCI*", "LOJA*", "MARKETING"): chave = "VENDA*"
+    elif tem(n, "PRODU*", "FABRI*", "INDUSTR*", "OBRA*", "OPERAC*", "MANUTENC*"): chave = "CUSTO*"
+    else: chave = "ADMINISTRATIV*"
+    return next((i for i, c in enumerate(cands) if tem(c["cadeia"], chave)), 0)
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# GERA ARQUIVOS FINAIS — ETAPA 2
-# ══════════════════════════════════════════════════════════════════════════
-def ler_excel_preenchido(file_bytes: bytes, log: list) -> pd.DataFrame | None:
-    try: xls = pd.ExcelFile(BytesIO(file_bytes))
-    except Exception as e: log.append(f"ERRO ao abrir Excel: {e}"); return None
-    sheet = None
-    for c in ["Configuração","configuracao","Plan1","Sheet1"]:
-        if c in xls.sheet_names: sheet = c; break
-    if not sheet: sheet = xls.sheet_names[0]
-    try:
-        df = pd.read_excel(BytesIO(file_bytes), sheet_name=sheet, dtype=str)
-    except Exception as e: log.append(f"ERRO ao ler aba '{sheet}': {e}"); return None
-    df.columns = [str(c).strip() for c in df.columns]; df = df.dropna(how="all")
-    log.append(f"Excel preenchido: {len(df)} linha(s) na aba '{sheet}'.")
-    return df
+def existe_analitica(plano, mascara):
+    gs = _segs(mascara)
+    return bool(gs) and plano[plano["tipo"] == "A"]["segs"].apply(lambda s: dentro(s, gs)).any()
+
+# =====================================================================
+# 4. LEITURA DOS RELATÓRIOS DA FOLHA
+# =====================================================================
+def extrair_linhas(dados: bytes, nome: str):
+    if nome.lower().endswith(".pdf"):
+        if pdfplumber is None:
+            raise RuntimeError("Instale o pdfplumber: pip install pdfplumber")
+        linhas = []
+        with pdfplumber.open(io.BytesIO(dados)) as pdf:
+            for p in pdf.pages:
+                linhas.extend((p.extract_text() or "").splitlines())
+        return linhas
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return dados.decode(enc).splitlines()
+        except UnicodeDecodeError:
+            continue
 
 
-def _limpa(val) -> str:
-    if val is None: return ""
-    s = str(val).strip()
-    return "" if s.lower() in ("nan","none","") else s
+RE_RUB = re.compile(r"^\s*(\d{1,5})\s+(.*?)\s*"
+                    r"(Provento|Desconto|Informativa|Informat|Inf\.\s*dedutora|Inf\.\s*ded)")
+
+def _tipo_cad(t):
+    t = t.lower()
+    if t.startswith("prov"): return "Provento"
+    if t.startswith("desc"): return "Desconto"
+    if t.startswith("inf."): return "Inf. dedutora"
+    return "Informativa"
 
 
-def gerar_arquivos_finais(df: pd.DataFrame, cod_empresa_padrao: str, log: list) -> tuple[bytes, bytes]:
-    col_map: dict[str, str] = {}
-    for col in df.columns:
-        cl = col.lower()
-        if   "cód. empresa"           in cl or "cod. empresa"    in cl: col_map["empresa"]       = col
-        elif "cód. evento"            in cl or "cod. evento"     in cl: col_map["seq"]           = col
-        elif "tipo folha (nº)"        in cl or "tipo folha (n"   in cl: col_map["tipo"]          = col
-        elif "descrição (rubricas)"   in cl:                             col_map["desc"]          = col
-        elif "descrição (pdf)"        in cl and "desc" not in col_map:  col_map["desc"]          = col
-        elif "cód. centro de custo"   in cl:                             col_map["cc"]            = col
-        elif "conta débito"           in cl or "conta debito"    in cl: col_map["debito"]        = col
-        elif "descrição conta débito" in cl or "descricao conta debito" in cl: col_map["desc_deb"] = col
-        elif "conta crédito"          in cl or "conta credito"   in cl: col_map["credito"]       = col
-        elif "descrição conta crédito" in cl or "descricao conta credito" in cl: col_map["desc_cred"] = col
-        elif "cód. histórico"         in cl or "cod. historico"  in cl: col_map["historico"]     = col
-        elif "histórico"              in cl and "cód" not in cl and "cod" not in cl: col_map["historico_texto"] = col
-        elif "observação"             in cl:                             col_map["observacao"]    = col
-        elif "usa separador"          in cl:                             col_map["usa_separador"] = col
-
-    TIPO_COL = ("Tipo da Integração (1 - Folha mensal; 2 - Empresa; "
-                "3 - Férias; 4 - Rescisao; 5 - Prov. Férias; 6 - Prov. 13)")
-    linhas_evento, linhas_integra, linhas_integra_xls = [], [], []
-    sem_conta = com_conta = cc_count = 0
-
-    for _, row in df.iterrows():
-        empresa     = _limpa(row.get(col_map.get("empresa",""),"")) or cod_empresa_padrao
-        seq         = _limpa(row.get(col_map.get("seq",""),""))
-        tipo        = _limpa(row.get(col_map.get("tipo",""),""))
-        desc        = _limpa(row.get(col_map.get("desc",""),""))
-        cc          = _limpa(row.get(col_map.get("cc",""),""))
-        debito      = _limpa(row.get(col_map.get("debito",""),""))
-        credito     = _limpa(row.get(col_map.get("credito",""),""))
-        historico   = _limpa(row.get(col_map.get("historico",""),""))
-        complemento = _limpa(row.get(col_map.get("historico_texto",""),""))
-        usa_sep     = _limpa(row.get(col_map.get("usa_separador",""),""))
-        if not seq: continue
-        if debito and credito and debito == credito:
-            cc_count += 1; debito = ""
-            log.append(f"⚠️ CURTO-CIRCUITO exportação: Seq {seq} — Débito removido.")
-        sep_val = "1" if usa_sep.lower() == "sim" else "0"
-        if debito or credito: com_conta += 1
-        else: sem_conta += 1
-        linhas_evento.append({
-            "Código da Empresa": empresa, "Centro de custo": cc,
-            "Código Sequencial da Integração": seq, TIPO_COL: tipo,
-            "Descrição": desc, "Código da Conta Débito": debito,
-            "Código da Conta Crédito": credito, "Código do Histórico": historico,
-            "Complemento": complemento,
-        })
-        linhas_integra.append({
-            "Código da Empresa": empresa, "Separador": sep_val,
-            "Código Sequencial da Integração": seq, TIPO_COL: tipo,
-            "Código da Rúbrica Selecionada": seq,
-        })
-        linhas_integra_xls.append({
-            "Código da Empresa": empresa, "Centro de Custo": cc,
-            "Código Sequencial da Integração": seq, TIPO_COL: tipo,
-            "Descrição": desc, "Código da Conta Débito": debito,
-            "Código da Conta Crédito": credito, "Código do Histórico": historico,
-        })
-    log.append(f"Arquivos → Com conta: {com_conta} | Sem conta: {sem_conta} | CC corrigido: {cc_count}")
-
-    buf_ev = BytesIO()
-    with pd.ExcelWriter(buf_ev, engine="openpyxl") as w:
-        pd.DataFrame(linhas_integra).to_excel(w, sheet_name="integra", index=False)
-        pd.DataFrame(linhas_evento).to_excel(w,  sheet_name="evento",  index=False)
-        for sn in ["integra","evento"]: _formatar_planilha_saida(w.sheets[sn])
-    buf_ev.seek(0)
-
-    buf_int = BytesIO()
-    with pd.ExcelWriter(buf_int, engine="openpyxl") as w:
-        pd.DataFrame(linhas_integra_xls).to_excel(w, sheet_name="Plan1", index=False)
-        _formatar_planilha_saida(w.sheets["Plan1"])
-    buf_int.seek(0)
-    return buf_ev.read(), buf_int.read()
+@st.cache_data(show_spinner=False)
+def parse_cadastro(dados: bytes, nome: str):
+    linhas = extrair_linhas(dados, nome)
+    cab = next((re.split(r"P[áa]gina", l, flags=re.I)[0].strip() for l in linhas if l.strip()), "")
+    cad = {}
+    for l in linhas:
+        m = RE_RUB.match(l)
+        if m and int(m.group(1)) not in cad:
+            desc = m.group(2).strip()
+            cad[int(m.group(1))] = {"descricao": desc, "desc_norm": norm(desc), "tipo": _tipo_cad(m.group(3))}
+    return cab, cad
 
 
-def _formatar_planilha_saida(ws):
-    borda = Border(left=Side(style="thin"), right=Side(style="thin"),
-                   top=Side(style="thin"), bottom=Side(style="thin"))
-    for cell in ws[1]:
-        cell.fill = PatternFill("solid", fgColor="444444")
-        cell.font = Font(bold=True, color="FFFFFF", size=10)
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = borda
-    ws.row_dimensions[1].height = 32
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.border = borda; cell.alignment = Alignment(vertical="center"); cell.font = Font(size=10)
-    for col in ws.columns:
-        ml = 0; cl = get_column_letter(col[0].column)
-        for cell in col:
-            try:
-                if cell.value: ml = max(ml, len(str(cell.value)))
-            except: pass
-        ws.column_dimensions[cl].width = min(max(ml + 2, 10), 50)
-    ws.freeze_panes = "A2"
+RE_EMPRESA = re.compile(r"^\s*Empresa\s*:\s*(\d+)\s*-\s*(.+)$", re.I)
+RE_SEP = re.compile(r"^\s*(Centro de Custo|Filial|Servi[çc]o)\s*:\s*(\d*)\s*(.*)$", re.I)
+RE_ITEM = re.compile(r"^\s*(\d{1,5})\s+(\S.*)$")
+IGNORAR = ("PAGINA", "EMISSAO", "HORA ", "RELACAO DE RUBRICAS", "CODIGO DESCRICAO")
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# INTERFACE STREAMLIT
-# ══════════════════════════════════════════════════════════════════════════
-def main():
-    st.set_page_config(page_title="Domínio | Integração Contábil",
-                       page_icon="🟠", layout="wide", initial_sidebar_state="expanded")
-    apply_tr_theme()
+@st.cache_data(show_spinner=False)
+def parse_pendencias(dados: bytes, nome: str):
+    cab = {"codigo": "", "nome": ""}
+    itens, vistos = [], set()
+    secao, sep_cod, sep_nome, sep_tipo = None, "", "", ""
+    for bruta in extrair_linhas(dados, nome):
+        txt = bruta.strip()
+        if not txt:
+            continue
+        n = norm(txt)
+        m = RE_EMPRESA.match(txt)
+        if m:
+            cab["codigo"], cab["nome"] = m.group(1), m.group(2).strip()
+            continue
+        if n in SECOES:
+            if SECOES[n] != secao:
+                secao, sep_cod, sep_nome = SECOES[n], "", ""
+            continue
+        m = RE_SEP.match(txt)
+        if m:
+            sep_tipo, sep_cod, sep_nome = m.group(1), m.group(2).strip(), m.group(3).strip()
+            continue
+        if n.startswith(IGNORAR):
+            continue
+        m = RE_ITEM.match(txt)
+        if m and secao:
+            chave = (secao, sep_cod, int(m.group(1)))
+            if chave not in vistos:
+                vistos.add(chave)
+                itens.append({"secao": secao, "sep_tipo": sep_tipo, "sep_cod": sep_cod,
+                              "sep_nome": sep_nome, "codigo": int(m.group(1)),
+                              "descricao": m.group(2).strip()})
+    return cab, itens
 
-    st.markdown(f"""
-        <div style="background:#444444; padding:24px 28px 18px 28px;
-                    border-radius:8px; border-top:6px solid #FF8000; margin-bottom:28px;">
-            <h2 style="color:#FF8000; margin:0;">
-                📊 Integração Contábil — Domínio Sistemas &nbsp;|&nbsp; {VERSAO}
-            </h2>
-            <p style="color:#DDDDDD; margin:6px 0 0 0;">
-                <b>Etapa 1:</b> PDF + TXT + Plano de Contas → classifica automaticamente → gera Excel.<br>
-                <b>Etapa 2:</b> Excel preenchido → gera <b>evento exemplo.xlsx</b> e <b>integra exemplo.xlsx</b>.<br>
-                <span style="color:#CC99FF;">🏛️ Tipo Folha "Empresa" → <b>Encargo Patronal</b> automático.</span><br>
-                <span style="color:#FFD700;">⚡ Detecção de rubricas: busca exata + fallback rapidfuzz
-                {"✅ ativo" if RAPIDFUZZ_OK else "⚠️ não instalado — pip install rapidfuzz"}.</span>
-            </p>
-        </div>""", unsafe_allow_html=True)
-
-    with st.sidebar:
-        st.markdown("### ⚙️ Configurações")
-        cod_empresa = st.text_input("Código da empresa", value="45")
-        st.markdown("---")
-        st.markdown(f"### 🔍 rapidfuzz\n{'✅ Ativo' if RAPIDFUZZ_OK else '⚠️ Não instalado'}")
-        if not RAPIDFUZZ_OK:
-            st.code("pip install rapidfuzz")
-        st.markdown("---")
-        st.markdown("### 🎨 Legenda")
-        for cor, txt in [("🟢","Provento"),("🔴","Desconto"),("🔵","Informativa"),
-                         ("🟡","Inf. Dedutora"),("🟣","Encargo Patronal"),
-                         ("🟠","Campos editáveis"),("🌿","Preenchimento auto"),("⭐","Curto-circuito")]:
-            st.markdown(f"{cor} {txt}")
-        st.markdown("---")
-        st.markdown("### 📋 Roteamento V6.5")
-        st.markdown(
-            "**Proventos — Débito DRE por tipo:**\n"
-            "- Dias Normais/Saldo → Salários e Ordenados\n"
-            "- Horas Extras/Reflexo → Horas Extras\n"
-            "- Férias/1/3/Abono → Férias\n"
-            "- Rescisão/Aviso/13ºResc → Indenizações\n"
-            "- Vale Transporte → Vale Transporte\n"
-            "- Vale Refeição/Aliment. → Alimentação\n\n"
-            "**Proventos — Crédito Passivo:**\n"
-            "- Normal → Salários a Pagar\n"
-            "- Férias → Férias a Pagar\n"
-            "- Rescisão → Rescisões a Pagar\n\n"
-            "**Descontos — Crédito:**\n"
-            "- INSS → INSS a Recolher\n"
-            "- IRRF → IRRF S/ Folha\n"
-            "- Sindicato → Contrib. Sindicais\n"
-            "- **TODOS OS OUTROS → Salários a Pagar**\n\n"
-            "**Fuzzy threshold por tipo:**\n"
-            "- Horas Extras / Férias / Rescisão / 13º → 85%\n"
-            "- Consignado / INSS / IRRF / VT / VR → 88%\n"
-            "- Pensão Alimentícia → 90%\n"
-            "- PIS s/ Folha → 92%\n"
-            "- FGTS → exata apenas (sigla curta)"
-        )
-        st.markdown(f"---\n**Versão:** {VERSAO}")
-
-    _defaults = {
-        "log": [f"Pronto. Versão {VERSAO} | rapidfuzz: {'ativo' if RAPIDFUZZ_OK else 'não instalado'}"],
-        "excel_config": None, "evento_xlsx": None, "integra_xls": None,
-        "df_preview": None, "n_eventos": 0, "df_contas": None,
-        "eventos_parsed": None, "catalog_parsed": None,
-        "config_cc": {}, "classif_auto": {},
-        "_contas_fid": None, "_contas_name": None,
-    }
-    for k, v in _defaults.items():
-        if k not in st.session_state: st.session_state[k] = v
-
-    st.markdown("## 📋 Etapa 1 — Gerar Excel para Preenchimento")
-    col1, col2, col3 = st.columns(3)
-    with col1: pdf_file = st.file_uploader("1️⃣ PDF — Rubricas Não Configuradas", type=["pdf"], key="pdf_e1")
-    with col2: txt_file = st.file_uploader("2️⃣ TXT — Rubricas (catálogo)", type=["txt"], key="txt_e1")
-    with col3: contas_file = st.file_uploader("3️⃣ XLS/XLSX — Plano de Contas", type=["xls","xlsx"], key="contas_e1")
-
-    if contas_file is not None:
-        fid = getattr(contas_file, "file_id", id(contas_file))
-        if st.session_state._contas_fid != fid:
-            lt: list[str] = []
-            df_c = parse_plano_contas(contas_file.read(), contas_file.name, lt)
-            st.session_state.df_contas    = df_c if not df_c.empty else None
-            st.session_state._contas_fid  = fid
-            st.session_state._contas_name = contas_file.name
-            st.session_state.config_cc    = {}
-            st.session_state.log.extend(lt)
-    else:
-        if st.session_state._contas_fid is not None:
-            st.session_state.df_contas = None; st.session_state._contas_fid = None
-            st.session_state._contas_name = None; st.session_state.config_cc = {}
-
-    df_pc = st.session_state.df_contas
-    if df_pc is not None and not df_pc.empty:
-        n_a = len(df_pc[df_pc["tipo"]=="A"]); n_s = len(df_pc[df_pc["tipo"]=="S"])
-        n_f = len(df_pc[(df_pc["tipo"]=="A") & (df_pc["score_folha"] >= SCORE_MINIMO_FOLHA)]) if "score_folha" in df_pc.columns else 0
-        n_dre = len(df_pc[(df_pc["tipo"]=="A") & df_pc["classificacao"].apply(_e_conta_dre)])
-        n_pas = len(df_pc[(df_pc["tipo"]=="A") & df_pc["classificacao"].apply(_e_conta_passivo)])
-        st.success(f"✅ **{st.session_state._contas_name}**: {len(df_pc)} contas "
-                   f"({n_a} analíticas · {n_s} sintéticas · **{n_f}** de folha · "
-                   f"**{n_dre}** DRE · **{n_pas}** Passivo)")
-
-        with st.expander("🔍 Preview das contas-chave detectadas (V6.5)", expanded=False):
-            previews = [
-                ("Salários (DRE)", DRE_SALARIO_POS, DRE_SALARIO_NEG, "DRE"),
-                ("Horas Extras (DRE)", DRE_HORAS_EXTRAS_POS, DRE_HORAS_EXTRAS_NEG, "DRE"),
-                ("Férias (DRE)", DRE_FERIAS_POS, DRE_FERIAS_NEG, "DRE"),
-                ("Rescisão/Indenizações (DRE)", DRE_RESCISAO_POS, DRE_RESCISAO_NEG, "DRE"),
-                ("13º Salário (DRE)", DRE_13_SALARIO_POS, DRE_13_SALARIO_NEG, "DRE"),
-                ("Vale Transporte (DRE)", DRE_VALE_TRANSPORTE_POS, DRE_VALE_TRANSPORTE_NEG, "DRE"),
-                ("Alimentação/VR (DRE)", DRE_VALE_REFEICAO_POS, DRE_VALE_REFEICAO_NEG, "DRE"),
-                ("Salários a Pagar (Passivo)", PASSIVO_SALARIOS_POS, PASSIVO_SALARIOS_NEG, "PASSIVO"),
-                ("Férias a Pagar (Passivo)", PASSIVO_FERIAS_POS, PASSIVO_FERIAS_NEG, "PASSIVO"),
-                ("Rescisões a Pagar (Passivo)", PASSIVO_RESCISAO_POS, PASSIVO_RESCISAO_NEG, "PASSIVO"),
-                ("INSS a Recolher (Passivo)", DESCONTO_CRED_INSS_POS, DESCONTO_CRED_INSS_NEG, "PASSIVO"),
-                ("IRRF s/ Folha (Passivo)", DESCONTO_CRED_IRRF_POS, DESCONTO_CRED_IRRF_NEG, "PASSIVO"),
-                ("Outros Descontos → Sal. a Pagar", DESCONTO_CRED_SAL_PAGAR_POS, DESCONTO_CRED_SAL_PAGAR_NEG, "PASSIVO"),
-                ("Consignado (Ativo/Passivo)", CONSIGNADO_CREDITO_POS, CONSIGNADO_CREDITO_NEG, ""),
-                ("Encargo Patronal Débito (DRE)", INFORMATIVO_DEBITO_POS, INFORMATIVO_DEBITO_NEG, "DRE"),
-                ("FGTS a Recolher (Passivo)", FGTS_CREDITO_POS, FGTS_CREDITO_NEG, "PASSIVO"),
-            ]
-            cols_p = st.columns(4)
-            for i, (lbl, pos, neg, filtro) in enumerate(previews):
-                with cols_p[i % 4]:
-                    st.markdown(f"**{lbl}**")
-                    cod_t, desc_t = _melhor_conta(df_pc, pos, neg, 30, filtro_posicao=filtro)
-                    st.info(f"`{cod_t}` — {desc_t[:25] if desc_t else '—'}" if cod_t else "⚠️ Não encontrada")
-    elif contas_file is not None:
-        st.error("❌ Não foi possível carregar o Plano de Contas.")
-
-    st.markdown("---")
-    st.markdown("### ⚙️ Configuração de Separador")
-    usa_separador = st.radio("Os lançamentos usam separador por Centro de Custo?",
-                              ["Não","Sim"], index=0, horizontal=True)
-    usa_sep_bool = (usa_separador == "Sim")
-
-    if usa_sep_bool and st.session_state.eventos_parsed:
-        ccs = get_centros_custo_unicos(st.session_state.eventos_parsed)
-        if ccs:
-            st.markdown("#### 🏢 Grupo de Despesa por Centro de Custo")
-            nao_cl = [f"CC {cc} — {nm}" for cc, nm in ccs
-                      if not st.session_state.config_cc.get(cc, {}).get("grupo")]
-            if nao_cl:
-                with st.expander(f"⚠️ {len(nao_cl)} CC(s) sem grupo", expanded=True):
-                    for item in nao_cl: st.markdown(f"- {item}")
-            else:
-                st.success("✅ Todos os CCs têm grupo definido!")
-            st.markdown("---")
-            for cc_cod, cc_nome in ccs:
-                cfg_at = st.session_state.config_cc.get(cc_cod, {})
-                grupo_ok = bool(cfg_at.get("grupo"))
-                evs_cc = get_eventos_por_cc(st.session_state.eventos_parsed, cc_cod)
-                n_emp = sum(1 for ev in evs_cc if ev["tipo_folha"] == "2")
-                titulo = f"{'✅' if grupo_ok else '⚠️'} CC {cc_cod} — {cc_nome} ({len(evs_cc)} evento(s)"
-                if n_emp > 0: titulo += f" · 🏛️ {n_emp} Encargo Patronal"
-                titulo += ")"
-                with st.expander(titulo, expanded=not grupo_ok):
-                    if n_emp > 0:
-                        st.info(f"🏛️ **{n_emp} evento(s)** do Tipo Folha **Empresa** → **Encargo Patronal** automático.")
-                    gi = GRUPOS_LISTA.index(cfg_at.get("grupo","Despesa Administrativa")) if cfg_at.get("grupo") in GRUPOS_LISTA else 0
-                    gs = st.selectbox("📂 Grupo de Despesa do CC", GRUPOS_LISTA, index=gi, key=f"g_{cc_cod}")
-                    hs = st.text_input("📋 Histórico padrão", value=cfg_at.get("historico",""), key=f"h_{cc_cod}", placeholder="Ex: 001")
-                    st.session_state.config_cc[cc_cod] = {"grupo": gs, "historico": hs}
-    elif usa_sep_bool:
-        st.info("⬆️ Faça upload do PDF e clique em **▶ Gerar Excel** para configurar os CCs.")
-
-    st.markdown("---")
-    col_b1, col_b2 = st.columns(2)
-    with col_b1:
-        gerar_excel = st.button("▶ Gerar Excel de Configuração",
-                                 disabled=(pdf_file is None or txt_file is None),
-                                 use_container_width=True, type="primary")
-    with col_b2:
-        if st.button("🗑 Limpar tudo", use_container_width=True):
-            for k in ["log","excel_config","evento_xlsx","integra_xls","df_preview","n_eventos",
-                      "df_contas","eventos_parsed","catalog_parsed","config_cc","classif_auto",
-                      "_contas_fid","_contas_name"]:
-                st.session_state[k] = (["Campos limpos."] if k == "log" else
-                                        0 if k == "n_eventos" else
-                                        {} if k in ("config_cc","classif_auto") else None)
-            st.rerun()
-
-    if gerar_excel and pdf_file and txt_file:
-        log: list[str] = ["[Etapa 1] Iniciando..."]
-        with st.spinner("Lendo rubricas.txt..."): catalog = parse_rubricas_txt(txt_file.read(), log)
-        with st.spinner("Lendo PDF..."): eventos = parse_nao_configurados_pdf(pdf_file.read(), log)
-        st.session_state.eventos_parsed = eventos; st.session_state.catalog_parsed = catalog
-        with st.spinner("🔍 Classificando com regras V6.5 + rapidfuzz..."):
-            ca = classificar_todos_eventos(eventos, catalog, df_pc, log)
-            st.session_state.classif_auto = ca
-        if usa_sep_bool:
-            for cc_cod, _ in get_centros_custo_unicos(eventos):
-                if cc_cod not in st.session_state.config_cc:
-                    evs_cc = [ev for ev in eventos if ev["centro_custo_cod"] == cc_cod and ev["tipo_folha"] != "2"]
-                    grupos_cc = [ca.get(f"{ev['cod']}_{ev['tipo_folha']}", {}).get("grupo","Despesa Administrativa") for ev in evs_cc]
-                    gd = max(set(grupos_cc), key=grupos_cc.count) if grupos_cc else "Despesa Administrativa"
-                    st.session_state.config_cc[cc_cod] = {"grupo": gd, "historico": ""}
-                    log.append(f"CC {cc_cod}: grupo sugerido → {gd}")
-        if not eventos: log.append("AVISO: Nenhum evento encontrado.")
-        else:
-            with st.spinner("Gerando Excel..."):
-                eb = gerar_excel_configuracao(eventos, catalog, cod_empresa, log,
-                                              usa_separador=usa_sep_bool,
-                                              config_cc=st.session_state.config_cc if usa_sep_bool else None,
-                                              df_contas=df_pc, classif_auto=ca)
-            st.session_state.excel_config = eb; st.session_state.n_eventos = len(eventos)
-            linhas_prev = []
-            for ev in eventos:
-                cod_ev = ev["cod"]; tf = ev["tipo_folha"]
-                info = catalog.get(cod_ev, {}); cc_cod = ev["centro_custo_cod"]
-                chave = f"{cod_ev}_{tf}"
-                if usa_sep_bool and cc_cod in st.session_state.config_cc:
-                    cfg_cc = st.session_state.config_cc[cc_cod]
-                    grupo = "Encargo Patronal" if tf == "2" else cfg_cc.get("grupo","")
-                    if df_pc is not None and not df_pc.empty and grupo:
-                        dep = gerar_depara_evento_conta(cod_ev, info.get("descricao", ev["descricao_pdf"]),
-                                                        info.get("tipo","Provento"), grupo, df_pc, tf)
-                        cd, cc2 = dep["conta_debito"], dep["conta_credito"]
-                    else: cd = cc2 = ""
-                    conf = "manual" if tf != "2" else "alta"
-                else:
-                    auto = ca.get(chave, {}); grupo = auto.get("grupo","—")
-                    cd, cc2, conf = auto.get("conta_debito",""), auto.get("conta_credito",""), auto.get("confianca","")
-                cc_alert = ""
-                if cd and cc2 and cd == cc2: cc_alert = "⚡"; cd = ""
-                ok = "✅" if (cd and cc2) else ("⚡" if cc_alert else "⚠️")
-                linhas_prev.append({"Código": cod_ev, "Descrição": ev["descricao_pdf"],
-                                    "Tipo": info.get("tipo","⚠️"), "Tipo Folha": ev["tipo_folha_desc"],
-                                    "Centro Custo": ev["centro_custo_nome"], "Grupo": grupo,
-                                    "Confiança": conf, "Conta Débito": cd, "Conta Crédito": cc2, "Status": ok})
-            st.session_state.df_preview = pd.DataFrame(linhas_prev)
-        st.session_state.log = log; st.rerun()
-
-    if st.session_state.excel_config is not None:
-        st.success(f"✅ Excel gerado — {st.session_state.n_eventos} evento(s)")
-        st.download_button("⬇ Baixar Excel de Configuração", data=st.session_state.excel_config,
-                           file_name="configuracao_rubricas_dominio.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           use_container_width=True, type="primary")
-        if st.session_state.df_preview is not None:
-            df = st.session_state.df_preview
-            total = len(df); p = len(df[df["Tipo"]=="Provento"]); d = len(df[df["Tipo"]=="Desconto"])
-            i = len(df[df["Tipo"]=="Informativa"]); id_ = len(df[df["Tipo"]=="Inf. Dedutora"])
-            nf = len(df[df["Tipo"].str.startswith("⚠️",na=False)])
-            ok = len(df[df["Status"]=="✅"]) if "Status" in df.columns else 0
-            nok = len(df[df["Status"]=="⚠️"]) if "Status" in df.columns else 0
-            ncc = len(df[df["Status"]=="⚡"]) if "Status" in df.columns else 0
-            np_ = len(df[df["Grupo"]=="Encargo Patronal"]) if "Grupo" in df.columns else 0
-            cols_m = st.columns(9)
-            for cm, lbl, val in zip(cols_m,
-                ["📋 Total","🟢 Proventos","🔴 Descontos","🔵 Informativas","🟡 Inf.Ded.",
-                 "⚠️ Tipo n/id","✅ Completos","⚡ Curto-circ.","🏛️ Patronal"],
-                [total, p, d, i, id_, nf, ok, ncc, np_]):
-                cm.metric(lbl, val)
-            if ncc > 0:
-                st.warning(f"⚡ **{ncc} lançamento(s)** com curto-circuito — Débito resetado.")
-            if nok > 0:
-                st.info(f"⚠️ **{nok} lançamento(s)** sem conta definida — verifique o plano de contas.")
-            def hl(row):
-                t = str(row.get("Tipo","")); tf = str(row.get("Tipo Folha","")); g = str(row.get("Grupo",""))
-                s = str(row.get("Status",""))
-                if s == "⚡":                              return ["background-color:#FFD700"]*len(row)
-                if tf == "Empresa" or g == "Encargo Patronal": return ["background-color:#E8D5FF"]*len(row)
-                if t == "Provento":                        return ["background-color:#d4edda"]*len(row)
-                if t == "Desconto":                        return ["background-color:#f8d7da"]*len(row)
-                if t == "Informativa":                     return ["background-color:#cce5ff"]*len(row)
-                if t == "Inf. Dedutora":                   return ["background-color:#fff3cd"]*len(row)
-                return ["background-color:#e2e3e5"]*len(row)
-            st.dataframe(df.head(150).style.apply(hl, axis=1), use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("## 📥 Etapa 2 — Importar Excel Preenchido → Gerar Arquivos Finais")
-    st.markdown("1. Baixe o Excel da Etapa 1 · 2. Revise contas · 3. Faça upload e clique em **▶ Gerar**")
-    excel_preenchido = st.file_uploader("4️⃣ Excel Preenchido (.xlsx)", type=["xlsx","xls"], key="excel_e2")
-    col_b3, _ = st.columns(2)
-    with col_b3:
-        gerar_finais = st.button("▶ Gerar Arquivos Finais", disabled=(excel_preenchido is None),
-                                  use_container_width=True, type="primary")
-    if gerar_finais and excel_preenchido:
-        log = list(st.session_state.log); log.append("[Etapa 2] Iniciando...")
-        with st.spinner("Lendo Excel..."):
-            df_p = ler_excel_preenchido(excel_preenchido.read(), log)
-        if df_p is not None:
-            with st.spinner("Gerando arquivos finais..."):
-                ev_b, int_b = gerar_arquivos_finais(df_p, cod_empresa, log)
-            st.session_state.evento_xlsx = ev_b; st.session_state.integra_xls = int_b
-        st.session_state.log = log; st.rerun()
-
-    if st.session_state.evento_xlsx is not None:
-        st.success("✅ Arquivos finais gerados!")
-        cd1, cd2 = st.columns(2)
-        with cd1:
-            st.download_button("⬇ Baixar evento exemplo.xlsx", data=st.session_state.evento_xlsx,
-                               file_name="evento exemplo.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True, type="primary")
-        with cd2:
-            st.download_button("⬇ Baixar integra exemplo.xlsx", data=st.session_state.integra_xls,
-                               file_name="integra exemplo.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True, type="primary")
-
-    st.markdown("---")
-    st.markdown("**Log de processamento**")
-    log_texto = "\n".join(st.session_state.log)
-    tem_erro = any(str(l).upper().startswith("ERRO") for l in st.session_state.log)
-    tem_cc   = any("CURTO-CIRCUITO" in str(l).upper() for l in st.session_state.log)
-    cor = "#D32F2F" if tem_erro else ("#FF8C00" if tem_cc else "#388E3C")
-    st.markdown(f"""<div style="background:#FCFCFC; border:1px solid {cor}; border-radius:6px;
-        padding:14px; font-family:Consolas,monospace; font-size:13px; white-space:pre-wrap;
-        max-height:300px; overflow-y:auto; color:#1F1F1F;">{log_texto}</div>""",
-        unsafe_allow_html=True)
+# =====================================================================
+# 5. REGRAS DETERMINÍSTICAS (devolvem conceitos, nunca contas)
+# =====================================================================
+def inferir_tipo(d):
+    if tem(d, "MATERN*") and not tem(d, "DESC*"): return "Provento"
+    if tem(d, "INSS") and tem(d, "A MAIOR") and not tem(d, "DESCONTO"): return "Provento"
+    if tem(d, "REEMBOLSO", "DEV", "DEVOLUCAO", "RESTITUI*"): return "Provento"
+    if tem(d, "FGTS", "CONTRIBUICAO SOCIAL", "CONTRIB SOCIAL", "BASE"): return "Informativa"
+    if tem(d, "DESC*") or (tem(d, "ESTOURO", "TROCO") and tem(d, "ANTERIOR")): return "Desconto"
+    if tem(d, "INSS", "IRRF", "IMPOSTO DE RENDA", "PENSAO", "EMPREST*", "CONTRIB*",
+           "MENSALIDADE", "FALTA*", "ATRASO*"): return "Desconto"
+    if tem(d, "VALE TRANSPORTE") and "%" in d: return "Desconto"
+    return "Provento"
 
 
-if __name__ == "__main__":
-    main()
+def tipo_rubrica(codigo, d, cad):
+    reg = cad.get(codigo)
+    if reg:
+        a, b = d, reg["desc_norm"]
+        if (SequenceMatcher(None, a, b).ratio() >= LIMIAR_SIMILARIDADE
+                or (min(len(a), len(b)) >= 8 and (a.startswith(b) or b.startswith(a)))):
+            return reg["tipo"], "Cadastro"
+        return inferir_tipo(d), f"Inferido — no cadastro o cód. {codigo} é '{reg['descricao']}'"
+    return inferir_tipo(d), "Inferido — código ausente no cadastro"
+
+
+def e_socio(d):
+    """Pró-labore e rubricas 'EMPREGADOR' (INSS/IRRF/troco do sócio)."""
+    if tem(d, "PRO LAB*", "PROLAB*"):
+        return True
+    return tem(d, "EMPREGADOR") and tem(d, "INSS", "IRRF", "TROCO", "ESTOURO", "ADTO", "ADIANT*")
+
+
+def passivo_secao(secao, d):
+    if secao == "Férias": return "FER_PAGAR"
+    if secao == "Rescisão": return "RESC_PAGAR"
+    if e_socio(d): return "PROLAB_PAGAR"
+    return "SAL_PAGAR"
+
+
+def alvo_adiant(d):
+    if e13(d): return "ADIANT_13"
+    if tem(d, "FERIAS"): return "ADIANT_FER"
+    return "ADIANT_SAL"
+
+
+def e_licenca_remunerada(d):
+    return tem(d, "LICENC*", "LIC") and tem(d, "REMUN*", "REM")
+
+
+def alvo_dre_provento(d):
+    if tem(d, "PRO LAB*", "PROLAB*"): return ["PRO_LABORE"]
+    if tem(d, "BOLSA", "ESTAGI*", "RECESSO"): return ["BOLSA", "SALARIOS"]
+    if e_licenca_remunerada(d) and not tem(d, "GOZ*"): return ["SALARIOS"]
+    if tem(d, "HORAS EXTRA*", "HORA EXTRA*", "EXTRAS", "BANCO DE HORAS"): return ["HE", "SALARIOS"]
+    if e13(d): return ["DECIMO"]
+    if tem(d, "FERIAS", "ABONO"): return ["FERIAS"]
+    if tem(d, "AVISO PREVIO", "INDENIZ*", "MULTA", "ESTABILIDADE"): return ["INDENIZ", "SALARIOS"]
+    if tem(d, "PREMIO*", "GRATIFIC*", "BONUS", "PLR", "PARTICIPACAO LUCRO*", "PARTIC LUCRO*"):
+        return ["PREMIOS", "SALARIOS"]
+    if tem(d, "COMISS*"): return ["COMISSOES", "PREMIOS", "SALARIOS"]
+    if tem(d, "VALE TRANSPORTE", "VT"): return ["VT"]
+    if tem(d, "PLANO DE SAUDE", "PLANO SAUDE", "ODONTO*", "ASSISTENCIA MEDICA"): return ["ASSIST"]
+    if tem(d, "REFEICAO", "ALIMENTACAO", "CESTA", "VR"): return ["ALIM"]
+    if tem(d, "SEGURO*"): return ["SEGURO", "ASSIST"]
+    if tem(d, "TREINAMENTO", "CURSO*"): return ["TREIN"]
+    return ["SALARIOS"]
+
+
+def classificar_provento(d, secao, baixa_prov):
+    L = passivo_secao(secao, d)
+    if tem(d, "ESTOURO", "TROCO"):
+        return ["ADIANT_SAL"], [L], "Estouro/troco: crédito a receber do empregado", False
+    if tem(d, "ADIANT*", "ADTO*"):
+        return [alvo_adiant(d)], [L], "Adiantamento pago: Ativo × obrigação", False
+    if tem(d, "DEV", "DEVOLUCAO", "ESTORNO") and tem(d, "EMPREST*", "CONSIG*"):
+        return ["EMPREST"], [L], "Devolução/estorno de consignado", True
+    if tem(d, "SALARIO FAMILIA", "SAL FAM*"):
+        if tem(d, "SEM COMPENSAC*"):
+            return ["SALARIOS"], [L], "Salário-família sem compensação na guia: custo", True
+        return ["BENEF_INSS"], [L], "Salário-família → conta-ponte até a compensação na guia", False
+    if tem(d, "MATERN*") and not tem(d, "DESC*", "DEDUC*"):
+        if tem(d, "INSS"):
+            return [], [], "Maternidade paga direto pelo INSS — não integrar", True
+        if not tem(d, "PRORROG*", "EMPREGADOR"):
+            return ["BENEF_INSS"], [L], "Salário-maternidade reembolsável → conta-ponte", False
+    if tem(d, "INSS", "IRRF") and tem(d, "A MAIOR", "DEVOL*", "RESTITUI*"):
+        return ["IRRF_REC" if tem(d, "IRRF") else "INSS_REC"], [L], "Restituição de retenção a maior", False
+    dre = alvo_dre_provento(d)
+    if baixa_prov and secao in ("Férias", "Rescisão", "13º Salário") and dre[0] in ("FERIAS", "DECIMO"):
+        return (["P_PROV_FER"] if dre[0] == "FERIAS" else ["P_PROV_13"]), [L], "Baixa contra a provisão", False
+    return dre, [L], "", False
+
+
+def classificar_desconto(d, secao):
+    L = passivo_secao(secao, d)
+    def r(c, obs="", rev=False): return [L], c, obs, rev
+    if tem(d, "ESTOURO", "TROCO"): return r(["ADIANT_SAL"], "Baixa de estouro/troco anterior")
+    if tem(d, "PENSAO"): return r(["PENSAO"], "Repasse ao beneficiário", True)
+    if tem(d, "INSS"): return r(["INSS_REC"])
+    if tem(d, "IRRF", "IMPOSTO DE RENDA"): return r(["IRRF_REC"])
+    if tem(d, "SAL FAM*", "SALARIO FAMILIA"):
+        return r(["BENEF_INSS"], "Estorno de salário-família pago a maior", True)
+    if tem(d, "ADIANT*", "ADTO*", "FERIAS PAGAS"): return r([alvo_adiant(d)], "Baixa do adiantamento")
+    if tem(d, "SINDICA*", "ASSISTENCIAL", "CONFEDERATIVA", "NEGOC*"): return r(["SIND_REC"])
+    if tem(d, "EMPREST*", "EMP", "CONSIG*", "CRED TRAB"): return r(["EMPREST"], "Consignado a repassar", True)
+    if tem(d, "PLANO", "ODONTO*", "COPARTICIP*", "ASSISTENCIA MEDICA", "FARMACIA", "SAUDE"):
+        return r(["ASSIST"], "Recuperação do custo do benefício")
+    if tem(d, "VALE TRANSPORTE", "VT"): return r(["VT"], "Recuperação dos 6% do VT")
+    if tem(d, "REFEICAO", "ALIMENTACAO", "VR", "CESTA", "SUPERMERCADO"):
+        return r(["ALIM"], "Recuperação do custo do benefício")
+    if tem(d, "SEGURO*"): return r(["SEGURO", "ASSIST"], "Recuperação do custo do benefício")
+    if tem(d, "AVISO PREVIO", "MULTA", "ESTABILIDADE", "INDENIZ*"):
+        return r(["INDENIZ"], "Indenização devida pelo empregado", True)
+    if e13(d) and tem(d, "AFAST*", "MATERN*"): return r(["DECIMO"], "Redução do custo de 13º")
+    if tem(d, "FALTA*", "ATRASO*", "DSR", "HORAS", "PAGO A MAIOR", "INATIVAS"):
+        return r(["SALARIOS"], "Redução do custo de salários")
+    return r([], "Desconto sem regra — definir conta manualmente", True)
+
+
+def classificar_informativa(d, tipo):
+    if tem(d, "BASE", "E SOCIAL", "INFORMATIVO", "HORAS CREDITO", "HORAS COMPENSADA",
+           "BANCO DE HORAS", "ADIANT*", "DEMONSTR*", "DEPENDENTE"):
+        return [], [], "Informativa de base/controle — não integrar", True
+    if tem(d, "FGTS", "CONTRIBUICAO SOCIAL", "CONTRIB SOCIAL"):
+        dre = ["INDENIZ", "FGTS"] if tem(d, "40%", "20%") else ["FGTS"]
+        if tem(d, "A MAIOR") or tipo == "Inf. dedutora":
+            return ["FGTS_REC"], dre, "Estorno de FGTS a maior", True
+        return dre, ["FGTS_REC"], "Encargo FGTS", False
+    if tem(d, "INSS"): return ["INSS"], ["INSS_REC"], "Encargo INSS", False
+    if tem(d, "PIS"): return ["PIS"], ["PIS_REC"], "Encargo PIS s/ folha", False
+    return [], [], "Informativa não reconhecida", True
+
+
+_BASE_PROV = {"D_PROV_FER": "FERIAS", "D_INSS_FER": "INSS", "D_FGTS_FER": "FGTS",
+              "D_PROV_13": "DECIMO", "D_INSS_13": "INSS", "D_FGTS_13": "FGTS"}
+
+
+def classificar_item(d, secao):
+    """Informações INSS e Provisões."""
+    if secao == "Informações INSS":
+        if tem(d, "RETENC*", "RETIDO"):
+            return ["INSS_REC"], ["INSS_COMP"], "Retenção s/ NF compensada na guia", True
+        return (["INSS_REC"], ["BENEF_INSS"], "Compensação na guia — baixa da conta-ponte",
+                not tem(d, "FAMILIA", "MATERN*"))
+    sfx = "FER" if "Férias" in secao else "13"
+    if tem(d, "FGTS"): dre, pas = f"D_FGTS_{sfx}", f"P_FGTS_{sfx}"
+    elif te
