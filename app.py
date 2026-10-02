@@ -688,4 +688,302 @@ def classificar_item(d, secao):
                 not tem(d, "FAMILIA", "MATERN*"))
     sfx = "FER" if "Férias" in secao else "13"
     if tem(d, "FGTS"): dre, pas = f"D_FGTS_{sfx}", f"P_FGTS_{sfx}"
-    elif te
+    elif tem(d, "INSS", "RAT", "TERCEIROS", "FAP"): dre, pas = f"D_INSS_{sfx}", f"P_INSS_{sfx}"
+    elif tem(d, "PIS"): dre, pas = "PIS", f"P_PIS_{sfx}"
+    else: dre, pas = f"D_PROV_{sfx}", f"P_PROV_{sfx}"
+    dres = [dre] + ([_BASE_PROV[dre]] if dre in _BASE_PROV else [])
+    if tem(d, "ESTORNO*", "BAIXA*", "REVERS*"):
+        return [pas], dres, "Estorno da provisão", False
+    return dres, [pas], "Constituição da provisão", False
+
+
+OBS_EMPRESA = {
+    "INSS": ("Encargo patronal INSS", False),
+    "INSS_SOCIO": ("INSS patronal s/ pró-labore", False),
+    "AUTONOMO": ("INSS patronal s/ autônomo — confirme a conta de despesa", True),
+    "SENAI": ("Adicional ao SENAI — confirme a forma de recolhimento", True),
+    "PIS": ("PIS s/ folha", False),
+    "FGTS": ("Encargo FGTS", False),
+    "CPRB": ("CPRB — dedução da receita bruta, fora do grupo de pessoal", False),
+    "SIND_PATRONAL": ("Contribuição sindical patronal (GRCS)", True),
+    "DEDUCAO": ("Compensação na guia — baixa da conta-ponte", False),
+    "ISENCAO": ("Isenção filantropia: valor não devido — não integrar", True),
+    None: ("Item patronal sem regra — definir manualmente", True),
+}
+
+
+def inferir_item_empresa(d):
+    if tem(d, "ISENCAO*", "FILANTROP*"): nat = "ISENCAO"
+    elif tem(d, "DEDUCAO*", "COMPENSACAO*"): nat = "DEDUCAO"
+    elif tem(d, "RECEITA BRUTA"): nat = "CPRB"
+    elif tem(d, "GRCS", "SINDICA*"): nat = "SIND_PATRONAL"
+    elif tem(d, "SENAI"): nat = "SENAI"
+    elif tem(d, "PIS"): nat = "PIS"
+    elif tem(d, "FGTS"): nat = "FGTS"
+    elif tem(d, "PRO LAB*"): nat = "INSS_SOCIO"
+    elif tem(d, "AUT", "AUTONOMO*"): nat = "AUTONOMO"
+    elif tem(d, "INSS", "RAT", "SAT", "FAP", "TERCEIROS", "ACID*"): nat = "INSS"
+    else: nat = None
+    return nat, ("13" if e13(d) else "F" if tem(d, "FERIAS") else "M")
+
+
+def classificar_item_empresa(codigo, d, baixa_prov):
+    cat = ITENS_EMPRESA.get(codigo)
+    if cat and SequenceMatcher(None, d, norm(cat[0])).ratio() >= LIMIAR_SIMILARIDADE:
+        _, nat, comp = cat
+        origem = "Catálogo Empresa"
+    else:
+        nat, comp = inferir_item_empresa(d)
+        origem = (f"Inferido — no catálogo o item {codigo} é '{cat[0]}'" if cat
+                  else f"Inferido — item {codigo} fora do catálogo")
+    sfx = {"F": "FER", "13": "13"}.get(comp)
+    pela_prov = bool(baixa_prov and sfx and nat in ("INSS", "SENAI", "PIS"))
+    if nat in ("INSS", "INSS_SOCIO", "AUTONOMO", "SENAI"):
+        deb, cred = ([f"P_INSS_{sfx}"] if pela_prov else ["INSS"]), ["INSS_REC"]
+    elif nat == "PIS":
+        deb, cred = ([f"P_PIS_{sfx}"] if pela_prov else ["PIS"]), ["PIS_REC"]
+    elif nat == "FGTS":
+        deb, cred = ["FGTS"], ["FGTS_REC"]
+    elif nat == "CPRB":
+        deb, cred = ["CPRB_DED"], ["CPRB_REC"]
+    elif nat == "SIND_PATRONAL":
+        deb, cred = ["SIND_PAT", "TAXAS_DIV"], ["SIND_REC"]
+    elif nat == "DEDUCAO":
+        deb, cred = ["INSS_REC"], ["BENEF_INSS"]
+    else:
+        deb, cred = [], []
+    obs, rev = OBS_EMPRESA.get(nat, OBS_EMPRESA[None])
+    if pela_prov:
+        obs += " — baixa contra a provisão"
+    return deb, cred, obs, rev, origem, nat
+
+
+def classificar(it, cad, baixa_prov):
+    d, sec, nat_item = norm(it["descricao"]), it["secao"], None
+    if sec == "Empresa":
+        tipo = "Item (Empresa)"
+        deb, cred, obs, rev, origem, nat_item = classificar_item_empresa(it["codigo"], d, baixa_prov)
+    elif sec in SECOES_DE_ITENS:
+        tipo, origem = f"Item ({sec})", "Seção"
+        deb, cred, obs, rev = classificar_item(d, sec)
+    else:
+        tipo, origem = tipo_rubrica(it["codigo"], d, cad)
+        if tipo in ("Informativa", "Inf. dedutora"):
+            deb, cred, obs, rev = classificar_informativa(d, tipo)
+        elif tipo == "Desconto":
+            deb, cred, obs, rev = classificar_desconto(d, sec)
+        else:
+            deb, cred, obs, rev = classificar_provento(d, sec, baixa_prov)
+    return {"d": d, "tipo": tipo, "origem": origem, "deb": deb, "cred": cred,
+            "obs": obs, "rev": rev, "nat_item": nat_item}
+
+# =====================================================================
+# 6. PERFIL DA EMPRESA (confirmações salvas em JSON)
+# =====================================================================
+def caminho_perfil(cod):
+    nome = re.sub(r"\W", "_", str(cod)) or "sem_codigo"
+    return PASTA_PERFIS / f"empresa_{nome}.json"
+
+
+def carregar_perfil(cod):
+    p = caminho_perfil(cod)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def salvar_perfil(cod, dados):
+    PASTA_PERFIS.mkdir(exist_ok=True)
+    caminho_perfil(cod).write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def limpa(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return re.sub(r"\.0$", "", str(v).strip())
+
+# =====================================================================
+# 7. INTERFACE
+# =====================================================================
+st.set_page_config(page_title="Integrador Contábil da Folha", layout="wide")
+st.title("📒 Integrador Contábil da Folha — Domínio")
+st.caption("Motor 100% determinístico. Nenhum plano de contas fica fixo no programa: "
+           "a estrutura é lida do arquivo importado e confirmada por você.")
+
+with st.sidebar:
+    st.header("1. Arquivos")
+    f_pend = st.file_uploader("Rubricas/Itens não configurados", type=["pdf", "txt"])
+    f_cad = st.file_uploader("Cadastro geral de rubricas", type=["pdf", "txt"])
+    f_plano = st.file_uploader("Plano de contas", type=["xlsx", "xls", "csv"])
+    st.header("2. Parâmetros")
+    historico = st.text_input("Código do histórico padrão", "")
+    baixa_prov = st.checkbox("Baixar férias/13º pagos contra a provisão", False,
+                             help="Deixe desmarcado se a Domínio já gera o 'Valor Estorno Provisão'.")
+    socio_adm = st.checkbox("Pró-labore e encargos do sócio sempre em Despesas Administrativas", True)
+    st.header("3. Perfil da empresa")
+    f_perfil = st.file_uploader("Importar perfil (.json)", type=["json"])
+
+if not (f_pend and f_cad and f_plano):
+    st.info("Envie os três arquivos para começar.")
+    st.stop()
+
+try:
+    cab, itens = parse_pendencias(f_pend.getvalue(), f_pend.name)
+    nome_cad, cad = parse_cadastro(f_cad.getvalue(), f_cad.name)
+    plano = carregar_plano(f_plano.getvalue(), f_plano.name).copy()
+except Exception as e:
+    st.error(f"Erro na leitura: {e}")
+    st.stop()
+
+if not itens:
+    st.error("Nenhuma rubrica/item encontrado no relatório de pendências.")
+    st.stop()
+
+cod_empresa = st.sidebar.text_input("Código da empresa na Domínio", cab["codigo"])
+perfil = carregar_perfil(cod_empresa)
+if f_perfil is not None:
+    try:
+        perfil = json.loads(f_perfil.getvalue().decode("utf-8"))
+    except Exception:
+        st.sidebar.error("Arquivo de perfil inválido.")
+if perfil:
+    st.sidebar.success("Perfil da empresa carregado.")
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Itens pendentes", len(itens))
+m2.metric("Rubricas no cadastro", len(cad))
+m3.metric("Contas no plano", len(plano))
+m4.metric("Empresa", f'{cab["codigo"]} - {cab["nome"][:25]}')
+
+dup = plano[plano.duplicated("reduzido", keep=False)]
+if not dup.empty:
+    st.warning(f"O plano tem {dup['reduzido'].nunique()} código(s) reduzido(s) repetido(s) "
+               "com classificações diferentes. Corrija na origem antes de integrar.")
+
+# ---------- 1. Estrutura do plano ----------
+st.subheader("1. Estrutura do plano de contas")
+tab = tabela_naturezas(plano, perfil.get("naturezas", {}))
+with st.expander("Natureza dos grupos — detectada pela descrição, confirme",
+                 expanded=not perfil.get("naturezas")):
+    tab_ed = st.data_editor(
+        tab, key=f"nat_{cod_empresa}", hide_index=True, use_container_width=True,
+        disabled=["Classificação", "Descrição", "Nível"],
+        column_config={"Natureza": st.column_config.SelectboxColumn(
+            "Natureza", options=list(NAT_ROT.values()), required=True)})
+nat_ov = dict(zip(tab_ed["Classificação"], tab_ed["Natureza"].map(ROT_NAT).fillna("")))
+plano["nat"] = aplicar_naturezas(plano, nat_ov)
+
+cont = plano[plano["tipo"] == "A"]["nat"].value_counts()
+cs = st.columns(5)
+for col, (k, rot) in zip(cs, [("A", "Ativo"), ("P", "Passivo/PL"), ("R", "Receita"),
+                               ("D", "Custo/Despesa"), ("?", "Sem natureza")]):
+    col.metric(rot, int(cont.get(k, 0)))
+if cont.get("?", 0):
+    st.warning("Há contas analíticas sem natureza. Defina-as na tabela acima.")
+if not cont.get("D", 0) or not cont.get("P", 0):
+    st.error("O plano precisa ter contas de Passivo e de Custo/Despesa. Revise a tabela de natureza.")
+    st.stop()
+
+# ---------- 2. Separador → grupo ----------
+st.subheader("2. Separador → grupo de resultado")
+usa_sep = any(i["sep_cod"] for i in itens)
+precisa_geral = (not usa_sep) or any(not i["sep_cod"] for i in itens)
+nome_geral = NOME_PADRAO_SEM_SEPARADOR
+if precisa_geral:
+    nome_geral = (st.text_input("Nome do lote sem separador",
+                                perfil.get("nome_geral", NOME_PADRAO_SEM_SEPARADOR))
+                  or NOME_PADRAO_SEM_SEPARADOR)
+
+cands = grupos_resultado(plano)
+rotulos = [f"{c['mascara']} — {c['descricao']}" + (f" ({c['pai']})" if c["pai"] else "") for c in cands]
+mascaras = [c["mascara"] for c in cands]
+if usa_sep:
+    st.success("Folha com separador detectada (Centro de Custo / Filial / Serviço).")
+else:
+    st.warning("Nenhuma quebra por Centro de Custo / Filial / Serviço → folha centralizada. "
+               "Escolha o grupo contábil em que a folha inteira será classificada.")
+if not cands:
+    st.info("Nenhum grupo de custo/despesa com conta de salários foi encontrado: informe a máscara manualmente.")
+
+seps = {}
+for it in itens:
+    k = it["sep_cod"] or nome_geral
+    seps.setdefault(k, it["sep_nome"] if it["sep_cod"] else "itens sem separador")
+
+sep_salvo = perfil.get("separadores", {})
+mapa_grupos = {}
+for k, nome in seps.items():
+    c1, c2 = st.columns([3, 1])
+    salvo = sep_salvo.get(k, "")
+    if salvo in mascaras: idx = mascaras.index(salvo)
+    elif usa_sep and cands: idx = sugerir_grupo(nome, cands)
+    else: idx = None
+    escolha = c1.selectbox(f"Separador {k} — {nome}", rotulos, index=idx, key=f"g_{k}",
+                           placeholder="Escolha o grupo contábil")
+    manual = c2.text_input("ou máscara manual", value="" if salvo in mascaras else salvo,
+                           key=f"m_{k}", placeholder="classificação do grupo")
+    pref = manual.strip() or (mascaras[rotulos.index(escolha)] if escolha else "")
+    if pref and not existe_analitica(plano, pref):
+        c2.error("Máscara sem contas analíticas")
+        pref = ""
+    mapa_grupos[k] = pref
+
+if any(not v for v in mapa_grupos.values()):
+    st.info("Defina o grupo de todos os separadores para continuar.")
+    st.stop()
+
+grupo_adm = next((c["mascara"] for c in cands if tem(c["cadeia"], "ADMINISTRATIV*")), None)
+
+# ---------- Classificação (conceitos, ainda sem contas) ----------
+classif = []
+for it in itens:
+    r = classificar(it, cad, baixa_prov)
+    k = it["sep_cod"] or nome_geral
+    grupo = mapa_grupos[k]
+    if socio_adm and grupo_adm and e_socio(r["d"]):
+        grupo = grupo_adm
+    r.update(it=it, sep=k, grupo=grupo)
+    classif.append(r)
+
+ne, nc = norm(cab["nome"]), norm(nome_cad)
+n_div = sum(r["origem"].startswith("Inferido") for r in classif if r["it"]["secao"] not in SECOES_DE_ITENS)
+if ne and nc and ne not in nc and nc not in ne:
+    if n_div:
+        st.warning(f"⚠️ Cadastro de outra empresa (**{nome_cad}**): {n_div} rubrica(s) com "
+                   "código divergente/ausente — Tipo inferido pela descrição.")
+    else:
+        st.info(f"Cadastro do modelo **{nome_cad}**, mas todas as rubricas conferem por código + descrição.")
+
+# ---------- 3. Contas-chave ----------
+st.subheader("3. Contas-chave do plano")
+st.caption("Sugestões tiradas da descrição das contas do plano importado. Confirme, digite outro "
+           "código reduzido ou deixe em branco se a empresa não tiver a conta.")
+res = Resolvedor(plano)
+pedidos = {}
+def pedir(alvo, grupo):
+    g = grupo if ALVOS[alvo][0] in (G, GD) else None
+    pedidos.setdefault(Resolvedor.chave(alvo, g), (alvo, g))
+for r in classif:
+    for a in r["deb"] + r["cred"]:
+        pedir(a, r["grupo"])
+for a in ALVOS_COLABORADOR:
+    pedir(a, None)
+
+contas_salvas = perfil.get("contas", {})
+linhas_map = []
+for k, (alvo, grupo) in pedidos.items():
+    cod, desc, n = res.sugestao(alvo, grupo)
+    salvo = contas_salvas.get(k)
+    usa_salvo = salvo is not None and (salvo == "" or res.valida(salvo))
+    linhas_map.append({"Chave": k, "Conta-chave": ALVOS[alvo][1], "Grupo": grupo or "—",
+                       "Sugestão": f"{cod} — {desc}" if cod else "(nenhuma)", "Candidatos": n,
+                       "Origem": "Perfil" if usa_salvo else "Sugestão",
+                       "Conta": salvo if usa_salvo else cod})
+df_map = pd.DataFrame(linhas_map).sort_values(["Grupo", "Conta-chave"]).reset_index(drop=True)
+with st.expander("Contas-chave usadas nesta folha", expanded=not contas_salvas):
+    ed_map = st.data_editor(
+        df_map, key=f"contas_{cod_empresa}_{abs(hash(tuple(df_map['Chave'])))}",
+        hide_index=True, use_container_width
