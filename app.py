@@ -2,10 +2,10 @@
 Integrador Contábil da Folha — Domínio Sistemas
 Motor 100% determinístico (regex + regras de substring). Sem IA, sem APIs, sem chaves.
 
-NENHUMA conta, código reduzido ou classificação de plano é fixada no código:
-- as raízes (Ativo / Passivo / Custos-Despesas / Receitas) são detectadas no plano importado;
-- as contas são localizadas por descrição dentro do escopo correto;
-- tudo pode ser sobrescrito no "Mapa de contas" e salvo por empresa (.json).
+- Nenhuma conta, código reduzido ou classificação de plano é fixada no código.
+- Exportação no layout de importação da Domínio:
+    aba "evento"  -> lançamentos (Débito x Crédito + histórico + complemento), um por combinação única
+    aba "integra" -> cada rubrica/item vinculado ao Código Sequencial do seu evento
 
 Executar:
     pip install -r requirements.txt
@@ -29,16 +29,30 @@ except ImportError:
     pdfplumber = None
 
 # =====================================================================
-# 0. PARÂMETROS (layout Domínio — não dependem do plano de contas)
+# 0. LAYOUT DE IMPORTAÇÃO DA DOMÍNIO (não depende do plano de contas)
 # =====================================================================
-NOME_PADRAO_SEM_SEPARADOR = "Geral"
+NOME_PADRAO_SEM_SEPARADOR = "Geral"      # só para exibição na tela
+SEP_SEM = "0"                             # valor gravado no arquivo quando não há separador
 LIMIAR_SIMILARIDADE = 0.60
+LIM_DESC_EVENTO = 60                      # tamanho máximo do campo "Descrição" do evento
+COMPLEMENTO_PADRAO = "<<Competencia>> - <<Descrição do Lançamento>>"
 
 ABA_INTEGRA, ABA_EVENTO = "integra", "evento"
-COLS_INTEGRA = ["Código da Empresa", "Separador"]
-COLS_EVENTO = ["Código da Empresa", "Separador", "Código Sequencial", "Tipo de Integração",
-               "Código da Rubrica", "Descrição da Rubrica", "Conta Débito", "Conta Crédito",
-               "Histórico Padrão"]
+COL_TIPO = ("Tipo da Integração (1 - Folha mensal; 2 - Empresa; 3 - Férias; 4 - Rescisao; "
+            "5 - Prov. Férias; 6 - Prov. 13)")
+COLS_INTEGRA = ["Código da Empresa", "Separador", "Código Sequencial da Integração", COL_TIPO,
+                "Código da Rúbrica Selecionada"]
+COLS_EVENTO = ["Código da Empresa", "Separador (0 quando é sem separador)",
+               "Código Sequencial da Integração", COL_TIPO, "Descrição",
+               "Código da Conta Débito", "Código da Conta Crédito", "Código do Histórico", "Complemento"]
+
+TIPOS_LAYOUT = {1: "Folha mensal", 2: "Empresa", 3: "Férias", 4: "Rescisão", 5: "Prov. Férias", 6: "Prov. 13"}
+TIPO_INTEGRACAO = {  # seção do relatório -> código do layout (None = não importável)
+    "Folha Normal": 1, "Adiantamento": 1, "13º Salário": 1,
+    "Empresa": 2, "Férias": 3, "Rescisão": 4,
+    "Provisão de Férias": 5, "Provisão de 13º": 6,
+    "Informações INSS": None,
+}
 
 SECOES = {  # título normalizado no PDF -> nome interno
     "FOLHA NORMAL": "Folha Normal", "FOLHA MENSAL": "Folha Normal",
@@ -51,7 +65,6 @@ SECOES = {  # título normalizado no PDF -> nome interno
     "INFORMACOES INSS": "Informações INSS", "INFORMACOES DO INSS": "Informações INSS",
 }
 SECOES_DE_ITENS = {"Empresa", "Provisão de Férias", "Provisão de 13º", "Informações INSS"}
-TIPO_INTEGRACAO = {s: s for s in set(SECOES.values())}  # troque por códigos do layout, se houver
 
 # Catálogo do sistema Domínio: Configurar Integração > aba Empresa (não tem o item 37).
 # (descrição, natureza, competência)  competência: "M" mensal | "F" férias | "13" 13º
@@ -123,6 +136,15 @@ def tem(d: str, *termos) -> bool:
 
 RE_13 = re.compile(r"(?<![A-Z0-9])13[OA]?(?![A-Z0-9])")
 def e13(d): return bool(RE_13.search(d)) or tem(d, "DECIMO*")
+
+
+def txt_cel(v) -> str:
+    return "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+
+
+def para_int(v):
+    s = txt_cel(v)
+    return int(s) if s.isdigit() else s
 
 # =====================================================================
 # 2. PLANO DE CONTAS GENÉRICO
@@ -776,6 +798,11 @@ def classificar_item_empresa(codigo, d, baixa_prov):
 # =====================================================================
 # 6. CONFIGURAÇÃO POR EMPRESA (.json)
 # =====================================================================
+CFG_WIDGETS = (("historico", "w_hist"), ("baixa_prov", "w_baixa"), ("socio_adm", "w_socio"),
+               ("bloqueio_extra", "w_bloq"), ("empresa", "w_cod"), ("complemento", "w_compl"),
+               ("seq_inicial", "w_seq"), ("seq_por_tipo", "w_seq_tipo"))
+
+
 def aplicar_config(dados: bytes):
     fid = hashlib.md5(dados).hexdigest()
     if st.session_state.get("cfg_id") == fid:
@@ -790,10 +817,11 @@ def aplicar_config(dados: bytes):
         if k.startswith(("g_", "m_", "r_", "c_")) or k == "w_grupo_socio":
             del st.session_state[k]
     st.session_state["cfg_contas"] = {str(k): str(v) for k, v in cfg.get("contas", {}).items()}
-    for chave, wk in (("historico", "w_hist"), ("baixa_prov", "w_baixa"), ("socio_adm", "w_socio"),
-                      ("bloqueio_extra", "w_bloq"), ("nome_geral", "w_nome_geral"), ("empresa", "w_cod")):
+    for chave, wk in CFG_WIDGETS:
         if chave in cfg:
             st.session_state[wk] = cfg[chave]
+    for t, v in cfg.get("hist_tipo", {}).items():
+        st.session_state[f"w_hist_{t}"] = str(v)
 
 
 def md5(txt: str) -> str:
@@ -816,15 +844,28 @@ with st.sidebar:
     f_pend = st.file_uploader("Rubricas/Itens não configurados", type=["pdf", "txt"])
     f_cad = st.file_uploader("Cadastro geral de rubricas", type=["pdf", "txt"])
     f_plano = st.file_uploader("Plano de contas", type=["xlsx", "xls", "csv", "txt"])
-    st.header("2. Parâmetros")
-    for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", "")):
+
+    st.header("2. Regras")
+    for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", ""),
+                 ("w_compl", COMPLEMENTO_PADRAO), ("w_seq", 1), ("w_seq_tipo", False)):
         st.session_state.setdefault(k, v)
-    historico = st.text_input("Código do histórico padrão", key="w_hist")
     baixa_prov = st.checkbox("Baixar férias/13º pagos contra a provisão", key="w_baixa",
                              help="Deixe desmarcado se a Domínio já gera o 'Valor Estorno Provisão'.")
     socio_adm = st.checkbox("Pró-labore e encargos do sócio sempre em Despesas Administrativas", key="w_socio")
     bloq_extra = st.text_input("Contas extras de colaborador (reduzidos, separados por vírgula)", key="w_bloq",
                                help="Além das detectadas automaticamente; itens patronais nunca poderão usá-las.")
+
+    st.header("3. Layout de importação")
+    historico = st.text_input("Código do Histórico (padrão)", key="w_hist")
+    hist_tipo = {}
+    with st.expander("Histórico por Tipo da Integração (opcional)"):
+        for t, n in TIPOS_LAYOUT.items():
+            st.session_state.setdefault(f"w_hist_{t}", "")
+            hist_tipo[t] = st.text_input(f"{t} - {n}", key=f"w_hist_{t}",
+                                         placeholder=historico or "usa o padrão")
+    complemento = st.text_input("Complemento", key="w_compl")
+    seq_ini = int(st.number_input("Primeiro Código Sequencial da Integração", min_value=1, step=1, key="w_seq"))
+    seq_por_tipo = st.checkbox("Reiniciar a numeração a cada Tipo/Separador", key="w_seq_tipo")
 
 if not (f_pend and f_cad and f_plano):
     st.info("Envie os três arquivos para começar. Opcional: carregue a configuração salva da empresa.")
@@ -917,11 +958,6 @@ m4.metric("Empresa", f'{cab["codigo"]} - {cab["nome"][:25]}')
 # ---------- 2. Separadores ----------
 st.subheader("2. Separador → grupo de resultado")
 usa_sep = any(i["sep_cod"] for i in itens)
-precisa_geral = (not usa_sep) or any(not i["sep_cod"] for i in itens)
-st.session_state.setdefault("w_nome_geral", NOME_PADRAO_SEM_SEPARADOR)
-if precisa_geral:
-    st.text_input("Nome do lote sem separador", key="w_nome_geral")
-nome_geral = (st.session_state.get("w_nome_geral") or NOME_PADRAO_SEM_SEPARADOR).strip()
 
 cands = grupos_resultado(plano, raizes["RESULTADO"], pontuado)
 rotulos = [f"{g['classif']} — {g['descricao']}" + (f"  ({g['caminho']})" if g["caminho"] else "")
@@ -935,12 +971,14 @@ if usa_sep:
     tipos = sorted({i["sep_tipo"] for i in itens if i["sep_tipo"]})
     st.success(f"Folha com separador detectada ({', '.join(tipos)}).")
 else:
-    st.warning("Nenhuma quebra por Centro de Custo / Filial / Serviço → folha centralizada. "
+    st.warning(f"Nenhuma quebra por Centro de Custo / Filial / Serviço → folha centralizada "
+               f"({NOME_PADRAO_SEM_SEPARADOR}, Separador = {SEP_SEM} no arquivo). "
                "Escolha o grupo contábil em que a folha inteira será classificada.")
 
 seps = {}
 for it in itens:
-    seps.setdefault(it["sep_cod"] or nome_geral, it["sep_nome"] if it["sep_cod"] else "itens sem separador")
+    seps.setdefault(it["sep_cod"] or SEP_SEM,
+                    it["sep_nome"] if it["sep_cod"] else f"sem separador ({NOME_PADRAO_SEM_SEPARADOR})")
 
 an_cla = plano.loc[plano["tipo"] == "A", "classificacao"].tolist()
 cfg_grupos = cfg.get("grupos", {})
@@ -985,7 +1023,7 @@ if socio_adm:
 regras = []
 for it in itens:
     d, sec = norm(it["descricao"]), it["secao"]
-    k = it["sep_cod"] or nome_geral
+    k = it["sep_cod"] or SEP_SEM
     prefixo, nat = mapa_grupos[k], None
     if sec == "Empresa":
         tipo = "Item (Empresa)"
@@ -1035,8 +1073,7 @@ with st.expander(f"Contas localizadas por descrição — {n_nf} alvo(s) sem con
 analiticas = set(plano.loc[plano["tipo"] == "A", "reduzido"])
 overrides, erros_ov = {}, []
 for row in ed_map.to_dict("records"):
-    v = row.get("Conta definida")
-    v = "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+    v = txt_cel(row.get("Conta definida"))
     if v:
         cfg_contas[row["Chave"]] = v
         if v in analiticas:
@@ -1054,9 +1091,11 @@ colab |= {x for x in re.split(r"[,;\s]+", bloq_extra or "") if x}
 st.caption("🔒 Contas de colaborador protegidas contra itens patronais: " + (", ".join(sorted(colab)) or "—"))
 
 # ---------- Resolução ----------
+ST_OK, ST_REV, ST_PEND, ST_NAO, ST_MAN = "✅ OK", "⚠️ Revisar", "❌ Pendente", "⏭️ Não integrar", "📝 Manual"
 linhas = []
 for r in regras:
     it, sec = r["it"], r["sec"]
+    tipo_int = TIPO_INTEGRACAO.get(sec)
     dc, dd, ad = res.resolver(r["deb"], r["prefixo"])
     cc_, cd, ac = res.resolver(r["cred"], r["prefixo"])
     alertas = [a for a in (ad, ac) if a]
@@ -1070,22 +1109,27 @@ for r in regras:
         if cc_ in colab:
             cc_, cd = "", ""
             alertas.append("🚫 crédito em conta de colaborador bloqueado")
+    if usa_sep and r["k"] == SEP_SEM and tipo_int:
+        alertas.append(f"separador {SEP_SEM} numa folha com separador — confirme")
     if not r["deb"] and not r["cred"]:
-        status = "❌ Pendente" if (sec == "Empresa" and r["nat"] != "ISENCAO") else "⏭️ Não integrar"
+        status = ST_PEND if (sec == "Empresa" and r["nat"] != "ISENCAO") else ST_NAO
+    elif tipo_int is None:
+        status = ST_MAN
+        alertas.append("seção sem Tipo da Integração no layout — configurar na Domínio")
     elif not dc or not cc_:
-        status = "❌ Pendente"
+        status = ST_PEND
     elif r["rev"] or alertas or r["origem"].startswith("Inferido"):
-        status = "⚠️ Revisar"
+        status = ST_REV
     else:
-        status = "✅ OK"
+        status = ST_OK
     linhas.append({
-        "Status": status, "Seção": sec, "Separador": r["k"],
-        "Nome do separador": it["sep_nome"] or nome_geral, "Grupo": r["prefixo"],
-        "Código": it["codigo"], "Descrição": it["descricao"], "Tipo": r["tipo"],
+        "Status": status, "Seção": sec, "Tipo Integração": str(tipo_int) if tipo_int else "—",
+        "Separador": r["k"], "Nome do separador": it["sep_nome"] or NOME_PADRAO_SEM_SEPARADOR,
+        "Grupo": r["prefixo"], "Código": it["codigo"], "Descrição": it["descricao"], "Tipo": r["tipo"],
         "Origem do tipo": r["origem"], "Débito": dc, "Desc. Débito": dd,
         "Crédito": cc_, "Desc. Crédito": cd,
         "Observação": " | ".join([r["obs"]] + alertas).strip(" |"),
-        "Exportar": bool(dc and cc_),
+        "Exportar": bool(dc and cc_ and tipo_int),
     })
 df = pd.DataFrame(linhas)
 
@@ -1101,8 +1145,8 @@ if ne and nc and ne not in nc and nc not in ne:
 # ---------- 4. Conferência ----------
 st.subheader("4. Conferência")
 st.caption("Edições aqui valem só para este lote. Para correções permanentes, use o Mapa de contas.")
-f1, f2, f3, f4 = st.columns(4)
-for col, s in zip((f1, f2, f3, f4), ("✅ OK", "⚠️ Revisar", "❌ Pendente", "⏭️ Não integrar")):
+mcols = st.columns(5)
+for col, s in zip(mcols, (ST_OK, ST_REV, ST_PEND, ST_NAO, ST_MAN)):
     col.metric(s, int((df["Status"] == s).sum()))
 
 ed = st.data_editor(
@@ -1116,11 +1160,11 @@ idx_plano = plano.drop_duplicates("reduzido").set_index("reduzido")
 
 
 def validar(row):
-    msgs = []
-    vals = {}
+    msgs, vals = [], {}
+    if TIPO_INTEGRACAO.get(row["Seção"]) is None:
+        msgs.append("seção sem Tipo da Integração no layout")
     for lado in ("Débito", "Crédito"):
-        v = row[lado]
-        c = "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
+        c = txt_cel(row[lado])
         vals[lado] = c
         if not c:
             msgs.append(f"{lado} vazio")
@@ -1143,44 +1187,116 @@ if not bloqueadas.empty:
     st.error(f"{len(bloqueadas)} linha(s) marcadas para exportar com erro — ficarão fora do lote.")
     st.dataframe(bloqueadas[["Seção", "Separador", "Código", "Descrição", "Validação"]], hide_index=True)
 
-# ---------- 5. Exportação ----------
-st.subheader("5. Arquivos")
+manuais = ed[ed["Status"] == ST_MAN]
+if not manuais.empty:
+    st.warning(f"📝 {len(manuais)} item(ns) de seção sem código no layout (ex.: Informações INSS) — "
+               "configure-os manualmente na Domínio com as contas abaixo. Sem isso, a conta-ponte "
+               "(sal.-família/maternidade) fica com saldo.")
+    st.dataframe(manuais[["Seção", "Separador", "Código", "Descrição", "Débito", "Desc. Débito",
+                          "Crédito", "Desc. Crédito"]], hide_index=True)
+
+# ---------- 5. Montagem do layout (evento + integra) ----------
+st.subheader("5. Arquivo de importação")
+emp = para_int(cod_empresa)
+desc_conta = idx_plano["descricao"].to_dict()
+
+exp = exportar.copy()
+exp["_sep"] = exp["Separador"].map(para_int)
+exp["_tipo"] = exp["Seção"].map(TIPO_INTEGRACAO).astype(int)
+exp["_deb"] = exp["Débito"].map(txt_cel)
+exp["_cred"] = exp["Crédito"].map(txt_cel)
+exp["_hist"] = exp["_tipo"].map(lambda t: txt_cel(hist_tipo.get(t)) or txt_cel(historico))
+
+# a mesma rubrica, no mesmo separador e tipo, só pode apontar para um evento
+chave_rub = ["_sep", "_tipo", "Código"]
+if not exp.empty:
+    n_d = exp.groupby(chave_rub)["_deb"].transform("nunique")
+    n_c = exp.groupby(chave_rub)["_cred"].transform("nunique")
+    conflito = (n_d > 1) | (n_c > 1)
+else:
+    conflito = pd.Series([], dtype=bool)
+conflitos = exp[conflito]
+if not conflitos.empty:
+    st.error(f"{len(conflitos)} linha(s) com a mesma rubrica no mesmo Tipo/Separador e contas diferentes "
+             "(ex.: Folha Normal × Adiantamento). Desmarque uma delas em 'Exportar'.")
+    st.dataframe(conflitos[["Seção", "Separador", "Código", "Descrição", "Débito", "Crédito"]], hide_index=True)
+exp = exp[~conflito].drop_duplicates(chave_rub).reset_index(drop=True)
+
+chave_ev = ["_sep", "_tipo", "_deb", "_cred", "_hist"]
+eventos = (exp.drop_duplicates(chave_ev)[chave_ev]
+           .assign(_s=lambda x: x["_sep"].astype(str))
+           .sort_values(["_s", "_tipo"], kind="stable").drop(columns="_s").reset_index(drop=True))
+if seq_por_tipo:
+    eventos["_seq"] = eventos.groupby(["_sep", "_tipo"]).cumcount() + seq_ini
+else:
+    eventos["_seq"] = list(range(seq_ini, seq_ini + len(eventos)))
+exp = exp.merge(eventos, on=chave_ev, how="left")
+
+evento = pd.DataFrame({
+    COLS_EVENTO[0]: [emp] * len(eventos),
+    COLS_EVENTO[1]: eventos["_sep"].tolist(),
+    COLS_EVENTO[2]: eventos["_seq"].astype(int).tolist(),
+    COLS_EVENTO[3]: eventos["_tipo"].tolist(),
+    COLS_EVENTO[4]: [f"{desc_conta.get(d, '')} x {desc_conta.get(c, '')}"[:LIM_DESC_EVENTO]
+                     for d, c in zip(eventos["_deb"], eventos["_cred"])],
+    COLS_EVENTO[5]: eventos["_deb"].map(para_int).tolist(),
+    COLS_EVENTO[6]: eventos["_cred"].map(para_int).tolist(),
+    COLS_EVENTO[7]: eventos["_hist"].map(para_int).tolist(),
+    COLS_EVENTO[8]: [complemento] * len(eventos),
+})[COLS_EVENTO]
+
+exp = exp.assign(_s=exp["_sep"].astype(str)).sort_values(["_s", "_seq", "Código"], kind="stable")
+integra = pd.DataFrame({
+    COLS_INTEGRA[0]: [emp] * len(exp),
+    COLS_INTEGRA[1]: exp["_sep"].tolist(),
+    COLS_INTEGRA[2]: exp["_seq"].astype(int).tolist(),
+    COLS_INTEGRA[3]: exp["_tipo"].tolist(),
+    COLS_INTEGRA[4]: exp["Código"].astype(int).tolist(),
+})[COLS_INTEGRA]
+
+sem_hist = int((eventos["_hist"] == "").sum())
+if sem_hist:
+    st.warning(f"{sem_hist} evento(s) sem Código do Histórico — preencha na barra lateral.")
+if not isinstance(emp, int):
+    st.warning("Código da empresa não numérico — confira na barra lateral.")
+
+e1, e2, e3 = st.columns(3)
+e1.metric("Eventos (aba evento)", len(evento))
+e2.metric("Rubricas vinculadas (aba integra)", len(integra))
+e3.metric("Configurar manualmente", len(manuais))
+t1, t2 = st.tabs([ABA_EVENTO, ABA_INTEGRA])
+t1.dataframe(evento, hide_index=True, use_container_width=True)
+t2.dataframe(integra, hide_index=True, use_container_width=True)
 
 
 def excel_bytes(abas: dict) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         for nome, d in abas.items():
-            d.to_excel(w, sheet_name=nome, index=False)
+            d.to_excel(w, sheet_name=nome[:31], index=False)
     return buf.getvalue()
 
 
-integra = pd.DataFrame([{"Código da Empresa": cod_empresa, "Separador": 1 if usa_sep else 0}])[COLS_INTEGRA]
-evento = pd.DataFrame({
-    "Código da Empresa": [cod_empresa] * len(exportar),
-    "Separador": exportar["Separador"].astype(str).tolist(),
-    "Código Sequencial": list(range(1, len(exportar) + 1)),
-    "Tipo de Integração": exportar["Seção"].map(TIPO_INTEGRACAO).tolist(),
-    "Código da Rubrica": exportar["Código"].tolist(),
-    "Descrição da Rubrica": exportar["Descrição"].tolist(),
-    "Conta Débito": exportar["Débito"].astype(str).str.strip().tolist(),
-    "Conta Crédito": exportar["Crédito"].astype(str).str.strip().tolist(),
-    "Histórico Padrão": [historico] * len(exportar),
-})[COLS_EVENTO]
-
 cfg_out = {
-    "versao": 1, "empresa": cod_empresa, "nome_empresa": cab["nome"], "nome_geral": nome_geral,
+    "versao": 2, "empresa": cod_empresa, "nome_empresa": cab["nome"],
     "grupos": mapa_grupos, "grupo_socio": grupo_socio, "contas": dict(cfg_contas),
-    "historico": historico, "baixa_prov": baixa_prov, "socio_adm": socio_adm,
-    "bloqueio_extra": bloq_extra, "raizes": raizes,
-    "colunas": {k: v for k, v in sel.items() if v and v != "(nenhuma)"},
+    "historico": historico, "hist_tipo": {str(t): v for t, v in hist_tipo.items() if v},
+    "complemento": complemento, "seq_inicial": seq_ini, "seq_por_tipo": seq_por_tipo,
+    "baixa_prov": baixa_prov, "socio_adm": socio_adm, "bloqueio_extra": bloq_extra,
+    "raizes": raizes, "colunas": {k: v for k, v in sel.items() if v and v != "(nenhuma)"},
 }
 
+conf_abas = {"conferencia": ed}
+if not manuais.empty:
+    conf_abas["configurar_manual"] = manuais
+if not conflitos.empty:
+    conf_abas["conflitos"] = conflitos.drop(columns=[c for c in conflitos.columns if c.startswith("_")])
+
 c1, c2, c3 = st.columns(3)
-c1.download_button(f"📥 Importação Domínio ({len(evento)} linhas)",
+c1.download_button(f"📥 Importação Domínio ({len(evento)} eventos / {len(integra)} vínculos)",
                    excel_bytes({ABA_INTEGRA: integra, ABA_EVENTO: evento}),
                    file_name=f"integracao_folha_emp{cod_empresa}.xlsx")
-c2.download_button("📋 Planilha de conferência completa", excel_bytes({"conferencia": ed}),
+c2.download_button("📋 Planilha de conferência completa", excel_bytes(conf_abas),
                    file_name=f"conferencia_folha_emp{cod_empresa}.xlsx")
 c3.download_button("💾 Salvar configuração da empresa (.json)",
                    json.dumps(cfg_out, ensure_ascii=False, indent=2).encode("utf-8"),
