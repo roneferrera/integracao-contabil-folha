@@ -3,11 +3,16 @@ Integrador Contábil da Folha — Domínio Sistemas
 Motor 100% determinístico (regex + regras de substring). Sem IA, sem APIs, sem chaves.
 
 - Nenhuma conta, código reduzido ou classificação de plano é fixada no código.
-- Exportação no layout de importação da Domínio (1 lançamento por rubrica):
-    aba "evento"  -> lançamento: Código Sequencial = código da rubrica,
+- Exportação no layout de importação da Domínio (1 lançamento por rubrica/item):
+    aba "evento"  -> lançamento: Código Sequencial = código da rubrica/item,
                      Descrição = "código - descrição" (caixa mista, máx. 40 caracteres)
-    aba "integra" -> vínculo da rubrica ao seu lançamento
+    aba "integra" -> vínculo da rubrica/item ao seu lançamento
 - Tipos: 1 Folha mensal | 2 Empresa | 3 Férias | 4 Rescisão | 5 Prov. Férias | 6 Prov. 13 | 10 Outras Informações
+- Dois modos:
+    * Pendências: lê o relatório "Rubricas/Itens não configurados"
+    * Todos os eventos cadastrados: usa só o Cadastro geral de rubricas + Plano de contas
+      (Tipos 1/3/4 = rubricas do cadastro; Tipo 2 = catálogo Empresa; Tipo 10 = catálogo Outras Informações,
+       cada item em lançamento próprio)
 
 Executar:
     pip install -r requirements.txt
@@ -56,6 +61,10 @@ TIPO_INTEGRACAO = {  # seção do relatório -> código do layout (None = não i
     "Provisão de Férias": 5, "Provisão de 13º": 6,
     "Outras Informações": 10,
 }
+
+# Modo "todos os eventos do cadastro": Tipo do layout -> seção interna usada pelas regras
+SECAO_POR_TIPO = {1: "Folha Normal", 2: "Empresa", 3: "Férias", 4: "Rescisão", 10: "Outras Informações"}
+TIPOS_CADASTRO = list(SECAO_POR_TIPO)          # Prov. Férias/13 (5 e 6) não têm catálogo de itens
 
 SECOES = {  # título normalizado no PDF -> nome interno
     "FOLHA NORMAL": "Folha Normal", "FOLHA MENSAL": "Folha Normal",
@@ -115,6 +124,7 @@ ITENS_EMPRESA = {
 }
 
 # Catálogo do sistema Domínio: Configurar Integração > aba Outras Informações (Tipo 10)
+# Cada item gera o SEU PRÓPRIO lançamento (Código Sequencial = código do item).
 ITENS_OUTRAS = {
     1: ("Compensação Ded. FPAS Saldo anterior", "COMP_INSS"),
     2: ("Compensação da Ded. Sal. Família", "COMP_BENEF"),
@@ -693,6 +703,55 @@ def parse_pendencias(dados: bytes, nome: str):
                               "descricao": m.group(2).strip()})
     return cab, itens
 
+
+# ---- Modo "todos os eventos cadastrados" (sem relatório de pendências)
+RE_CAB_EMP = re.compile(r"^\s*(?:Empresa\s*:\s*)?(\d{1,6})\s*-\s*(.+?)\s*$", re.I)
+
+
+@st.cache_data(show_spinner=False)
+def empresa_do_cadastro(dados: bytes, nome: str):
+    """Código e nome da empresa lidos do cabeçalho do cadastro geral de rubricas."""
+    linhas = [l for l in extrair_linhas(dados, nome) if l.strip()]
+    for l in linhas[:15]:
+        t = re.split(r"P[áa]gina", l, flags=re.I)[0].strip()
+        if RE_RUB.match(t):                       # já chegou nas rubricas
+            break
+        m = RE_EMPRESA.match(t) or RE_CAB_EMP.match(t)
+        if m:
+            return {"codigo": m.group(1), "nome": m.group(2).strip()}
+    primeira = re.split(r"P[áa]gina", linhas[0], flags=re.I)[0].strip() if linhas else ""
+    return {"codigo": "", "nome": primeira}
+
+
+def parse_separadores(txt: str):
+    """'1=Administrativo; 2=Produção' -> [('1','Administrativo'), ('2','Produção')]"""
+    out = []
+    for parte in re.split(r"[;\n]+", txt or ""):
+        m = re.match(r"\s*(\d+)\s*(?:[=:\-]\s*(.*))?$", parte)
+        if m:
+            out.append((m.group(1), (m.group(2) or "").strip() or f"Separador {m.group(1)}"))
+    return out
+
+
+def itens_do_cadastro(cad: dict, tipos, separadores):
+    """Itens a contabilizar sem o relatório de pendências:
+    Tipos 1/3/4 = todas as rubricas do cadastro; Tipo 2 = catálogo Empresa;
+    Tipo 10 = catálogo Outras Informações (itens 1 a 13), CADA ITEM EM LANÇAMENTO PRÓPRIO."""
+    fontes = {
+        "Empresa": {c: v[0] for c, v in ITENS_EMPRESA.items()},
+        "Outras Informações": {c: v[0] for c, v in ITENS_OUTRAS.items()},
+    }
+    rubricas = {c: r["descricao"] for c, r in cad.items()}
+    itens = []
+    for sep_cod, sep_nome in (separadores or [("", "")]):
+        for t in sorted(tipos):
+            secao = SECAO_POR_TIPO[t]
+            for cod, desc in sorted(fontes.get(secao, rubricas).items()):
+                itens.append({"secao": secao, "sep_tipo": "Informado" if sep_cod else "",
+                              "sep_cod": sep_cod, "sep_nome": sep_nome,
+                              "codigo": int(cod), "descricao": desc})
+    return itens
+
 # =====================================================================
 # 5. REGRAS DETERMINÍSTICAS
 # =====================================================================
@@ -905,7 +964,7 @@ def classificar_item_empresa(codigo, d, baixa_prov):
     return deb, cred, obs, rev, origem, nat
 
 
-# ---- Aba Outras Informações (Tipo 10)
+# ---- Aba Outras Informações (Tipo 10) — cada item = 1 lançamento próprio
 OBS_OUTRAS = {
     "COMP_BENEF": ("Compensação sal.-família/maternidade — baixa da conta-ponte", False),
     "COMP_INSS": ("Compensação de INSS na guia", False),
@@ -915,7 +974,7 @@ OBS_OUTRAS = {
     "COMP_PIS": ("Compensação de PIS s/ folha — confirme a conta", True),
     None: ("Item de Outras Informações sem regra — definir manualmente", True),
 }
-CONTAS_OUTRAS = {
+CONTAS_OUTRAS = {  # D INSS a Recolher × C INSS a Compensar (padrão da tela Configurar Integração)
     "COMP_BENEF": (["INSS_REC"], ["BENEF_INSS"]),
     "COMP_INSS": (["INSS_REC"], ["INSS_COMP", "BENEF_INSS"]),
     "COMP_RETENCAO": (["INSS_REC"], ["INSS_COMP", "BENEF_INSS"]),
@@ -951,7 +1010,8 @@ def classificar_item_outras(codigo, d):
 # 6. CONFIGURAÇÃO POR EMPRESA (.json)
 # =====================================================================
 CFG_WIDGETS = (("historico", "w_hist"), ("baixa_prov", "w_baixa"), ("socio_adm", "w_socio"),
-               ("bloqueio_extra", "w_bloq"), ("empresa", "w_cod"), ("complemento", "w_compl"))
+               ("bloqueio_extra", "w_bloq"), ("empresa", "w_cod"), ("complemento", "w_compl"),
+               ("tipos_cadastro", "w_tipos_cad"), ("separadores_cadastro", "w_seps_cad"))
 
 
 def aplicar_config(dados: bytes):
@@ -991,10 +1051,41 @@ with st.sidebar:
     f_cfg = st.file_uploader("Carregar configuração salva (.json)", type=["json"])
     if f_cfg is not None:
         aplicar_config(f_cfg.getvalue())
+
     st.header("1. Arquivos")
-    f_pend = st.file_uploader("Rubricas/Itens não configurados", type=["pdf", "txt"])
+    st.session_state.setdefault("modo_cad", False)
+    if st.session_state["modo_cad"]:
+        st.success("Modo: **todos os eventos cadastrados** (cadastro geral + plano de contas)")
+        if st.button("↩️ Voltar ao modo pendências", use_container_width=True):
+            st.session_state["modo_cad"] = False
+            st.rerun()
+    else:
+        if st.button("🗂️ Contabilizar todos os eventos cadastrados", use_container_width=True,
+                     help="Ignora o relatório de pendências e gera o lançamento de todas as rubricas "
+                          "do cadastro geral + itens das abas Empresa e Outras Informações."):
+            st.session_state["modo_cad"] = True
+            st.rerun()
+    modo_cad = st.session_state["modo_cad"]
+
+    f_pend = None
+    if not modo_cad:
+        f_pend = st.file_uploader("Rubricas/Itens não configurados", type=["pdf", "txt"])
     f_cad = st.file_uploader("Cadastro geral de rubricas", type=["pdf", "txt"])
     f_plano = st.file_uploader("Plano de contas", type=["xlsx", "xls", "csv", "txt"])
+
+    tipos_cad, seps_cad = [], ""
+    if modo_cad:
+        st.session_state.setdefault("w_tipos_cad", TIPOS_CADASTRO)
+        st.session_state.setdefault("w_seps_cad", "")
+        st.session_state["w_tipos_cad"] = [int(t) for t in st.session_state["w_tipos_cad"]
+                                           if str(t).isdigit() and int(t) in TIPOS_CADASTRO]
+        tipos_cad = st.multiselect("Tipos da Integração a gerar", TIPOS_CADASTRO, key="w_tipos_cad",
+                                   format_func=lambda t: f"{t} - {TIPOS_LAYOUT[t]}")
+        seps_cad = st.text_area("Separadores (opcional)", key="w_seps_cad",
+                                placeholder="1=Administrativo; 2=Produção",
+                                help="Sem separador = folha centralizada (Separador 0). "
+                                     "Informando, todos os eventos são replicados para cada separador.")
+        st.caption("Tipo 10: cada item da aba Outras Informações (1 a 13) gera o seu próprio lançamento.")
 
     st.header("2. Regras")
     for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", ""),
@@ -1015,29 +1106,43 @@ with st.sidebar:
             hist_tipo[t] = st.text_input(f"{t} - {n}", key=f"w_hist_{t}",
                                          placeholder=historico or "usa o padrão")
     complemento = st.text_input("Complemento", key="w_compl")
-    st.caption(f"1 lançamento por rubrica · Código Sequencial = código da rubrica · "
+    st.caption(f"1 lançamento por rubrica/item · Código Sequencial = código da rubrica/item · "
                f"Descrição = 'código - descrição' em caixa mista, máx. {LIM_DESC_EVENTO} caracteres.")
 
-if not (f_pend and f_cad and f_plano):
-    st.info("Envie os três arquivos para começar. Opcional: carregue a configuração salva da empresa.")
+if not (f_cad and f_plano and (f_pend or modo_cad)):
+    st.info("Envie o cadastro geral de rubricas e o plano de contas"
+            + ("." if modo_cad else " e o relatório de pendências — ou use o botão "
+               "'Contabilizar todos os eventos cadastrados'.")
+            + " Opcional: carregue a configuração salva da empresa.")
     st.stop()
 
 cfg = st.session_state.get("cfg", {})
 try:
-    cab, itens = parse_pendencias(f_pend.getvalue(), f_pend.name)
     nome_cad, cad = parse_cadastro(f_cad.getvalue(), f_cad.name)
     raw = ler_tabela_bruta(f_plano.getvalue(), f_plano.name)
+    if modo_cad:
+        if not tipos_cad:
+            st.info("Escolha ao menos um Tipo da Integração na barra lateral.")
+            st.stop()
+        cab = empresa_do_cadastro(f_cad.getvalue(), f_cad.name)
+        itens = itens_do_cadastro(cad, tipos_cad, parse_separadores(seps_cad))
+    else:
+        cab, itens = parse_pendencias(f_pend.getvalue(), f_pend.name)
 except Exception as e:
     st.error(f"Erro na leitura: {e}")
     st.stop()
 
-if not itens:
-    st.error("Nenhuma rubrica/item encontrado no relatório de pendências.")
+if modo_cad and not cad and any(t in (1, 3, 4) for t in tipos_cad):
+    st.error("Nenhuma rubrica lida no cadastro geral — não há eventos para os Tipos 1, 3 e 4.")
     st.stop()
-if not cad:
+if not itens:
+    st.error("Nenhuma rubrica/item encontrado" + (" no cadastro." if modo_cad else " no relatório de pendências."))
+    st.stop()
+if not cad and not modo_cad:
     st.warning("Nenhuma rubrica lida no cadastro geral — o Tipo de todas será inferido pela descrição.")
 
-pid = hashlib.md5(f_pend.getvalue()).hexdigest()
+origem_bytes = f_cad.getvalue() if modo_cad else f_pend.getvalue()
+pid = hashlib.md5(origem_bytes + (b"|cad" if modo_cad else b"|pend")).hexdigest()
 if st.session_state.get("pend_id") != pid:
     st.session_state["pend_id"] = pid
     if not cfg.get("empresa"):
@@ -1046,7 +1151,7 @@ st.session_state.setdefault("w_cod", cab["codigo"])
 cod_empresa = st.sidebar.text_input("Código da empresa na Domínio", key="w_cod")
 if cfg.get("empresa") and cab["codigo"] and str(cfg["empresa"]) != cab["codigo"]:
     st.warning(f"⚠️ A configuração carregada é da empresa {cfg['empresa']}, "
-               f"mas o relatório é da empresa {cab['codigo']}.")
+               f"mas o {'cadastro' if modo_cad else 'relatório'} é da empresa {cab['codigo']}.")
 
 # ---------- 1. Estrutura do plano ----------
 st.subheader("1. Estrutura do plano de contas")
@@ -1101,10 +1206,14 @@ if not raizes["ATIVO"]:
     st.warning("Raiz do Ativo não definida — adiantamentos e compensações ficarão pendentes.")
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Itens pendentes", len(itens))
+m1.metric("Eventos no lote" if modo_cad else "Itens pendentes", len(itens))
 m2.metric("Rubricas no cadastro", len(cad))
 m3.metric("Contas no plano", len(plano))
 m4.metric("Empresa", f'{cab["codigo"]} - {cab["nome"][:25]}')
+if modo_cad:
+    cont = pd.Series([TIPO_INTEGRACAO[i["secao"]] for i in itens]).value_counts().sort_index()
+    st.caption("Eventos por Tipo da Integração: "
+               + " · ".join(f"{t} - {TIPOS_LAYOUT[t]}: {n}" for t, n in cont.items()))
 
 # ---------- 2. Separadores ----------
 st.subheader("2. Separador → grupo de resultado")
@@ -1120,7 +1229,7 @@ if not cands:
 
 if usa_sep:
     tipos = sorted({i["sep_tipo"] for i in itens if i["sep_tipo"]})
-    st.success(f"Folha com separador detectada ({', '.join(tipos)}).")
+    st.success(f"Folha com separador ({', '.join(tipos)}).")
 else:
     st.warning(f"Nenhuma quebra por Centro de Custo / Filial / Serviço → folha centralizada "
                f"({NOME_PADRAO_SEM_SEPARADOR}, Separador = {SEP_SEM} no arquivo). "
@@ -1290,7 +1399,7 @@ df = pd.DataFrame(linhas)
 
 n_div = int(df["Origem do tipo"].str.startswith("Inferido").sum())
 ne, nc = norm(cab["nome"]), norm(nome_cad)
-if ne and nc and ne not in nc and nc not in ne:
+if not modo_cad and ne and nc and ne not in nc and nc not in ne:
     if n_div:
         st.warning(f"⚠️ Cadastro de outra empresa (**{nome_cad}**): {n_div} item(ns) com código "
                    "divergente/ausente — Tipo inferido pela descrição.")
@@ -1356,7 +1465,7 @@ if not manuais.empty:
     st.dataframe(manuais[["Seção", "Separador", "Código", "Descrição", "Débito", "Desc. Débito",
                           "Crédito", "Desc. Crédito"]], hide_index=True)
 
-# ---------- 5. Montagem do layout (1 lançamento por rubrica) ----------
+# ---------- 5. Montagem do layout (1 lançamento por rubrica/item) ----------
 st.subheader("5. Arquivo de importação")
 emp = para_int(cod_empresa)
 
@@ -1386,7 +1495,7 @@ n = len(exp)
 evento = pd.DataFrame({
     COLS_EVENTO[0]: [emp] * n,
     COLS_EVENTO[1]: exp["_sep"].tolist(),
-    COLS_EVENTO[2]: exp["_cod"].tolist(),           # Código Sequencial = código da rubrica
+    COLS_EVENTO[2]: exp["_cod"].tolist(),           # Código Sequencial = código da rubrica/item
     COLS_EVENTO[3]: exp["_tipo"].tolist(),
     COLS_EVENTO[4]: exp["_desc"].tolist(),          # "1 - Horas Normais" (máx. 40)
     COLS_EVENTO[5]: [para_int(v) for v in exp["_deb"]],
@@ -1398,7 +1507,7 @@ evento = pd.DataFrame({
 integra = pd.DataFrame({
     COLS_INTEGRA[0]: [emp] * n,
     COLS_INTEGRA[1]: exp["_sep"].tolist(),
-    COLS_INTEGRA[2]: exp["_cod"].tolist(),          # aponta para o lançamento da própria rubrica
+    COLS_INTEGRA[2]: exp["_cod"].tolist(),          # aponta para o lançamento da própria rubrica/item
     COLS_INTEGRA[3]: exp["_tipo"].tolist(),
     COLS_INTEGRA[4]: exp["_cod"].tolist(),
 }, columns=COLS_INTEGRA).drop_duplicates().reset_index(drop=True)
@@ -1432,24 +1541,31 @@ def excel_bytes(abas: dict) -> bytes:
 
 
 cfg_out = {
-    "versao": 4, "empresa": cod_empresa, "nome_empresa": cab["nome"],
+    "versao": 5, "empresa": cod_empresa, "nome_empresa": cab["nome"],
     "grupos": mapa_grupos, "grupo_socio": grupo_socio, "contas": dict(cfg_contas),
     "historico": historico, "hist_tipo": {str(t): v for t, v in hist_tipo.items() if v},
     "complemento": complemento, "baixa_prov": baixa_prov, "socio_adm": socio_adm,
     "bloqueio_extra": bloq_extra, "raizes": raizes,
     "colunas": {k: v for k, v in sel.items() if v and v != "(nenhuma)"},
 }
+if modo_cad:
+    cfg_out.update({"tipos_cadastro": tipos_cad, "separadores_cadastro": seps_cad})
+else:
+    for chave in ("tipos_cadastro", "separadores_cadastro"):   # preserva o que veio do .json
+        if chave in cfg:
+            cfg_out[chave] = cfg[chave]
 
 conf_abas = {"conferencia": ed}
 if not manuais.empty:
     conf_abas["configurar_manual"] = manuais
 
+sufixo = "_completo" if modo_cad else ""
 c1, c2, c3 = st.columns(3)
 c1.download_button(f"📥 Importação Domínio ({len(evento)} lançamentos)",
                    excel_bytes({ABA_INTEGRA: integra, ABA_EVENTO: evento}),
-                   file_name=f"integracao_folha_emp{cod_empresa}.xlsx")
+                   file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.xlsx")
 c2.download_button("📋 Planilha de conferência completa", excel_bytes(conf_abas),
-                   file_name=f"conferencia_folha_emp{cod_empresa}.xlsx")
+                   file_name=f"conferencia_folha_emp{cod_empresa}{sufixo}.xlsx")
 c3.download_button("💾 Salvar configuração da empresa (.json)",
                    json.dumps(cfg_out, ensure_ascii=False, indent=2).encode("utf-8"),
                    file_name=f"config_folha_emp{cod_empresa}.json", mime="application/json")
