@@ -39,6 +39,10 @@ import pandas as pd
 import streamlit as st
 
 try:
+    import pypdfium2 as pdfium
+except ImportError:
+    pdfium = None
+try:
     import pdfplumber
 except ImportError:
     pdfplumber = None
@@ -51,6 +55,7 @@ SEP_SEM = "0"                             # valor gravado no arquivo quando não
 LIMIAR_SIMILARIDADE = 0.75
 LIM_DESC_EVENTO = 40                      # FOINTEGCONT.descricao = char(40)
 LIM_COMP_HIST = 512                       # FOINTEGCONT.comp_hist = varchar(512)
+HISTORICO_FIXO = "186"                   # Código do Histórico fixo em todos os lançamentos
 COMPLEMENTO_PADRAO = "<<Competencia>> - <<Descrição do Lançamento>>"
 
 ABA_INTEGRA, ABA_EVENTO = "integra", "evento"
@@ -668,8 +673,23 @@ class Resolvedor:
 # =====================================================================
 def extrair_linhas(dados: bytes, nome: str):
     if nome.lower().endswith(".pdf"):
+        # pypdfium2 lê as colunas coladas do relatório de rubricas sem embaralhar caracteres (pdfplumber embaralha).
+        if pdfium is not None:
+            pdf = pdfium.PdfDocument(dados)
+            linhas = []
+            try:
+                for i in range(len(pdf)):
+                    pagina = pdf[i]
+                    tp = pagina.get_textpage()
+                    txt = tp.get_text_range()
+                    tp.close()
+                    pagina.close()
+                    linhas.extend(txt.replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+            finally:
+                pdf.close()
+            return linhas
         if pdfplumber is None:
-            raise RuntimeError("Instale o pdfplumber: pip install pdfplumber")
+            raise RuntimeError("Instale um leitor de PDF: pip install pypdfium2")
         linhas = []
         with pdfplumber.open(io.BytesIO(dados)) as pdf:
             for p in pdf.pages:
@@ -683,10 +703,11 @@ def extrair_linhas(dados: bytes, nome: str):
     return []
 
 
-# O tipo da rubrica é a ÚLTIMA ocorrência (a descrição pode conter "Desconto", "Provento", "Informativa").
-RE_TIPO_RUB = r"(Provento|Desconto|Informativa|Informat\w*|Inf\.\s*ded\w*)"
-RE_RUB = re.compile(r"^\s*(\d{1,5})\s+(.+)\s+" + RE_TIPO_RUB + r"\b")
-RE_RUB_SEM_DESC = re.compile(r"^\s*(\d{1,5})\s*()" + RE_TIPO_RUB + r"\b")
+# O tipo da rubrica é a ÚLTIMA ocorrência na linha (a descrição pode conter "Desconto", "Provento", "Informativa")
+# e, nos PDFs da Domínio, a coluna Tipo vem COLADA à descrição ("...DOENCProvento Nenhuma"), por isso sem \s+.
+RE_TIPO_RUB = r"(Provento|Desconto|Informativa|Informat|Inf\.\s*ded)"
+RE_RUB = re.compile(r"^\s*(\d{1,5})\s+(.+)" + RE_TIPO_RUB)
+RE_RUB_SEM_DESC = re.compile(r"^\s*(\d{1,5})\s*()" + RE_TIPO_RUB)
 
 
 def _casa_rubrica(linha):
@@ -967,6 +988,8 @@ def classificar_desconto(d, secao):
     if tem(d, "PREMIO*", "GRATIFIC*"): return r(["PREMIOS", "SALARIOS"], "Estorno de prêmio/gratificação")
     if tem(d, "FALTA*", "ATRASO*", "DSR", "HORAS", "DIAS", "PAGO A MAIOR", "INATIV*", "SUSPENS*", "AFASTAD*"):
         return r(["SALARIOS"], "Redução do custo de salários")
+    if tem(d, "ARRED*"):
+        return r(["SALARIOS"], "Arredondamento — redução do custo de salários", True)
     return r([], "Desconto sem regra — definir conta manualmente", True)
 
 
@@ -1249,18 +1272,37 @@ def md5(txt: str) -> str:
 # =====================================================================
 # 7. INTERFACE
 # =====================================================================
-st.set_page_config(page_title="Integrador Contábil da Folha", layout="wide")
+st.set_page_config(page_title="Integrador Contábil da Folha", page_icon="📒", layout="wide")
 st.title("📒 Integrador Contábil da Folha — Domínio")
-st.caption("Motor 100% determinístico (regex + regras de substring). Nenhuma IA, API ou chave paga. "
-           "Nenhuma conta fixa: tudo é lido do plano importado.")
+st.caption("Gera o arquivo de integração contábil da folha para importar na Domínio e confere se o líquido fecha. "
+           "Regras fixas e auditáveis, sem IA; as contas são sempre lidas do plano de contas da empresa.")
+
+
+def desenhar_passos(ph, atual: int):
+    nomes = ["Arquivos", "Configuração", "Conferência", "Importação"]
+    with ph.container():
+        cols_p = st.columns(4)
+        for i, nome_p in enumerate(nomes, 1):
+            if i < atual:
+                cols_p[i - 1].markdown(f":green[✅ **{i}. {nome_p}**]")
+            elif i == atual:
+                cols_p[i - 1].markdown(f":blue[▶ **{i}. {nome_p}**]")
+            else:
+                cols_p[i - 1].markdown(f":gray[○ {i}. {nome_p}]")
+        st.progress((atual - 1) / 3)
+
+
+ph_passos = st.empty()
+ph_resumo = st.empty()
+desenhar_passos(ph_passos, 1)
 
 with st.sidebar:
-    st.header("0. Configuração da empresa")
+    st.header("Configuração salva (opcional)")
     f_cfg = st.file_uploader("Carregar configuração salva (.json)", type=["json"])
     if f_cfg is not None:
         aplicar_config(f_cfg.getvalue())
 
-    st.header("1. Arquivos")
+    st.header("Passo 1 · Arquivos")
     st.session_state.setdefault("modo_cad", False)
     if st.session_state["modo_cad"]:
         st.success("Modo: **todos os eventos cadastrados** (cadastro geral + plano de contas)")
@@ -1295,7 +1337,7 @@ with st.sidebar:
                                      "Informando, todos os eventos são replicados para cada separador.")
         st.caption("Tipo 10: cada item da aba Outras Informações (1 a 13) gera o seu próprio lançamento.")
 
-    st.header("2. Regras")
+    st.header("Regras desta empresa")
     for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", ""),
                  ("w_compl", COMPLEMENTO_PADRAO), ("w_mesma_resc", False), ("w_mesma_fer", False),
                  ("w_exc_fer", ""), ("w_exc_resc", ""), ("w_filant", False), ("w_exclusivas", True),
@@ -1336,26 +1378,21 @@ with st.sidebar:
     baixa_prov = st.checkbox("Baixar férias/13º pagos contra a provisão", key="w_baixa",
                              help="Deixe desmarcado se a Domínio já gera o 'Valor Estorno Provisão'.")
     socio_adm = st.checkbox("Pró-labore e encargos do sócio sempre em Despesas Administrativas", key="w_socio")
-    bloq_extra = st.text_input("Contas extras de colaborador (reduzidos, separados por vírgula)", key="w_bloq",
-                               help="Além das detectadas automaticamente; itens patronais nunca poderão usá-las.")
-
-    st.header("3. Layout de importação")
-    historico = st.text_input("Código do Histórico (padrão)", key="w_hist")
-    hist_tipo = {}
-    with st.expander("Histórico por Tipo da Integração (opcional)"):
-        for t, n in TIPOS_LAYOUT.items():
-            st.session_state.setdefault(f"w_hist_{t}", "")
-            hist_tipo[t] = st.text_input(f"{t} - {n}", key=f"w_hist_{t}",
-                                         placeholder=historico or "usa o padrão")
-    complemento = st.text_input("Complemento", key="w_compl")
-    st.caption(f"1 lançamento por rubrica/item · Código Sequencial = código da rubrica/item · "
-               f"Descrição = 'código - descrição' em caixa mista, máx. {LIM_DESC_EVENTO} caracteres.")
+    with st.expander("Opções avançadas"):
+        bloq_extra = st.text_input("Contas extras de colaborador (reduzidos, separados por vírgula)", key="w_bloq",
+                                   help="Além das detectadas automaticamente; itens patronais nunca poderão usá-las.")
+        historico = HISTORICO_FIXO
+        hist_tipo = {}
+        st.text_input("Código do Histórico (fixo)", value=HISTORICO_FIXO, disabled=True)
+        complemento = st.text_input("Complemento", key="w_compl")
+        st.caption(f"1 lançamento por rubrica/item · Código Sequencial = código da rubrica/item · "
+                   f"Descrição = 'código - descrição' em caixa mista, máx. {LIM_DESC_EVENTO} caracteres.")
 
 if not (f_cad and f_plano and (f_pend or modo_cad)):
-    st.info("Envie o cadastro geral de rubricas e o plano de contas"
-            + ("." if modo_cad else " e o relatório de pendências — ou use o botão "
+    st.info("👈 Comece pelo Passo 1: envie na barra lateral o cadastro geral de rubricas e o plano de contas"
+            + ("." if modo_cad else " e o relatório de rubricas/itens não configurados — ou use o botão "
                "'Contabilizar todos os eventos cadastrados'.")
-            + " Opcional: carregue a configuração salva da empresa.")
+            + " Se já configurou esta empresa antes, carregue também a configuração salva.")
     st.stop()
 
 cfg = st.session_state.get("cfg", {})
@@ -1374,6 +1411,7 @@ except Exception as e:
     st.error(f"Erro na leitura: {e}")
     st.stop()
 
+desenhar_passos(ph_passos, 2)
 itens, n_unif, n_excl = unificar_com_folha(itens, mesma_fer, mesma_resc, manter_excl)
 if n_unif or n_excl:
     nomes_unif = " e ".join(n for n, f in (("Férias", mesma_fer), ("Rescisão", mesma_resc)) if f)
@@ -1409,7 +1447,7 @@ if cfg.get("empresa") and cab["codigo"] and str(cfg["empresa"]) != cab["codigo"]
                f"mas o {'cadastro' if modo_cad else 'relatório'} é da empresa {cab['codigo']}.")
 
 # ---------- 1. Estrutura do plano ----------
-st.subheader("1. Estrutura do plano de contas")
+st.subheader("Passo 2 · Plano de contas")
 cols = list(raw.columns)
 auto = auto_colunas(cols)
 cfg_cols = cfg.get("colunas", {})
@@ -1471,7 +1509,7 @@ if modo_cad:
                + " · ".join(f"{t} - {TIPOS_LAYOUT[t]}: {n}" for t, n in cont.items()))
 
 # ---------- 2. Separadores ----------
-st.subheader("2. Separador → grupo de resultado")
+st.subheader("Passo 2 · Onde lançar a despesa da folha")
 usa_sep = any(i["sep_cod"] for i in itens)
 
 cands = grupos_resultado(plano, raizes["RESULTADO"], pontuado)
@@ -1486,9 +1524,8 @@ if usa_sep:
     tipos = sorted({i["sep_tipo"] for i in itens if i["sep_tipo"]})
     st.success(f"Folha com separador ({', '.join(tipos)}).")
 else:
-    st.warning(f"Nenhuma quebra por Centro de Custo / Filial / Serviço → folha centralizada "
-               f"({NOME_PADRAO_SEM_SEPARADOR}, Separador = {SEP_SEM} no arquivo). "
-               "Escolha o grupo contábil em que a folha inteira será classificada.")
+    st.info("A folha não está dividida por centro de custo, filial ou serviço. "
+            "Escolha abaixo o grupo de despesa em que a folha inteira será lançada.")
 
 seps = {}
 for it in itens:
@@ -1520,8 +1557,9 @@ for k, nome in seps.items():
     mapa_grupos[k] = pref
 
 if any(not v for v in mapa_grupos.values()):
-    st.info("Defina o grupo de todos os separadores para continuar.")
+    st.info("Escolha o grupo de despesa acima para continuar.")
     st.stop()
+desenhar_passos(ph_passos, 3)
 
 grupo_socio = None
 if socio_adm:
@@ -1582,7 +1620,7 @@ if n_isencao_ign:
             "Se a empresa é filantrópica, marque 'Entidade filantrópica' na barra lateral.")
 
 # ---------- 3. Mapa de contas ----------
-st.subheader("3. Mapa de contas")
+st.subheader("Passo 2 · Contas do plano usadas nos lançamentos")
 base_res = Resolvedor(plano, pontuado, raizes, {})
 pares = {Resolvedor.chave(a, ""): (a, "") for a in COLAB_ALVOS}
 for r in regras:
@@ -1600,9 +1638,10 @@ for chave, (a, g) in sorted(pares.items()):
     })
 df_map = pd.DataFrame(linhas_map)
 n_nf = int(((df_map["Sugerida"] == "") & (df_map["Conta definida"] == "")).sum())
-with st.expander(f"Contas localizadas por descrição — {n_nf} alvo(s) sem conta", expanded=n_nf > 0):
-    st.caption("Preencha 'Conta definida' com o código reduzido para substituir a sugestão. "
-               "Os valores entram na configuração salva da empresa.")
+with st.expander(f"Contas encontradas no plano — {n_nf} sem conta definida", expanded=n_nf > 0):
+    st.caption("O app procurou cada conta pelo nome no plano da empresa. Onde aparecer '❌ não encontrada', "
+               "informe o código reduzido na coluna 'Conta definida' (também serve para trocar uma sugestão). "
+               "Os valores ficam na configuração salva da empresa.")
     ed_map = st.data_editor(df_map, key=f"map_{md5(df_map.to_json())}", hide_index=True,
                             disabled=[c for c in df_map.columns if c != "Conta definida"],
                             column_config={"Conta definida": st.column_config.TextColumn()})
@@ -1678,27 +1717,32 @@ n_div = int(df["Origem do tipo"].str.startswith("Inferido").sum())
 ne, nc = norm(cab["nome"]), norm(nome_cad)
 if not modo_cad and ne and nc and ne not in nc and nc not in ne:
     if n_div:
-        st.warning(f"⚠️ Cadastro de outra empresa (**{nome_cad}**): {n_div} item(ns) com código "
-                   "divergente/ausente — Tipo inferido pela descrição.")
+        st.warning(f"⚠️ O cadastro enviado é de outro modelo (**{nome_cad}**): {n_div} rubrica(s) não conferem "
+                   "em código/descrição e tiveram o tipo (provento/desconto) deduzido pelo nome — revise-as.")
     else:
         st.info(f"Cadastro do modelo **{nome_cad}**, mas todas as rubricas conferem por código + descrição.")
 
 # ---------- 4. Conferência ----------
-st.subheader("4. Conferência")
-st.caption("Edições aqui valem só para este lote. Para correções permanentes de contas, use o Mapa de contas.")
+st.subheader("Passo 3 · Conferência das rubricas")
+n_ok_ = int((df["Status"] == ST_OK).sum())
+n_rev_ = int((df["Status"] == ST_REV).sum())
+n_pend_ = int((df["Status"] == ST_PEND).sum())
 mcols = st.columns(5)
 for col, s in zip(mcols, (ST_OK, ST_REV, ST_PEND, ST_NAO, ST_MAN)):
     col.metric(s, int((df["Status"] == s).sum()))
 
 EDITAVEIS = ("Débito", "Crédito", "Descrição Lançamento", "Exportar")
-ed = st.data_editor(
-    df, key=f"editor_{md5(df.to_json())}", hide_index=True,
-    disabled=[c for c in df.columns if c not in EDITAVEIS],
-    column_config={"Exportar": st.column_config.CheckboxColumn(),
-                   "Débito": st.column_config.TextColumn(), "Crédito": st.column_config.TextColumn(),
-                   "Descrição Lançamento": st.column_config.TextColumn(
-                       help=f"Máximo {LIM_DESC_EVENTO} caracteres")},
-)
+with st.expander("Ver e ajustar rubrica por rubrica", expanded=bool(n_pend_ or n_rev_)):
+    st.caption("✅ OK = pronto · ⚠️ Revisar = confira a sugestão · ❌ Pendente = falta conta. "
+               "Edições aqui valem só para este lote; para correções permanentes de contas use o Passo 2.")
+    ed = st.data_editor(
+        df, key=f"editor_{md5(df.to_json())}", hide_index=True,
+        disabled=[c for c in df.columns if c not in EDITAVEIS],
+        column_config={"Exportar": st.column_config.CheckboxColumn(),
+                       "Débito": st.column_config.TextColumn(), "Crédito": st.column_config.TextColumn(),
+                       "Descrição Lançamento": st.column_config.TextColumn(
+                           help=f"Máximo {LIM_DESC_EVENTO} caracteres")},
+    )
 
 idx_plano = plano.drop_duplicates("reduzido").set_index("reduzido")
 
@@ -1733,20 +1777,22 @@ ed["Validação"] = ed.apply(validar, axis=1)
 exportar = ed[ed["Exportar"] & (ed["Validação"] == "")].reset_index(drop=True)
 bloqueadas = ed[ed["Exportar"] & (ed["Validação"] != "")]
 if not bloqueadas.empty:
-    st.error(f"{len(bloqueadas)} linha(s) marcadas para exportar com erro — ficarão fora do lote.")
-    st.dataframe(bloqueadas[["Seção", "Separador", "Código", "Descrição", "Validação"]], hide_index=True)
+    st.error(f"{len(bloqueadas)} linha(s) marcada(s) para exportar têm erro e ficarão fora do arquivo.")
+    with st.expander("Ver linhas com erro", expanded=True):
+        st.dataframe(bloqueadas[["Seção", "Separador", "Código", "Descrição", "Validação"]], hide_index=True)
 
 manuais = ed[ed["Status"] == ST_MAN]
 if not manuais.empty:
-    st.warning(f"📝 {len(manuais)} item(ns) de seção sem código no layout — configure-os manualmente na Domínio.")
-    st.dataframe(manuais[["Seção", "Separador", "Código", "Descrição", "Débito", "Desc. Débito",
-                          "Crédito", "Desc. Crédito"]], hide_index=True)
+    st.warning(f"📝 {len(manuais)} item(ns) não têm tipo de integração no layout — configure-os manualmente na Domínio.")
+    with st.expander("Ver itens para configurar manualmente", expanded=True):
+        st.dataframe(manuais[["Seção", "Separador", "Código", "Descrição", "Débito", "Desc. Débito",
+                              "Crédito", "Desc. Crédito"]], hide_index=True)
 
 # ---------- 4b. Verificação do líquido ----------
 # Regra: todo provento credita a conta de líquido da seção e todo desconto a debita; assim
 # Σ proventos − Σ descontos = saldo da conta de líquido (o líquido da folha). Nenhuma rubrica com
 # valor (provento/desconto) pode ficar fora do arquivo.
-st.subheader("4b. Verificação do líquido")
+st.subheader("Passo 3 · O líquido da folha fecha?")
 e_vd = ed["Tipo"].isin(["Provento", "Desconto"])
 no_arquivo = ed["Exportar"] & (ed["Validação"] == "")
 fora = ed[e_vd & ~no_arquivo]
@@ -1763,26 +1809,29 @@ def _fura_liquido(row):
 furam = ed[e_vd & no_arquivo & ed.apply(_fura_liquido, axis=1)]
 l1, l2, l3 = st.columns(3)
 l1.metric("Proventos/descontos no arquivo", int((e_vd & no_arquivo).sum()))
-l2.metric("Fora do arquivo (líquido não fecha)", len(fora))
-l3.metric("Não tocam a conta de líquido", len(furam))
+l2.metric("Sem conta (fora do arquivo)", len(fora))
+l3.metric("Fora da conta de líquido", len(furam))
 if not fora.empty:
-    st.error(f"❌ {len(fora)} provento(s)/desconto(s) com valor ficarão fora do arquivo — o líquido não fechará "
-             "até que sejam configurados.")
-    st.dataframe(fora[["Status", "Seção", "Separador", "Código", "Descrição", "Tipo", "Débito", "Crédito",
-                       "Observação"]], hide_index=True)
+    st.error(f"❌ {len(fora)} rubrica(s) ainda não têm conta definida e ficarão fora do arquivo — sem elas o líquido "
+             "da folha não fecha. Informe as contas em 'Passo 2 · Contas do plano usadas nos lançamentos' "
+             "(coluna 'Conta definida').")
+    with st.expander("Ver rubricas sem conta", expanded=True):
+        st.dataframe(fora[["Status", "Seção", "Separador", "Código", "Descrição", "Tipo", "Débito", "Crédito",
+                           "Observação"]], hide_index=True)
 if not furam.empty:
-    st.warning(f"⚠️ {len(furam)} provento(s)/desconto(s) não creditam/debitam a conta de líquido da seção "
-               "(coluna 'Conta Líquido'). Confirme se é intencional.")
-    st.dataframe(furam[["Seção", "Separador", "Código", "Descrição", "Tipo", "Débito", "Crédito",
-                        "Conta Líquido"]], hide_index=True)
+    st.warning(f"⚠️ {len(furam)} rubrica(s) não usam a conta de líquido da seção (coluna 'Conta Líquido'). "
+               "Confirme se é intencional.")
+    with st.expander("Ver rubricas fora da conta de líquido", expanded=True):
+        st.dataframe(furam[["Seção", "Separador", "Código", "Descrição", "Tipo", "Débito", "Crédito",
+                            "Conta Líquido"]], hide_index=True)
 if fora.empty and furam.empty:
-    st.success("Todo provento credita e todo desconto debita a conta de líquido da seção; nenhuma rubrica com "
-               "valor ficou de fora.")
-forcar = st.checkbox("Permitir exportar mesmo com rubricas com valor fora do arquivo", key="w_forcar",
+    st.success("✅ O líquido fecha: todo provento é creditado e todo desconto é debitado na conta de líquido, "
+               "e nenhuma rubrica com valor ficou de fora.")
+forcar = st.checkbox("Permitir exportar mesmo assim (o líquido não fechará)", key="w_forcar",
                      disabled=fora.empty)
 
 # ---------- 5. Montagem do layout (1 lançamento por rubrica/item) ----------
-st.subheader("5. Arquivo de importação")
+st.subheader("Passo 4 · Arquivo para importar na Domínio")
 emp = para_int(cod_empresa)
 
 exp = exportar.copy()
@@ -1805,11 +1854,12 @@ conflitos = exp[exp.duplicated(chave_pk, keep=False)]
 exp = (exp.drop_duplicates(chave_pk, keep="first")
        .sort_values(chave_pk, kind="stable").reset_index(drop=True))
 if not conflitos.empty:
-    st.error(f"❌ {len(conflitos)} linha(s) usam a mesma chave de lançamento (separador + tipo + código) com contas "
-             "diferentes. A tabela da Domínio aceita um único lançamento por chave: foi mantida a PRIMEIRA linha de "
-             "cada grupo. Para escolher outra, desmarque 'Exportar' nas linhas que não devem seguir.")
-    st.dataframe(conflitos[["Seção", "Separador", "Tipo Integração", "Código", "Descrição Lançamento",
-                            "Débito", "Crédito"]], hide_index=True)
+    st.error(f"❌ {len(conflitos)} rubrica(s) disputam o mesmo código de lançamento (mesmo separador e tipo) com contas "
+             "diferentes. A Domínio aceita um único lançamento por código: foi mantida a PRIMEIRA de cada grupo. "
+             "Para escolher outra, desmarque 'Exportar' nas que não devem seguir.")
+    with st.expander("Ver rubricas em conflito", expanded=True):
+        st.dataframe(conflitos[["Seção", "Separador", "Tipo Integração", "Código", "Descrição Lançamento",
+                                "Débito", "Crédito"]], hide_index=True)
 n = len(exp)
 
 evento = pd.DataFrame({
@@ -1843,7 +1893,7 @@ if cortadas:
 checagens = checar_layout(evento, integra) if n else []
 erros_layout = [c for c in checagens if c["Nível"] == "Erro" and c["Resultado"] == "❌"]
 avisos_layout = [c for c in checagens if c["Nível"] == "Aviso" and c["Resultado"] == "⚠️"]
-with st.expander(f"Conformidade com o leiaute da importação de tabelas (FOINTEGCONT / FOINTEGCONTEVE) — "
+with st.expander(f"Conformidade com o layout da Domínio (FOINTEGCONT / FOINTEGCONTEVE) — "
                  f"{len(erros_layout)} erro(s), {len(avisos_layout)} aviso(s)",
                  expanded=bool(erros_layout or avisos_layout)):
     if checagens:
@@ -1857,9 +1907,10 @@ e1, e2, e3 = st.columns(3)
 e1.metric("Lançamentos (aba evento)", len(evento))
 e2.metric("Vínculos (aba integra)", len(integra))
 e3.metric("Configurar manualmente", len(manuais))
-t1, t2 = st.tabs([ABA_EVENTO, ABA_INTEGRA])
-t1.dataframe(evento, hide_index=True, use_container_width=True)
-t2.dataframe(integra, hide_index=True, use_container_width=True)
+with st.expander("Pré-visualizar o arquivo (abas evento e integra)"):
+    t1, t2 = st.tabs([ABA_EVENTO, ABA_INTEGRA])
+    t1.dataframe(evento, hide_index=True, use_container_width=True)
+    t2.dataframe(integra, hide_index=True, use_container_width=True)
 
 
 def excel_bytes(abas: dict) -> bytes:
@@ -1894,17 +1945,43 @@ if checagens:
     conf_abas["conformidade_layout"] = pd.DataFrame(checagens)
 
 bloqueio_import = bool(erros_layout) or (not fora.empty and not forcar) or n == 0
+motivos = []
+if n == 0:
+    motivos.append("nenhum lançamento foi gerado")
 if erros_layout:
-    st.error("❌ O arquivo não está conforme o leiaute (ver detalhes acima) — o download da importação está bloqueado.")
+    motivos.append(f"{len(erros_layout)} erro(s) de conformidade com o layout da Domínio")
+if not fora.empty and not forcar:
+    motivos.append(f"{len(fora)} rubrica(s) sem conta definida (o líquido não fecha)")
+
+desenhar_passos(ph_passos, 3 if bloqueio_import else 4)
+with ph_resumo.container():
+    if motivos:
+        st.error("⛔ Ainda não dá para importar: " + "; ".join(motivos) + ". Veja os Passos 2 e 3 abaixo.")
+    elif n_rev_ or not furam.empty or avisos_layout or not conflitos.empty or not fora.empty:
+        st.warning(f"⚠️ Arquivo gerado, mas confira antes de importar: {n_rev_} rubrica(s) marcada(s) como 'Revisar'"
+                   + ("; exportação liberada com o líquido não fechando" if not fora.empty else "") + ".")
+    else:
+        st.success("✅ Tudo certo: o arquivo está pronto para importar na Domínio.")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Lançamentos prontos", len(evento))
+    k2.metric("Rubricas OK", n_ok_)
+    k3.metric("Para revisar", n_rev_)
+    k4.metric("Sem conta definida", n_pend_)
+    k5.metric("Líquido da folha", "Fecha" if (fora.empty and furam.empty) else "Não fecha" if not fora.empty else "Confirmar")
+
+if erros_layout:
+    st.error("❌ O arquivo não está conforme o layout da Domínio (veja 'Conformidade com o layout' acima) — "
+             "o download está bloqueado.")
 elif not fora.empty and not forcar:
-    st.error("❌ Download da importação bloqueado: há provento(s)/desconto(s) com valor fora do arquivo. "
-             "Resolva-os ou marque 'Permitir exportar mesmo com rubricas fora do arquivo'.")
+    st.error("❌ Download bloqueado: há rubricas sem conta definida, e o líquido não fecharia. Defina as contas no "
+             "Passo 2 ou marque 'Permitir exportar mesmo assim' no Passo 3.")
 
 sufixo = "_completo" if modo_cad else ""
-c1, c2, c3 = st.columns(3)
-c1.download_button(f"📥 Importação Domínio ({len(evento)} lançamentos)",
+st.download_button(f"⬇️ Baixar arquivo de importação ({len(evento)} lançamentos)",
                    excel_bytes({ABA_INTEGRA: integra, ABA_EVENTO: evento}),
-                   file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.xlsx", disabled=bloqueio_import)
+                   file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.xlsx", disabled=bloqueio_import,
+                   type="primary")
+c2, c3 = st.columns(2)
 c2.download_button("📋 Planilha de conferência completa", excel_bytes(conf_abas),
                    file_name=f"conferencia_folha_emp{cod_empresa}{sufixo}.xlsx")
 c3.download_button("💾 Salvar configuração da empresa (.json)",
