@@ -4,26 +4,32 @@ Motor 100% determinístico (regex + regras de substring). Sem IA, sem APIs, sem 
 
 - Nenhuma conta, código reduzido ou classificação de plano é fixada no código.
 - Exportação no layout de importação da Domínio (1 lançamento por rubrica/item):
-    aba "evento"  -> lançamento: Código Sequencial = código da rubrica/item,
+    aba "evento"  -> lançamento (tabela FOINTEGCONT): Código Sequencial = código da rubrica/item,
                      Descrição = "código - descrição" (caixa mista, máx. 40 caracteres)
-    aba "integra" -> vínculo da rubrica/item ao seu lançamento
+    aba "integra" -> vínculo da rubrica/item ao seu lançamento (tabela FOINTEGCONTEVE)
 - Tipos: 1 Folha mensal | 2 Empresa | 3 Férias | 4 Rescisão | 5 Prov. Férias | 6 Prov. 13 | 10 Outras Informações
 - Dois modos:
     * Pendências: lê o relatório "Rubricas/Itens não configurados"
     * Todos os eventos cadastrados: usa só o Cadastro geral de rubricas + Plano de contas
 - "Usar a mesma configuração da folha normal para Férias/Rescisão" (igual à Domínio):
-    marcado    = o Tipo 3/4 não é gerado; os itens usam o lançamento da Folha (Tipo 1)
+    marcado    = o Tipo 3/4 não é gerado; os itens usam o lançamento da Folha (Tipo 1).
+                 Rubricas exclusivas de Férias/Rescisão (que não existem na Folha) podem permanecer
+                 no próprio Tipo 3/4 (opção "Manter exclusivas"), como a Domínio grava.
     desmarcado = Tipo 3/4 próprio: passivo próprio (Férias/Rescisões a Pagar) E despesa própria
                  (Férias / Rescisão), com exceções automáticas e por código
+- Entidade filantrópica: gera também os itens de isenção (25 a 36) como estorno do INSS patronal.
+- Conferências: chave única do lançamento (empresa+separador+código+tipo), uma rubrica por lançamento
+  em cada empresa+separador+tipo, verificação do líquido e conformidade com FOINTEGCONT/FOINTEGCONTEVE.
 
 Executar:
     pip install -r requirements.txt
-    streamlit run app.py
+    streamlit run app_corrigido.py
 """
 import csv
 import hashlib
 import io
 import json
+import numbers
 import re
 import unicodedata
 from difflib import SequenceMatcher
@@ -42,8 +48,9 @@ except ImportError:
 # =====================================================================
 NOME_PADRAO_SEM_SEPARADOR = "Geral"      # só para exibição na tela
 SEP_SEM = "0"                             # valor gravado no arquivo quando não há separador
-LIMIAR_SIMILARIDADE = 0.60
-LIM_DESC_EVENTO = 40                      # tamanho máximo do campo "Descrição" do lançamento
+LIMIAR_SIMILARIDADE = 0.75
+LIM_DESC_EVENTO = 40                      # FOINTEGCONT.descricao = char(40)
+LIM_COMP_HIST = 512                       # FOINTEGCONT.comp_hist = varchar(512)
 COMPLEMENTO_PADRAO = "<<Competencia>> - <<Descrição do Lançamento>>"
 
 ABA_INTEGRA, ABA_EVENTO = "integra", "evento"
@@ -180,6 +187,11 @@ def e_fgts(d): return bool(RE_FGTS.search(d))
 def e_base(d):
     """Base de cálculo ou dedução de base (BASE INSS DE FÉRIAS, DEDUÇÃO BASE FGTS...)."""
     return tem(d, "BASE", "BASES")
+
+
+def e_ferias(d):
+    """Férias de fato: 'FÉRIAS' ou 'ABONO PECUNIÁRIO' (não 'Abono Salarial'/'Abono Natalino')."""
+    return tem(d, "FERIAS") or tem(d, "ABONO PECUNIARIO")
 
 
 def txt_cel(v) -> str:
@@ -663,7 +675,7 @@ def extrair_linhas(dados: bytes, nome: str):
             for p in pdf.pages:
                 linhas.extend((p.extract_text() or "").splitlines())
         return linhas
-    for enc in ("utf-8", "cp1252", "latin-1"):
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
             return dados.decode(enc).splitlines()
         except UnicodeDecodeError:
@@ -671,8 +683,14 @@ def extrair_linhas(dados: bytes, nome: str):
     return []
 
 
-RE_RUB = re.compile(r"^\s*(\d{1,5})\s+(.*?)\s*"
-                    r"(Provento|Desconto|Informativa|Informat|Inf\.\s*dedutora|Inf\.\s*ded)")
+# O tipo da rubrica é a ÚLTIMA ocorrência (a descrição pode conter "Desconto", "Provento", "Informativa").
+RE_TIPO_RUB = r"(Provento|Desconto|Informativa|Informat\w*|Inf\.\s*ded\w*)"
+RE_RUB = re.compile(r"^\s*(\d{1,5})\s+(.+)\s+" + RE_TIPO_RUB + r"\b")
+RE_RUB_SEM_DESC = re.compile(r"^\s*(\d{1,5})\s*()" + RE_TIPO_RUB + r"\b")
+
+
+def _casa_rubrica(linha):
+    return RE_RUB.match(linha) or RE_RUB_SEM_DESC.match(linha)
 
 
 def _tipo_cad(t):
@@ -689,7 +707,7 @@ def parse_cadastro(dados: bytes, nome: str):
     cab = next((re.split(r"P[áa]gina", l, flags=re.I)[0].strip() for l in linhas if l.strip()), "")
     cad = {}
     for l in linhas:
-        m = RE_RUB.match(l)
+        m = _casa_rubrica(l)
         if m and int(m.group(1)) not in cad:
             desc = m.group(2).strip()
             cad[int(m.group(1))] = {"descricao": desc, "desc_norm": norm(desc), "tipo": _tipo_cad(m.group(3))}
@@ -747,7 +765,7 @@ def empresa_do_cadastro(dados: bytes, nome: str):
     linhas = [l for l in extrair_linhas(dados, nome) if l.strip()]
     for l in linhas[:15]:
         t = re.split(r"P[áa]gina", l, flags=re.I)[0].strip()
-        if RE_RUB.match(t):                       # já chegou nas rubricas
+        if _casa_rubrica(t):                       # já chegou nas rubricas
             break
         m = RE_EMPRESA.match(t) or RE_CAB_EMP.match(t)
         if m:
@@ -786,29 +804,36 @@ def itens_do_cadastro(cad: dict, tipos, separadores):
     return itens
 
 
-def unificar_com_folha(itens, mesma_ferias: bool, mesma_rescisao: bool):
+def unificar_com_folha(itens, mesma_ferias: bool, mesma_rescisao: bool, manter_exclusivas: bool = False):
     """'Usar a mesma configuração da folha normal para Férias/Rescisão' (Domínio):
-    os itens dessas seções passam a usar o lançamento da Folha (Tipo 1). Não duplica rubrica
-    que já está no Tipo 1 do mesmo separador. Retorna (itens, quantidade unificada)."""
+    os itens dessas seções passam a usar o lançamento da Folha (Tipo 1).
+    - rubrica que já existe na Folha (mesmo separador e código): o item de Férias/Rescisão é descartado;
+    - rubrica exclusiva de Férias/Rescisão: com manter_exclusivas continua no próprio Tipo 3/4
+      (como a Domínio grava, p.ex. Aviso Prévio com crédito em Rescisões a Pagar);
+      sem manter_exclusivas é movida para a Folha (Tipo 1).
+    Retorna (itens, quantidade unificada, quantidade de exclusivas mantidas)."""
     unir = {s for s, f in (("Férias", mesma_ferias), ("Rescisão", mesma_rescisao)) if f}
     if not unir:
-        return itens, 0
-    out, vistos, movidos = [], set(), 0
-    for it in itens:
-        if it["secao"] in unir:
-            continue
-        out.append(it)
-        if TIPO_INTEGRACAO.get(it["secao"]) == 1:
-            vistos.add((it["sep_cod"], it["codigo"]))
+        return itens, 0, 0
+    folha = {(it["sep_cod"], it["codigo"]) for it in itens
+             if it["secao"] not in unir and TIPO_INTEGRACAO.get(it["secao"]) == 1}
+    out, movidos, mantidos = [], 0, 0
     for it in itens:
         if it["secao"] not in unir:
+            out.append(it)
             continue
-        movidos += 1
         k = (it["sep_cod"], it["codigo"])
-        if k not in vistos:
-            vistos.add(k)
+        if k in folha:
+            movidos += 1
+            continue
+        if manter_exclusivas:
+            mantidos += 1
+            out.append(it)
+        else:
+            movidos += 1
+            folha.add(k)
             out.append({**it, "secao": "Folha Normal"})
-    return out, movidos
+    return out, movidos, mantidos
 
 # =====================================================================
 # 5. REGRAS DETERMINÍSTICAS
@@ -872,7 +897,7 @@ def alvo_dre_provento(d):
     if e_licenca_remunerada(d) and not tem(d, "GOZ*"): return ["SALARIOS"]
     if tem(d, "HORAS EXTRA*", "EXTRAS", "BANCO DE HORAS"): return ["HE", "SALARIOS"]
     if e13(d): return ["DECIMO", "SALARIOS"]
-    if tem(d, "FERIAS", "ABONO"): return ["FERIAS", "SALARIOS"]
+    if e_ferias(d): return ["FERIAS", "SALARIOS"]
     if tem(d, "AVISO PREVIO", "INDENIZ*", "MULTA", "ESTABILIDADE"): return ["INDENIZ", "SALARIOS"]
     if tem(d, "PREMIO*", "GRATIFIC*", "BONUS", "PLR", "PARTICIPACAO LUCRO*", "PARTIC LUCRO*"):
         return ["PREMIOS", "SALARIOS"]
@@ -893,17 +918,16 @@ def classificar_provento(d, secao, baixa_prov):
         return alvo_adiant(d), L, "Adiantamento pago: Ativo × obrigação", False
     if tem(d, "DEV", "DEVOLUCAO") and tem(d, "EMPREST*", "CONSIG*"):
         return ["EMPREST"], L, "Devolução de consignado", True
-    # Maternidade "INSS": a empresa paga e abate o valor do INSS a recolher
-    if e_maternidade(d) and tem(d, "INSS") and not tem(d, "DESC*", "DEDUC*"):
-        return ["INSS_REC"], L, "Maternidade paga pela empresa e deduzida do INSS a recolher", False
+    # Maternidade: SEMPRE pela conta-ponte (a baixa é feita pelo Tipo 10 "Compensação da Ded. Sal. Maternidade").
+    # Lançar direto em INSS a Recolher e também compensar no Tipo 10 baixaria o INSS duas vezes.
+    if e_maternidade(d) and not tem(d, "DESC*", "DEDUC*", "PRORROG*", "EMPREGADOR"):
+        return ["BENEF_INSS"], L, "Salário-maternidade reembolsável → conta-ponte (baixa no Tipo 10)", False
     if tem(d, "INSS", "IRRF") and tem(d, "A MAIOR", "DIF*", "DEVOL*", "RESTITUI*"):
         return (["IRRF_REC"] if tem(d, "IRRF") else ["INSS_REC"]), L, "Restituição de retenção a maior", False
     if tem(d, "SALARIO FAMILIA", "SAL FAM*"):
         return ["BENEF_INSS"], L, "Salário-família → conta-ponte até a compensação na guia", False
-    if e_maternidade(d) and not tem(d, "DESC*", "DEDUC*", "PRORROG*", "EMPREGADOR"):
-        return ["BENEF_INSS"], L, "Salário-maternidade reembolsável → conta-ponte", False
     dre = alvo_dre_provento(d)
-    if baixa_prov and secao in ("Férias", "Rescisão", "13º Salário") and dre[0] in ("FERIAS", "DECIMO"):
+    if baixa_prov and dre[0] in ("FERIAS", "DECIMO"):
         return (["P_PROV_FER"] if dre[0] == "FERIAS" else ["P_PROV_13"]), L, "Baixa contra a provisão", False
     return dre, L, "", False
 
@@ -913,7 +937,10 @@ def classificar_desconto(d, secao):
     def r(c, obs="", rev=False): return L, c, obs, rev
     if tem(d, "ESTOURO", "TROCO"): return r(["ADIANT_SAL"], "Baixa de estouro/troco anterior")
     if tem(d, "LIQUIDO") and tem(d, "RESCIS*"):
-        return r(["RESC_PAGAR"], "Líquido da rescisão pago à parte — transfere p/ Rescisões a Pagar", True)
+        # Sempre D Salários a Pagar × C Rescisões a Pagar (a Domínio grava essa rubrica no Tipo 1);
+        # na seção Rescisão o passivo da seção já é Rescisões a Pagar e o lançamento viraria curto-circuito.
+        return ((["SAL_PAGAR"], ["RESC_PAGAR"],
+                 "Líquido da rescisão pago à parte — transfere p/ Rescisões a Pagar", True))
     if tem(d, "PENSAO*"): return r(["PENSAO"], "Repasse ao beneficiário", True)
     if tem(d, "SAL FAM*", "SALARIO FAMILIA"):
         return r(["BENEF_INSS"], "Estorno de salário-família pago a maior", True)
@@ -935,7 +962,7 @@ def classificar_desconto(d, secao):
         return r(["INDENIZ", "SALARIOS"], "Indenização devida pelo empregado", True)
     if e13(d): return r(["DECIMO", "SALARIOS"], "Redução do custo de 13º")
     if e_maternidade(d): return r(["BENEF_INSS"], "Estorno de salário-maternidade pago a maior", True)
-    if tem(d, "FERIAS", "ABONO"): return r(["FERIAS", "SALARIOS"], "Redução do custo de férias")
+    if e_ferias(d): return r(["FERIAS", "SALARIOS"], "Redução do custo de férias")
     if tem(d, "COMISS*"): return r(["COMISSOES", "PREMIOS", "SALARIOS"], "Estorno de comissões")
     if tem(d, "PREMIO*", "GRATIFIC*"): return r(["PREMIOS", "SALARIOS"], "Estorno de prêmio/gratificação")
     if tem(d, "FALTA*", "ATRASO*", "DSR", "HORAS", "DIAS", "PAGO A MAIOR", "INATIV*", "SUSPENS*", "AFASTAD*"):
@@ -1018,7 +1045,7 @@ def inferir_item_empresa(d):
     return nat, ("13" if e13(d) else "F" if tem(d, "FERIAS") else "M")
 
 
-def classificar_item_empresa(codigo, d, baixa_prov):
+def classificar_item_empresa(codigo, d, baixa_prov, filantropica=False):
     cat = ITENS_EMPRESA.get(codigo)
     if cat and confere(d, norm(cat[0])):
         _, nat, comp = cat
@@ -1028,7 +1055,7 @@ def classificar_item_empresa(codigo, d, baixa_prov):
         origem = (f"Inferido — no catálogo o item {codigo} é '{cat[0]}'" if cat
                   else f"Inferido — item {codigo} fora do catálogo")
     sfx = {"F": "FER", "13": "13"}.get(comp)
-    prov = bool(baixa_prov and sfx and nat in ("INSS", "SENAI", "PIS"))
+    prov = bool(baixa_prov and sfx and nat in ("INSS", "SENAI", "PIS", "ISENCAO"))
     if nat in ("INSS", "INSS_SOCIO", "AUTONOMO", "SENAI"):
         deb, cred = ([f"P_INSS_{sfx}", f"P_PROV_{sfx}"] if prov else ["INSS"]), ["INSS_REC"]
     elif nat == "PIS":
@@ -1041,11 +1068,20 @@ def classificar_item_empresa(codigo, d, baixa_prov):
         deb, cred = ["SIND_PAT", "TAXAS_DIV"], ["SIND_PAT_REC", "SIND_REC"]
     elif nat == "DEDUCAO":
         deb, cred = ["INSS_REC"], ["BENEF_INSS"]
+    elif nat == "ISENCAO" and filantropica:
+        # Estorno do INSS patronal não devido: inverso do lançamento do item de INSS correspondente
+        deb = ["INSS_REC"]
+        cred = [f"P_INSS_{sfx}", f"P_PROV_{sfx}"] if prov else ["INSS"]
     else:
         deb, cred = [], []
     obs, rev = OBS_EMPRESA.get(nat, OBS_EMPRESA[None])
+    if nat == "ISENCAO" and filantropica:
+        obs = "Isenção filantropia: estorno do INSS patronal não devido (inverso do item de INSS correspondente)"
+        rev = True
+    if nat == "PIS" and filantropica:
+        obs, rev = "PIS s/ folha — entidade filantrópica/sem fins lucrativos", False
     if prov:
-        obs += " — baixa contra a provisão"
+        obs += " — contra a provisão"
     return deb, cred, obs, rev, origem, nat
 
 
@@ -1092,13 +1128,98 @@ def classificar_item_outras(codigo, d):
     return list(deb), list(cred), obs, rev, origem, nat
 
 # =====================================================================
+# 5b. CONFERÊNCIA DO ARQUIVO CONTRA O LEIAUTE DA IMPORTAÇÃO DE TABELAS
+#     aba "evento" = FOINTEGCONT  (codi_emp, i_separador, i_codigo, tipo, descricao char(40),
+#                                  conta_deb, conta_cred, i_historico, comp_hist varchar(512))
+#     aba "integra" = FOINTEGCONTEVE (codi_emp, i_separador, i_codigo, tipo, i_eventos)
+#     Chave primária de FOINTEGCONT: (codi_emp, i_separador, i_codigo, tipo)
+#     Chave primária de FOINTEGCONTEVE: (codi_emp, i_separador, i_codigo, i_eventos, tipo), com FK para
+#     FOINTEGCONT; na prática um evento pertence a UM lançamento por (empresa, separador, tipo).
+# =====================================================================
+def _eh_int(v) -> bool:
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, numbers.Integral):
+        return True
+    return isinstance(v, str) and bool(re.fullmatch(r"-?\d+", v.strip()))
+
+
+def checar_layout(evento: pd.DataFrame, integra: pd.DataFrame):
+    out = []
+
+    def add(nome, nivel, problemas):
+        ok = not problemas
+        out.append({"Verificação": nome, "Nível": nivel,
+                    "Resultado": "✅" if ok else ("❌" if nivel == "Erro" else "⚠️"),
+                    "Detalhe": "ok" if ok else problemas})
+
+    add("Aba evento: colunas e ordem do leiaute", "Erro",
+        "" if list(evento.columns) == COLS_EVENTO else "colunas diferentes do leiaute")
+    add("Aba integra: colunas e ordem do leiaute", "Erro",
+        "" if list(integra.columns) == COLS_INTEGRA else "colunas diferentes do leiaute")
+
+    c_emp, c_sep, c_cod, c_tip, c_des, c_deb, c_cred, c_his, c_com = COLS_EVENTO
+    ruim = {c: int((~evento[c].map(_eh_int)).sum()) for c in (c_emp, c_sep, c_cod, c_tip, c_deb, c_cred)}
+    ruim = {c: n for c, n in ruim.items() if n}
+    add("Aba evento: empresa, separador, código, tipo e contas numéricos (integer)", "Erro",
+        "; ".join(f"{c[:28]}: {n} valor(es)" for c, n in ruim.items()))
+    n_vazio = int((evento[c_his].astype(str).str.strip() == "").sum())
+    n_nao_num = int(((evento[c_his].astype(str).str.strip() != "") & (~evento[c_his].map(_eh_int))).sum())
+    add("Aba evento: histórico numérico (i_historico integer)", "Erro",
+        f"{n_nao_num} histórico(s) não numérico(s)" if n_nao_num else "")
+    add("Aba evento: histórico preenchido (todos os lançamentos reais têm histórico)", "Aviso",
+        f"{n_vazio} lançamento(s) sem histórico" if n_vazio else "")
+    d = evento[c_des].astype(str)
+    p_des = []
+    if (d.str.strip() == "").any():
+        p_des.append(f"{int((d.str.strip() == '').sum())} vazia(s)")
+    if (d.str.len() > LIM_DESC_EVENTO).any():
+        p_des.append(f"{int((d.str.len() > LIM_DESC_EVENTO).sum())} acima de {LIM_DESC_EVENTO} caracteres")
+    add(f"Aba evento: descrição preenchida e com até {LIM_DESC_EVENTO} caracteres (char(40))", "Erro", "; ".join(p_des))
+    add(f"Aba evento: complemento com até {LIM_COMP_HIST} caracteres (varchar(512))", "Erro",
+        f"{int((evento[c_com].astype(str).str.len() > LIM_COMP_HIST).sum())} acima do limite"
+        if (evento[c_com].astype(str).str.len() > LIM_COMP_HIST).any() else "")
+    tipos_fora = sorted({t for t in evento[c_tip].tolist() if t not in TIPOS_LAYOUT})
+    add("Aba evento: tipo da integração no conjunto gerado (1, 2, 3, 4, 5, 6, 10)", "Erro",
+        f"tipos não previstos: {tipos_fora}" if tipos_fora else "")
+    add("Aba evento: conta débito diferente da conta crédito", "Erro",
+        f"{int((evento[c_deb].astype(str) == evento[c_cred].astype(str)).sum())} lançamento(s) com débito = crédito"
+        if (evento[c_deb].astype(str) == evento[c_cred].astype(str)).any() else "")
+    pk_ev = [c_emp, c_sep, c_cod, c_tip]
+    dup_ev = evento.duplicated(pk_ev, keep=False)
+    add("Aba evento: chave única (empresa + separador + código + tipo)", "Erro",
+        f"{int(dup_ev.sum())} linha(s) repetem a chave — a importação rejeitaria/sobrescreveria" if dup_ev.any() else "")
+
+    i_emp, i_sep, i_cod, i_tip, i_rub = COLS_INTEGRA
+    ruim_i = {c: int((~integra[c].map(_eh_int)).sum()) for c in COLS_INTEGRA}
+    ruim_i = {c: n for c, n in ruim_i.items() if n}
+    add("Aba integra: todas as colunas numéricas (integer)", "Erro",
+        "; ".join(f"{c[:28]}: {n}" for c, n in ruim_i.items()))
+    dup_in = integra.duplicated([i_emp, i_sep, i_cod, i_tip, i_rub], keep=False)
+    add("Aba integra: chave única (empresa + separador + código + tipo + rubrica)", "Erro",
+        f"{int(dup_in.sum())} linha(s) repetidas" if dup_in.any() else "")
+    dup_rub = integra.duplicated([i_emp, i_sep, i_tip, i_rub], keep=False)
+    add("Aba integra: cada rubrica/item em UM só lançamento por empresa + separador + tipo", "Erro",
+        f"{int(dup_rub.sum())} vínculo(s) com a mesma rubrica em lançamentos diferentes" if dup_rub.any() else "")
+    chaves_ev = set(map(tuple, evento[pk_ev].values.tolist()))
+    chaves_in = set(map(tuple, integra[[i_emp, i_sep, i_cod, i_tip]].values.tolist()))
+    orfaos = chaves_in - chaves_ev
+    add("Aba integra → evento: todo vínculo aponta para um lançamento existente (chave estrangeira)", "Erro",
+        f"{len(orfaos)} vínculo(s) sem lançamento correspondente" if orfaos else "")
+    sem_vinculo = chaves_ev - chaves_in
+    add("Aba evento → integra: todo lançamento tem ao menos uma rubrica vinculada", "Aviso",
+        f"{len(sem_vinculo)} lançamento(s) sem rubrica vinculada" if sem_vinculo else "")
+    return out
+
+# =====================================================================
 # 6. CONFIGURAÇÃO POR EMPRESA (.json)
 # =====================================================================
 CFG_WIDGETS = (("historico", "w_hist"), ("baixa_prov", "w_baixa"), ("socio_adm", "w_socio"),
                ("bloqueio_extra", "w_bloq"), ("empresa", "w_cod"), ("complemento", "w_compl"),
                ("tipos_cadastro", "w_tipos_cad"), ("separadores_cadastro", "w_seps_cad"),
                ("mesma_rescisao", "w_mesma_resc"), ("mesma_ferias", "w_mesma_fer"),
-               ("excecoes_ferias", "w_exc_fer"), ("excecoes_rescisao", "w_exc_resc"))
+               ("excecoes_ferias", "w_exc_fer"), ("excecoes_rescisao", "w_exc_resc"),
+               ("filantropica", "w_filant"), ("manter_exclusivas", "w_exclusivas"))
 
 
 def aplicar_config(dados: bytes):
@@ -1177,7 +1298,8 @@ with st.sidebar:
     st.header("2. Regras")
     for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", ""),
                  ("w_compl", COMPLEMENTO_PADRAO), ("w_mesma_resc", False), ("w_mesma_fer", False),
-                 ("w_exc_fer", ""), ("w_exc_resc", "")):
+                 ("w_exc_fer", ""), ("w_exc_resc", ""), ("w_filant", False), ("w_exclusivas", True),
+                 ("w_forcar", False)):
         st.session_state.setdefault(k, v)
     st.markdown("**Usar a mesma configuração da folha normal para**")
     mesma_resc = st.checkbox("Rescisão", key="w_mesma_resc",
@@ -1188,6 +1310,12 @@ with st.sidebar:
                             help="Igual à Domínio. Marcado: as Férias usam os lançamentos da Folha "
                                  "(Tipo 1) e o Tipo 3 não é gerado. Desmarcado: Tipo 3 próprio, com "
                                  "crédito em Férias a Pagar e despesa de Férias.")
+    manter_excl = st.checkbox("Manter no Tipo 3/4 as rubricas exclusivas de Férias/Rescisão",
+                              key="w_exclusivas", disabled=not (mesma_resc or mesma_fer),
+                              help="Só vale quando 'mesma configuração' está marcada. Rubricas que existem "
+                                   "somente em Férias/Rescisão (ex.: Aviso Prévio, 13º 1/12 indenizado) não "
+                                   "têm lançamento na Folha; a Domínio as grava no próprio Tipo 3/4, com "
+                                   "crédito em Rescisões a Pagar. Desmarcado: vão para o Tipo 1.")
     with st.expander("Despesa própria de Férias/Rescisão — exceções",
                      expanded=not (mesma_resc and mesma_fer)):
         st.caption("Vale para o cálculo **desmarcado** acima. Salários, horas extras, adicionais, "
@@ -1200,6 +1328,11 @@ with st.sidebar:
         exc_resc = st.text_input("Exceções Rescisão (códigos que mantêm a despesa da folha)",
                                  key="w_exc_resc", disabled=mesma_resc, placeholder="ex.: 9179, 9180")
     excecoes = {"Férias": codigos(exc_fer), "Rescisão": codigos(exc_resc)}
+    filant = st.checkbox("Entidade filantrópica (isenta de INSS patronal)", key="w_filant",
+                         help="Gera também os itens de isenção da aba Empresa (25 a 36): estorno do INSS "
+                              "patronal não devido, inverso do lançamento do item de INSS correspondente "
+                              "(débito INSS a Recolher × crédito INSS despesa, ou provisão se marcada a baixa). "
+                              "Desmarcado: esses itens não são integrados.")
     baixa_prov = st.checkbox("Baixar férias/13º pagos contra a provisão", key="w_baixa",
                              help="Deixe desmarcado se a Domínio já gera o 'Valor Estorno Provisão'.")
     socio_adm = st.checkbox("Pró-labore e encargos do sócio sempre em Despesas Administrativas", key="w_socio")
@@ -1241,11 +1374,15 @@ except Exception as e:
     st.error(f"Erro na leitura: {e}")
     st.stop()
 
-itens, n_unif = unificar_com_folha(itens, mesma_fer, mesma_resc)
-if n_unif:
+itens, n_unif, n_excl = unificar_com_folha(itens, mesma_fer, mesma_resc, manter_excl)
+if n_unif or n_excl:
     nomes_unif = " e ".join(n for n, f in (("Férias", mesma_fer), ("Rescisão", mesma_resc)) if f)
-    st.info(f"🔗 {nomes_unif}: mesma configuração da folha normal — {n_unif} item(ns) usam o "
-            "lançamento da Folha (Tipo 1); o Tipo 3/4 correspondente não será gerado.")
+    msg = (f"🔗 {nomes_unif}: mesma configuração da folha normal — {n_unif} item(ns) usam o "
+           "lançamento da Folha (Tipo 1); o Tipo 3/4 correspondente não será gerado para eles.")
+    if n_excl:
+        msg += (f" {n_excl} rubrica(s) exclusivas de Férias/Rescisão (inexistentes na Folha) "
+                "permanecem no próprio Tipo 3/4.")
+    st.info(msg)
 
 if modo_cad and not cad and any(t in (1, 3, 4) for t in tipos_cad):
     st.error("Nenhuma rubrica lida no cadastro geral — não há eventos para os Tipos 1, 3 e 4.")
@@ -1255,6 +1392,9 @@ if not itens:
     st.stop()
 if not cad and not modo_cad:
     st.warning("Nenhuma rubrica lida no cadastro geral — o Tipo de todas será inferido pela descrição.")
+if cad and sum(1 for r in cad.values() if not r["descricao"]):
+    st.warning(f"{sum(1 for r in cad.values() if not r['descricao'])} rubrica(s) do cadastro sem descrição lida — "
+               "confira o layout do relatório.")
 
 origem_bytes = f_cad.getvalue() if modo_cad else f_pend.getvalue()
 pid = hashlib.md5(origem_bytes + (b"|cad" if modo_cad else b"|pend")).hexdigest()
@@ -1395,6 +1535,7 @@ if socio_adm:
     grupo_socio = rot2pref.get(esc_socio)
 
 # ---------- Classificação (regras) ----------
+mesma_secao = {"Férias": mesma_fer, "Rescisão": mesma_resc}
 regras = []
 for it in itens:
     d, sec = norm(it["descricao"]), it["secao"]
@@ -1402,7 +1543,7 @@ for it in itens:
     prefixo, nat = mapa_grupos[k], None
     if sec == "Empresa":
         tipo = "Item (Empresa)"
-        deb, cred, obs, rev, origem, nat = classificar_item_empresa(it["codigo"], d, baixa_prov)
+        deb, cred, obs, rev, origem, nat = classificar_item_empresa(it["codigo"], d, baixa_prov, filant)
     elif sec == "Outras Informações":
         tipo = "Item (Outras Informações)"
         deb, cred, obs, rev, origem, nat = classificar_item_outras(it["codigo"], d)
@@ -1411,22 +1552,34 @@ for it in itens:
         deb, cred, obs, rev = classificar_provisao(d, sec)
     else:
         tipo, origem = tipo_rubrica(it["codigo"], d, cad)
+        fgts_forcado = False
+        if e_fgts(d) and tipo not in ("Informativa", "Inf. dedutora"):
+            fgts_forcado, tipo_cad = True, tipo
+            tipo = "Informativa"
         if tipo in ("Informativa", "Inf. dedutora"):
             deb, cred, obs, rev = classificar_informativa(d, tipo)
+            if fgts_forcado:
+                obs = f"Rubrica de FGTS cadastrada como {tipo_cad} — tratada como informativa | {obs}"
+                rev = True
         elif tipo == "Desconto":
             deb, cred, obs, rev = classificar_desconto(d, sec)
         else:
             deb, cred, obs, rev = classificar_provento(d, sec, baixa_prov)
         # Férias/Rescisão com configuração própria: a despesa também muda (com exceções)
-        if sec in DESPESA_SECAO:
+        if sec in DESPESA_SECAO and not mesma_secao[sec]:
             exc = excecoes.get(sec, set())
             deb, o1 = despesa_da_secao(deb, sec, it["codigo"], exc)
             cred, o2 = despesa_da_secao(cred, sec, it["codigo"], exc)
             obs = " | ".join(x for x in (obs, o1, o2) if x)
-    if grupo_socio and (e_socio(d) or nat == "INSS_SOCIO"):
+    if grupo_socio and (e_socio(d) or nat == "INSS_SOCIO" or (nat == "ISENCAO" and tem(d, "PRO LAB*"))):
         prefixo = grupo_socio
     regras.append(dict(it=it, d=d, sec=sec, k=k, prefixo=prefixo, tipo=tipo, origem=origem,
                        deb=deb, cred=cred, obs=obs, rev=rev, nat=nat))
+
+n_isencao_ign = sum(1 for r in regras if r["nat"] == "ISENCAO") if not filant else 0
+if n_isencao_ign:
+    st.info(f"ℹ️ {n_isencao_ign} item(ns) de isenção de filantropia não serão integrados. "
+            "Se a empresa é filantrópica, marque 'Entidade filantrópica' na barra lateral.")
 
 # ---------- 3. Mapa de contas ----------
 st.subheader("3. Mapa de contas")
@@ -1506,13 +1659,16 @@ for r in regras:
         status = ST_REV
     else:
         status = ST_OK
+    conta_liq = ""
+    if r["tipo"] in ("Provento", "Desconto"):
+        conta_liq = res.resolver(passivo_secao(sec, r["d"]), r["prefixo"])[0]
     linhas.append({
         "Status": status, "Seção": sec, "Tipo Integração": str(tipo_int) if tipo_int else "—",
         "Separador": r["k"], "Nome do separador": it["sep_nome"] or NOME_PADRAO_SEM_SEPARADOR,
         "Grupo": r["prefixo"], "Código": it["codigo"], "Descrição": it["descricao"],
         "Descrição Lançamento": descricao_lancamento(it["codigo"], it["descricao"]),
         "Tipo": r["tipo"], "Origem do tipo": r["origem"], "Débito": dc, "Desc. Débito": dd,
-        "Crédito": cc_, "Desc. Crédito": cd,
+        "Crédito": cc_, "Desc. Crédito": cd, "Conta Líquido": conta_liq,
         "Observação": " | ".join([r["obs"]] + alertas).strip(" |"),
         "Exportar": bool(dc and cc_ and tipo_int),
     })
@@ -1586,6 +1742,45 @@ if not manuais.empty:
     st.dataframe(manuais[["Seção", "Separador", "Código", "Descrição", "Débito", "Desc. Débito",
                           "Crédito", "Desc. Crédito"]], hide_index=True)
 
+# ---------- 4b. Verificação do líquido ----------
+# Regra: todo provento credita a conta de líquido da seção e todo desconto a debita; assim
+# Σ proventos − Σ descontos = saldo da conta de líquido (o líquido da folha). Nenhuma rubrica com
+# valor (provento/desconto) pode ficar fora do arquivo.
+st.subheader("4b. Verificação do líquido")
+e_vd = ed["Tipo"].isin(["Provento", "Desconto"])
+no_arquivo = ed["Exportar"] & (ed["Validação"] == "")
+fora = ed[e_vd & ~no_arquivo]
+
+
+def _fura_liquido(row):
+    liq = txt_cel(row["Conta Líquido"])
+    if not liq or row["Tipo"] not in ("Provento", "Desconto"):
+        return False
+    lado = row["Crédito"] if row["Tipo"] == "Provento" else row["Débito"]
+    return txt_cel(lado) != liq
+
+
+furam = ed[e_vd & no_arquivo & ed.apply(_fura_liquido, axis=1)]
+l1, l2, l3 = st.columns(3)
+l1.metric("Proventos/descontos no arquivo", int((e_vd & no_arquivo).sum()))
+l2.metric("Fora do arquivo (líquido não fecha)", len(fora))
+l3.metric("Não tocam a conta de líquido", len(furam))
+if not fora.empty:
+    st.error(f"❌ {len(fora)} provento(s)/desconto(s) com valor ficarão fora do arquivo — o líquido não fechará "
+             "até que sejam configurados.")
+    st.dataframe(fora[["Status", "Seção", "Separador", "Código", "Descrição", "Tipo", "Débito", "Crédito",
+                       "Observação"]], hide_index=True)
+if not furam.empty:
+    st.warning(f"⚠️ {len(furam)} provento(s)/desconto(s) não creditam/debitam a conta de líquido da seção "
+               "(coluna 'Conta Líquido'). Confirme se é intencional.")
+    st.dataframe(furam[["Seção", "Separador", "Código", "Descrição", "Tipo", "Débito", "Crédito",
+                        "Conta Líquido"]], hide_index=True)
+if fora.empty and furam.empty:
+    st.success("Todo provento credita e todo desconto debita a conta de líquido da seção; nenhuma rubrica com "
+               "valor ficou de fora.")
+forcar = st.checkbox("Permitir exportar mesmo com rubricas com valor fora do arquivo", key="w_forcar",
+                     disabled=fora.empty)
+
 # ---------- 5. Montagem do layout (1 lançamento por rubrica/item) ----------
 st.subheader("5. Arquivo de importação")
 emp = para_int(cod_empresa)
@@ -1600,17 +1795,21 @@ exp["_cred"] = [txt_cel(v) for v in exp["Crédito"]]
 exp["_hist"] = [txt_cel(hist_tipo.get(t)) or txt_cel(historico) for t in exp["_tipo"]]
 exp["_desc"] = [txt_cel(v) for v in exp["Descrição Lançamento"]]
 
-# Mesmo código em Tipos diferentes e em seções do mesmo Tipo é permitido.
-# Só remove linhas 100% idênticas (ex.: a mesma rubrica em Folha Normal e Adiantamento com as mesmas contas).
+# A chave do lançamento (empresa + separador + código + tipo) é ÚNICA em FOINTEGCONT, e uma rubrica pertence
+# a um só lançamento por empresa + separador + tipo. Linhas 100% idênticas (mesma rubrica em Folha Normal e
+# Adiantamento com as mesmas contas) são unificadas; se as contas diferem, só a primeira linha segue.
 chave_ev = ["_s", "_tipo", "_cod", "_deb", "_cred", "_hist", "_desc"]
-exp = (exp.drop_duplicates(chave_ev)
-       .sort_values(["_s", "_tipo", "_cod"], kind="stable").reset_index(drop=True))
-repetidas = exp[exp.duplicated(["_s", "_tipo", "_cod"], keep=False)]
-if not repetidas.empty:
-    st.info(f"ℹ️ {len(repetidas)} lançamento(s) com o mesmo código no mesmo Tipo/Separador e contas "
-            "diferentes — exportados conforme permitido.")
-    st.dataframe(repetidas[["Seção", "Separador", "Código", "Descrição Lançamento", "Débito", "Crédito"]],
-                 hide_index=True)
+exp = exp.drop_duplicates(chave_ev)
+chave_pk = ["_s", "_tipo", "_cod"]
+conflitos = exp[exp.duplicated(chave_pk, keep=False)]
+exp = (exp.drop_duplicates(chave_pk, keep="first")
+       .sort_values(chave_pk, kind="stable").reset_index(drop=True))
+if not conflitos.empty:
+    st.error(f"❌ {len(conflitos)} linha(s) usam a mesma chave de lançamento (separador + tipo + código) com contas "
+             "diferentes. A tabela da Domínio aceita um único lançamento por chave: foi mantida a PRIMEIRA linha de "
+             "cada grupo. Para escolher outra, desmarque 'Exportar' nas linhas que não devem seguir.")
+    st.dataframe(conflitos[["Seção", "Separador", "Tipo Integração", "Código", "Descrição Lançamento",
+                            "Débito", "Crédito"]], hide_index=True)
 n = len(exp)
 
 evento = pd.DataFrame({
@@ -1633,9 +1832,6 @@ integra = pd.DataFrame({
     COLS_INTEGRA[4]: exp["_cod"].tolist(),
 }, columns=COLS_INTEGRA).drop_duplicates().reset_index(drop=True)
 
-sem_hist = sum(1 for h in exp["_hist"] if not h)
-if sem_hist:
-    st.warning(f"{sem_hist} lançamento(s) sem Código do Histórico — preencha na barra lateral.")
 if not isinstance(emp, int):
     st.warning("Código da empresa não numérico — confira na barra lateral.")
 cortadas = sum(1 for c, d in zip(exp["_cod"], exp["Descrição"])
@@ -1643,6 +1839,19 @@ cortadas = sum(1 for c, d in zip(exp["_cod"], exp["Descrição"])
 if cortadas:
     st.info(f"{cortadas} descrição(ões) cortada(s) em {LIM_DESC_EVENTO} caracteres — "
             "ajuste na coluna 'Descrição Lançamento' se quiser abreviar.")
+
+checagens = checar_layout(evento, integra) if n else []
+erros_layout = [c for c in checagens if c["Nível"] == "Erro" and c["Resultado"] == "❌"]
+avisos_layout = [c for c in checagens if c["Nível"] == "Aviso" and c["Resultado"] == "⚠️"]
+with st.expander(f"Conformidade com o leiaute da importação de tabelas (FOINTEGCONT / FOINTEGCONTEVE) — "
+                 f"{len(erros_layout)} erro(s), {len(avisos_layout)} aviso(s)",
+                 expanded=bool(erros_layout or avisos_layout)):
+    if checagens:
+        st.dataframe(pd.DataFrame(checagens), hide_index=True, use_container_width=True)
+    else:
+        st.info("Nenhum lançamento para conferir.")
+    st.caption("O texto dos cabeçalhos segue o modelo da Domínio; as verificações acima conferem ordem das colunas, "
+               "tipos, limites de tamanho, chave única e vínculos do arquivo contra as tabelas de destino.")
 
 e1, e2, e3 = st.columns(3)
 e1.metric("Lançamentos (aba evento)", len(evento))
@@ -1662,13 +1871,13 @@ def excel_bytes(abas: dict) -> bytes:
 
 
 cfg_out = {
-    "versao": 7, "empresa": cod_empresa, "nome_empresa": cab["nome"],
+    "versao": 8, "empresa": cod_empresa, "nome_empresa": cab["nome"],
     "grupos": mapa_grupos, "grupo_socio": grupo_socio, "contas": dict(cfg_contas),
     "historico": historico, "hist_tipo": {str(t): v for t, v in hist_tipo.items() if v},
     "complemento": complemento, "baixa_prov": baixa_prov, "socio_adm": socio_adm,
     "bloqueio_extra": bloq_extra, "raizes": raizes,
-    "mesma_rescisao": mesma_resc, "mesma_ferias": mesma_fer,
-    "excecoes_ferias": exc_fer, "excecoes_rescisao": exc_resc,
+    "mesma_rescisao": mesma_resc, "mesma_ferias": mesma_fer, "manter_exclusivas": manter_excl,
+    "excecoes_ferias": exc_fer, "excecoes_rescisao": exc_resc, "filantropica": filant,
     "colunas": {k: v for k, v in sel.items() if v and v != "(nenhuma)"},
 }
 if modo_cad:
@@ -1681,12 +1890,21 @@ else:
 conf_abas = {"conferencia": ed}
 if not manuais.empty:
     conf_abas["configurar_manual"] = manuais
+if checagens:
+    conf_abas["conformidade_layout"] = pd.DataFrame(checagens)
+
+bloqueio_import = bool(erros_layout) or (not fora.empty and not forcar) or n == 0
+if erros_layout:
+    st.error("❌ O arquivo não está conforme o leiaute (ver detalhes acima) — o download da importação está bloqueado.")
+elif not fora.empty and not forcar:
+    st.error("❌ Download da importação bloqueado: há provento(s)/desconto(s) com valor fora do arquivo. "
+             "Resolva-os ou marque 'Permitir exportar mesmo com rubricas fora do arquivo'.")
 
 sufixo = "_completo" if modo_cad else ""
 c1, c2, c3 = st.columns(3)
 c1.download_button(f"📥 Importação Domínio ({len(evento)} lançamentos)",
                    excel_bytes({ABA_INTEGRA: integra, ABA_EVENTO: evento}),
-                   file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.xlsx")
+                   file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.xlsx", disabled=bloqueio_import)
 c2.download_button("📋 Planilha de conferência completa", excel_bytes(conf_abas),
                    file_name=f"conferencia_folha_emp{cod_empresa}{sufixo}.xlsx")
 c3.download_button("💾 Salvar configuração da empresa (.json)",
