@@ -1292,7 +1292,7 @@ def aplicar_config(dados: bytes):
     if st.session_state.get("cfg_id") == fid:
         return
     try:
-        cfg = json.loads(dados.decode("utf-8"))
+        cfg = json.loads(dados.decode("utf-8-sig"))
     except Exception as e:
         st.sidebar.error(f"Configuração inválida: {e}")
         return
@@ -1338,54 +1338,74 @@ ph_passos = st.empty()
 ph_resumo = st.empty()
 desenhar_passos(ph_passos, 1)
 
+MODO_PEND = "Só o que falta configurar (relatório de pendências)"
+MODO_TODOS = "Todos os eventos cadastrados"
+
+for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", ""),
+             ("w_compl", COMPLEMENTO_PADRAO), ("w_mesma_resc", False), ("w_mesma_fer", False),
+             ("w_exc_fer", ""), ("w_exc_resc", ""), ("w_filant", False), ("w_exclusivas", True),
+             ("w_forcar", False), ("w_multi", False), ("w_liquidos", LIQUIDOS_PADRAO), ("w_modo", MODO_PEND)):
+    st.session_state.setdefault(k, v)
+
 with st.sidebar:
-    st.header("Configuração salva (opcional)")
-    f_cfg = st.file_uploader("Carregar configuração salva (.json)", type=["json"])
-    if f_cfg is not None:
-        aplicar_config(f_cfg.getvalue())
+    box_arq = st.container()
+    box_cfg = st.container()
 
-    st.header("Passo 1 · Arquivos")
-    st.session_state.setdefault("modo_cad", False)
-    if st.session_state["modo_cad"]:
-        st.success("Modo: **todos os eventos cadastrados** (cadastro geral + plano de contas)")
-        if st.button("↩️ Voltar ao modo pendências", use_container_width=True):
-            st.session_state["modo_cad"] = False
-            st.rerun()
-    else:
-        if st.button("🗂️ Contabilizar todos os eventos cadastrados", use_container_width=True,
-                     help="Ignora o relatório de pendências e gera o lançamento de todas as rubricas "
-                          "do cadastro geral + itens das abas Empresa e Outras Informações."):
-            st.session_state["modo_cad"] = True
-            st.rerun()
-    modo_cad = st.session_state["modo_cad"]
+    # A configuração salva é lida primeiro (ela preenche os campos abaixo), mas aparece depois dos arquivos.
+    with box_cfg:
+        with st.expander("💾 Já configurou esta empresa? Carregar configuração salva"):
+            f_cfg = st.file_uploader("Arquivo .json salvo anteriormente", type=["json"])
+            if f_cfg is not None:
+                aplicar_config(f_cfg.getvalue())
 
-    f_pend = None
-    if not modo_cad:
-        f_pend = st.file_uploader("Rubricas/Itens não configurados", type=["pdf", "txt"])
-    f_cad = st.file_uploader("Cadastro geral de rubricas", type=["pdf", "txt"])
-    f_plano = st.file_uploader("Plano de contas", type=["xlsx", "xls", "csv", "txt"])
+    with box_arq:
+        st.header("Passo 1 · Arquivos")
+        modo_txt = st.radio("O que contabilizar?", [MODO_PEND, MODO_TODOS], key="w_modo",
+                            help="Pendências: gera só o que o relatório 'Rubricas/Itens não configurados' lista. "
+                                 "Todos os eventos: gera o lançamento de todas as rubricas do cadastro geral, "
+                                 "mais os itens das abas Empresa e Outras Informações.")
+        modo_cad = modo_txt == MODO_TODOS
+        f_pend = None
+        if not modo_cad:
+            f_pend = st.file_uploader("1. Rubricas/Itens não configurados (relatório da Domínio)", type=["pdf", "txt"])
+        f_cad = st.file_uploader("2. Cadastro geral de rubricas", type=["pdf", "txt"])
+        f_plano = st.file_uploader("3. Plano de contas da empresa", type=["xlsx", "xls", "csv", "txt"])
 
-    tipos_cad, seps_cad = [], ""
-    if modo_cad:
-        st.session_state.setdefault("w_tipos_cad", TIPOS_CADASTRO)
-        st.session_state.setdefault("w_seps_cad", "")
-        st.session_state["w_tipos_cad"] = [int(t) for t in st.session_state["w_tipos_cad"]
-                                           if str(t).isdigit() and int(t) in TIPOS_CADASTRO]
-        tipos_cad = st.multiselect("Tipos da Integração a gerar", TIPOS_CADASTRO, key="w_tipos_cad",
-                                   format_func=lambda t: f"{t} - {TIPOS_LAYOUT[t]}")
-        seps_cad = st.text_area("Separadores (opcional)", key="w_seps_cad",
-                                placeholder="1=Administrativo; 2=Produção",
-                                help="Sem separador = folha centralizada (Separador 0). "
-                                     "Informando, todos os eventos são replicados para cada separador.")
-        st.caption("Tipo 10: cada item da aba Outras Informações (1 a 13) gera o seu próprio lançamento.")
+        tipos_cad, seps_cad = [], ""
+        if modo_cad:
+            st.session_state.setdefault("w_tipos_cad", TIPOS_CADASTRO)
+            st.session_state.setdefault("w_seps_cad", "")
+            st.session_state["w_tipos_cad"] = [int(t) for t in st.session_state["w_tipos_cad"]
+                                               if str(t).isdigit() and int(t) in TIPOS_CADASTRO]
+            tipos_cad = st.multiselect("Tipos da Integração a gerar", TIPOS_CADASTRO, key="w_tipos_cad",
+                                       format_func=lambda t: f"{t} - {TIPOS_LAYOUT[t]}")
+            seps_cad = st.text_area("Separadores (opcional)", key="w_seps_cad",
+                                    placeholder="1=Administrativo; 2=Produção",
+                                    help="Sem separador = folha centralizada (Separador 0). "
+                                         "Informando, todos os eventos são replicados para cada separador.")
+            st.caption("Tipo 10: cada item da aba Outras Informações (1 a 13) gera o seu próprio lançamento.")
+        ph_empresa = st.empty()
 
+    st.divider()
     st.header("Regras desta empresa")
-    for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", ""),
-                 ("w_compl", COMPLEMENTO_PADRAO), ("w_mesma_resc", False), ("w_mesma_fer", False),
-                 ("w_exc_fer", ""), ("w_exc_resc", ""), ("w_filant", False), ("w_exclusivas", True),
-                 ("w_forcar", False), ("w_multi", False), ("w_liquidos", LIQUIDOS_PADRAO)):
-        st.session_state.setdefault(k, v)
-    st.markdown("**Usar a mesma configuração da folha normal para**")
+
+    st.markdown("**1 · Como lançar a folha**")
+    modo_multi = st.checkbox("Lançar o líquido à parte (partidas múltiplas)", key="w_multi",
+                             help="Modelo da Solução 822: no Tipo 1 cada provento vira lançamento só de débito, cada "
+                                  "desconto só de crédito ('nulo' no lado sem conta) e o líquido é lançado pelos itens "
+                                  "de Líquido (códigos negativos). Os lançamentos do Tipo 1 seguem a numeração 1, 2, 3… "
+                                  "(proventos, descontos, informativas, líquidos). A Rescisão continua com duas contas "
+                                  "no Tipo 4, pois a Domínio não tem o item 'Líquido Rescisão' na guia Folha.")
+    st.caption("Desligado: cada rubrica leva débito e crédito (Salários a Pagar). "
+               "Ligado: proventos só débito, descontos só crédito e o líquido sai nos itens de líquido.")
+    liquidos_sel = []
+    if modo_multi:
+        st.session_state["w_liquidos"] = [int(x) for x in st.session_state["w_liquidos"] if int(x) in LIQUIDOS]
+        liquidos_sel = st.multiselect("Itens de líquido a lançar", list(LIQUIDOS), key="w_liquidos",
+                                      format_func=lambda c: f"{c} · {LIQUIDOS[c][0]}")
+
+    st.markdown("**2 · Férias e Rescisão**")
+    st.caption("Usar a mesma configuração da folha normal para:")
     mesma_resc = st.checkbox("Rescisão", key="w_mesma_resc",
                              help="Igual à Domínio. Marcado: a Rescisão usa os lançamentos da Folha "
                                   "(Tipo 1) e o Tipo 4 não é gerado. Desmarcado: Tipo 4 próprio, com "
@@ -1400,18 +1420,8 @@ with st.sidebar:
                                    "somente em Férias/Rescisão (ex.: Aviso Prévio, 13º 1/12 indenizado) não "
                                    "têm lançamento na Folha; a Domínio as grava no próprio Tipo 3/4, com "
                                    "crédito em Rescisões a Pagar. Desmarcado: vão para o Tipo 1.")
-    with st.expander("Despesa própria de Férias/Rescisão — exceções",
-                     expanded=not (mesma_resc and mesma_fer)):
-        st.caption("Vale para o cálculo **desmarcado** acima. Salários, horas extras, adicionais, "
-                   "prêmios e comissões passam a debitar a despesa de Férias (Tipo 3) ou de Rescisão "
-                   "(Tipo 4); descontos de faltas/horas creditam a mesma despesa. Exceções automáticas: "
-                   "13º, férias, aviso prévio/indenizações, FGTS, benefícios, pró-labore e contas "
-                   "patrimoniais continuam como na folha.")
-        exc_fer = st.text_input("Exceções Férias (códigos que mantêm a despesa da folha)",
-                                key="w_exc_fer", disabled=mesma_fer, placeholder="ex.: 1, 150, 8781")
-        exc_resc = st.text_input("Exceções Rescisão (códigos que mantêm a despesa da folha)",
-                                 key="w_exc_resc", disabled=mesma_resc, placeholder="ex.: 9179, 9180")
-    excecoes = {"Férias": codigos(exc_fer), "Rescisão": codigos(exc_resc)}
+
+    st.markdown("**3 · Encargos, provisões e sócios**")
     filant = st.checkbox("Entidade filantrópica (isenta de INSS patronal)", key="w_filant",
                          help="Gera também os itens de isenção da aba Empresa (25 a 36): estorno do INSS "
                               "patronal não devido, inverso do lançamento do item de INSS correspondente "
@@ -1420,18 +1430,15 @@ with st.sidebar:
     baixa_prov = st.checkbox("Baixar férias/13º pagos contra a provisão", key="w_baixa",
                              help="Deixe desmarcado se a Domínio já gera o 'Valor Estorno Provisão'.")
     socio_adm = st.checkbox("Pró-labore e encargos do sócio sempre em Despesas Administrativas", key="w_socio")
-    modo_multi = st.checkbox("Contabilizar por partidas múltiplas com líquido", key="w_multi",
-                             help="Modelo da Solução 822: no Tipo 1 cada provento vira lançamento só de débito, cada "
-                                  "desconto só de crédito ('nulo' no lado sem conta) e o líquido é lançado pelos itens "
-                                  "de Líquido (códigos negativos). Os lançamentos do Tipo 1 seguem numeração 1, 2, 3… "
-                                  "(proventos, descontos, informativas, líquidos). A Rescisão continua com duas contas no "
-                                  "Tipo 4, pois a Domínio não tem o item 'Líquido Rescisão' na guia Folha.")
-    liquidos_sel = []
-    if modo_multi:
-        st.session_state["w_liquidos"] = [int(x) for x in st.session_state["w_liquidos"] if int(x) in LIQUIDOS]
-        liquidos_sel = st.multiselect("Itens de líquido a lançar", list(LIQUIDOS), key="w_liquidos",
-                                      format_func=lambda c: f"{c} · {LIQUIDOS[c][0]}")
+
     with st.expander("Opções avançadas"):
+        st.caption("Despesa própria de Férias/Rescisão (só vale com 'mesma configuração' desmarcada): salários, "
+                   "horas extras, prêmios e comissões debitam a despesa de Férias (Tipo 3) ou de Rescisão (Tipo 4). "
+                   "Informe abaixo os códigos que devem manter a despesa da folha.")
+        exc_fer = st.text_input("Exceções Férias (códigos)", key="w_exc_fer", disabled=mesma_fer,
+                                placeholder="ex.: 1, 150, 8781")
+        exc_resc = st.text_input("Exceções Rescisão (códigos)", key="w_exc_resc", disabled=mesma_resc,
+                                 placeholder="ex.: 9179, 9180")
         bloq_extra = st.text_input("Contas extras de colaborador (reduzidos, separados por vírgula)", key="w_bloq",
                                    help="Além das detectadas automaticamente; itens patronais nunca poderão usá-las.")
         historico = HISTORICO_FIXO
@@ -1440,11 +1447,12 @@ with st.sidebar:
         complemento = st.text_input("Complemento", key="w_compl")
         st.caption(f"1 lançamento por rubrica/item · Código Sequencial = código da rubrica/item · "
                    f"Descrição = 'código - descrição' em caixa mista, máx. {LIM_DESC_EVENTO} caracteres.")
+    excecoes = {"Férias": codigos(exc_fer), "Rescisão": codigos(exc_resc)}
 
 if not (f_cad and f_plano and (f_pend or modo_cad)):
     st.info("👈 Comece pelo Passo 1: envie na barra lateral o cadastro geral de rubricas e o plano de contas"
-            + ("." if modo_cad else " e o relatório de rubricas/itens não configurados — ou use o botão "
-               "'Contabilizar todos os eventos cadastrados'.")
+            + ("." if modo_cad else " e o relatório de rubricas/itens não configurados — ou escolha "
+               "'Todos os eventos cadastrados' em 'O que contabilizar?'.")
             + " Se já configurou esta empresa antes, carregue também a configuração salva.")
     st.stop()
 
@@ -1500,7 +1508,8 @@ if st.session_state.get("pend_id") != pid:
     if not cfg.get("empresa"):
         st.session_state["w_cod"] = cab["codigo"]
 st.session_state.setdefault("w_cod", cab["codigo"])
-cod_empresa = st.sidebar.text_input("Código da empresa na Domínio", key="w_cod")
+cod_empresa = ph_empresa.text_input("Código da empresa na Domínio", key="w_cod",
+                                    help="Lido do relatório; confira antes de baixar o arquivo.")
 if cfg.get("empresa") and cab["codigo"] and str(cfg["empresa"]) != cab["codigo"]:
     st.warning(f"⚠️ A configuração carregada é da empresa {cfg['empresa']}, "
                f"mas o {'cadastro' if modo_cad else 'relatório'} é da empresa {cab['codigo']}.")
