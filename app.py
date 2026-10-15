@@ -15,8 +15,11 @@ Motor 100% determinístico (regex + regras de substring). Sem IA, sem APIs, sem 
     marcado    = o Tipo 3/4 não é gerado; os itens usam o lançamento da Folha (Tipo 1).
                  Rubricas exclusivas de Férias/Rescisão (que não existem na Folha) podem permanecer
                  no próprio Tipo 3/4 (opção "Manter exclusivas"), como a Domínio grava.
-    desmarcado = Tipo 3/4 próprio: passivo próprio (Férias/Rescisões a Pagar) E despesa própria
-                 (Férias / Rescisão), com exceções automáticas e por código
+    desmarcado = Tipo 3/4 próprio com a mesma classificação por natureza da Folha. Como na integração real
+                 da Domínio, o cálculo passa por Salários a Pagar: a 937 leva o líquido das férias para
+                 Adiantamento de Férias e a 51 leva o líquido da rescisão para Rescisões a Pagar.
+- Provisão (Tipos 5/6): férias e 13º pagos (e o FGTS/INSS sobre eles) baixam a provisão; o "Valor Estorno
+  Provisão" da Domínio é ajuste do saldo da provisão, não a baixa das férias pagas.
 - Entidade filantrópica: gera também os itens de isenção (25 a 36) como estorno do INSS patronal.
 - Conferências: chave única do lançamento (empresa+separador+código+tipo), uma rubrica por lançamento
   em cada empresa+separador+tipo, verificação do líquido e conformidade com FOINTEGCONT/FOINTEGCONTEVE.
@@ -89,8 +92,9 @@ TIPO_INTEGRACAO = {  # seção do relatório -> código do layout (None = não i
 }
 
 # Modo "todos os eventos do cadastro": Tipo do layout -> seção interna usada pelas regras
-SECAO_POR_TIPO = {1: "Folha Normal", 2: "Empresa", 3: "Férias", 4: "Rescisão", 10: "Outras Informações"}
-TIPOS_CADASTRO = list(SECAO_POR_TIPO)          # Prov. Férias/13 (5 e 6) não têm catálogo de itens
+SECAO_POR_TIPO = {1: "Folha Normal", 2: "Empresa", 3: "Férias", 4: "Rescisão", 5: "Provisão de Férias",
+                  6: "Provisão de 13º", 10: "Outras Informações"}
+TIPOS_CADASTRO = list(SECAO_POR_TIPO)
 
 SECOES = {  # título normalizado no PDF -> nome interno
     "FOLHA NORMAL": "Folha Normal", "FOLHA MENSAL": "Folha Normal",
@@ -167,6 +171,16 @@ ITENS_OUTRAS = {
     13: ("Compensação diferença INSS Empresa Receita Bruta", "COMP_INSS"),
 }
 
+# Catálogo do sistema Domínio (FOINTEGCONTITENS): abas Provisão de Férias e Provisão de 13º (mesmos itens
+# nos Tipos 5 e 6). Os itens 14 a 25 (transferência de provisão entre empresas) não são gerados.
+ITENS_PROVISAO = {
+    1: "Valor da Provisão", 3: "Encargos FGTS", 4: "Encargos PIS", 5: "Valor Estorno Provisão",
+    6: "Valor Estorno INSS Empresa", 7: "Valor Estorno INSS RAT", 8: "Valor Estorno INSS Terceiros",
+    9: "Valor Estorno FGTS", 10: "Valor Estorno PIS", 11: "Encargos INSS Empresa", 12: "Encargos INSS RAT",
+    13: "Encargos INSS Terceiros",
+}
+ITENS_PROVISAO_PIS = {4, 10}   # só para entidade com PIS sobre a folha (filantrópica)
+
 # =====================================================================
 # 1. NORMALIZAÇÃO E BUSCA DE TERMOS
 # =====================================================================
@@ -207,8 +221,12 @@ def e_base(d):
 
 
 def e_ferias(d):
-    """Férias de fato: 'FÉRIAS' ou 'ABONO PECUNIÁRIO' (não 'Abono Salarial'/'Abono Natalino')."""
-    return tem(d, "FERIAS") or tem(d, "ABONO PECUNIARIO")
+    """Férias de fato: 'FÉRIAS', 'FER' abreviado, 'ABONO PECUNIÁRIO' e as médias/vantagens do abono
+    (não 'Abono Salarial'/'Abono Natalino')."""
+    if tem(d, "FERIAS", "FER", "ABONO PECUNIARIO"):
+        return True
+    return (tem(d, "ABONO") and tem(d, "MEDIA*", "VANTAGE*", "DIFERENC*", "DIF", "PARCELA*")
+            and not tem(d, "SALARIAL", "NATALINO", "PIS"))
 
 
 def txt_cel(v) -> str:
@@ -218,11 +236,6 @@ def txt_cel(v) -> str:
 def para_int(v):
     s = txt_cel(v)
     return int(s) if s.isdigit() else s
-
-
-def codigos(txt) -> set:
-    """'1, 150; 8781' -> {1, 150, 8781}"""
-    return {int(x) for x in re.findall(r"\d+", txt or "")}
 
 
 def confere(a: str, b: str) -> bool:
@@ -500,7 +513,10 @@ def _13(extra=(), nots=()):
             (["13", *extra], list(nots)), (["DECIMO*", *extra], list(nots))]
 
 
-NAO_TERC = ["SERVICO*", "TERCEIROS", "ALUGUE*", "APLICAC*", "PJ", "JUROS", "PROVIS*"]
+NAO_TERC = ["SERVICO*", "TERCEIROS", "ALUGUE*", "APLICAC*", "PJ", "PF", "AUTONOM*", "JUROS", "PROVIS*"]
+# INSS de terceiros/PJ/PF/retido em nota fiscal não é a conta da folha
+NAO_INSS_FOLHA = ["RECEITA BRUTA", "PROVIS*", "RETID*", "PJ", "PF", "SERVIC*", "AUTONOM*", "CPRB"]
+NAO_INSS_NF = ["PJ", "PF", "RETID*", "SERVIC*", "NF", "NOTA*", "CLIENTE*"]
 
 ALVOS = {
     # ---- DRE (restrito ao grupo do separador)
@@ -525,14 +541,10 @@ ALVOS = {
                                            "RECEITA*", "COFINS"])]),
     "INDENIZ": (G, "Indenizações e Aviso Prévio", [(["INDENIZAC*"], []), (["AVISO PREVIO"], []),
                                                    (["RESCIS*"], ["PAGAR"])]),
-    # Despesa do cálculo de Rescisão (Tipo 4 próprio). Conta "Rescisões" se existir; senão Indenizações.
-    "D_RESC": (G, "Rescisões (despesa)", [
-        (["RESCIS*"], ["PAGAR", "PROVIS*", "FGTS", "INSS", "MULTA"]),
-        (["INDENIZAC*"], []), (["AVISO PREVIO"], [])]),
     "ASSIST": (G, "Assistência Médica", [(["ASSISTENCIA MEDICA*"], []), (["PLANO*", "SAUDE"], []),
                                          (["CONVENIO*", "MEDIC*"], []), (["ODONTO*"], [])]),
     "VT": (G, "Vale-Transporte", [(["VALE TRANSP*"], []), (["TRANSPORTE*", "EMPREGADO*"], []),
-                                  (["TRANSPORTE*", "FUNCIONARIO*"], [])]),
+                                  (["TRANSPORTE*", "FUNCIONARIO*"], []), (["BENEFICIO*", "TRANSPORTE*"], [])]),
     "ALIM": (G, "Alimentação / VR", [(["ALIMENTACAO"], []), (["VALE REFEICAO"], []),
                                      (["REFEICAO*"], []), (["CESTA*", "BASICA*"], [])]),
     "BOLSA": (G, "Bolsa-Auxílio / Estágio", [(["BOLSA*"], []), (["ESTAGI*"], [])]),
@@ -554,9 +566,8 @@ ALVOS = {
     "RESC_PAGAR": (PA, "Rescisões a Pagar", [(["RESCIS*", "PAGAR"], [])]),
     "PROLAB_PAGAR": (PA, "Pró-labore a Pagar", [(["PRO LABORE", "PAGAR"], []), (["PRO LABORE"], ["INSS"])]),
     "INSS_REC": (PA, "INSS a Recolher", [
-        (["INSS", "RECOLHER"], ["RECEITA BRUTA", "PROVIS*", "RETIDO"]),
-        (["INSS", "PAGAR"], ["RECEITA BRUTA", "PROVIS*", "RETIDO"]),
-        (["PREVIDENCIA SOCIAL"], ["PROVIS*"])]),
+        (["INSS", "RECOLHER"], NAO_INSS_FOLHA), (["INSS", "PAGAR"], NAO_INSS_FOLHA),
+        (["PREVIDENCIA SOCIAL"], NAO_INSS_FOLHA)]),
     "FGTS_REC": (PA, "FGTS a Recolher", [(["FGTS", "RECOLHER"], ["PROVIS*"]),
                                          (["FGTS", "PAGAR"], ["PROVIS*"]), (["FGTS"], ["PROVIS*"])]),
     "IRRF_REC": (PA, "IRRF s/ Folha a Recolher", [
@@ -597,7 +608,7 @@ ALVOS = {
                                                        (["INSS", "RECUPERAR"], [])]),
     "BENEF_INSS": (AT, "Sal.-Família/Maternidade a Compensar", [
         (["MATERN*", "COMPENSAR"], []), (["FAMILIA", "COMPENSAR"], []),
-        (["INSS", "COMPENSAR"], []), (["INSS", "RECUPERAR"], [])]),
+        (["INSS", "COMPENSAR"], NAO_INSS_NF), (["INSS", "RECUPERAR"], NAO_INSS_NF)]),
     "IRRF_COMP": (AT, "IRRF a Compensar", [
         (["IRRF", "COMPENSAR"], []), (["IRRF", "RECUPERAR"], []),
         (["IMPOSTO DE RENDA", "COMPENSAR"], []), (["IMPOSTO DE RENDA", "RECUPERAR"], []),
@@ -615,11 +626,13 @@ ALVOS = {
 COLAB_ALVOS = ["SAL_PAGAR", "FER_PAGAR", "RESC_PAGAR", "PROLAB_PAGAR",
                "ADIANT_SAL", "ADIANT_13", "ADIANT_FER", "EMPREST", "PENSAO"]
 
-# Despesa própria do cálculo de Férias/Rescisão (quando a flag "mesma configuração" está desmarcada).
-# Só as despesas de natureza salarial são trocadas; o resto é exceção automática
-# (13º, férias, aviso/indenizações, FGTS, benefícios, pró-labore e contas patrimoniais).
-DESPESA_TROCAVEL = ("SALARIOS", "HE", "PREMIOS", "COMISSOES")
-DESPESA_SECAO = {"Férias": ["FERIAS"], "Rescisão": ["D_RESC", "INDENIZ"]}
+# Grupo sintético que indica obrigação/direito da folha: entre contas candidatas do Ativo/Passivo, as que estão
+# dentro dele têm preferência ("INSS a pagar" em Salários e Encargos ganha de "INSS PJ a recolher" em Impostos).
+TERMOS_GRUPO_FOLHA = ("SALARIO*", "ORDENADO*", "TRABALHIST*", "PREVIDENCIARI*", "SOCIAIS", "ENCARGO*", "PESSOAL",
+                      "FOLHA*", "EMPREGADO*", "FUNCIONARIO*", "COLABORADOR*")
+# Benefícios e comissões costumam ficar em outro grupo de despesa: sem conta no grupo do separador,
+# procura em todo o resultado antes de cair em Salários.
+FORA_DO_GRUPO = {"BOLSA", "ASSIST", "VT", "ALIM", "SEGURO", "TREIN", "COMISSOES"}
 
 
 class Resolvedor:
@@ -627,7 +640,10 @@ class Resolvedor:
         self.an = plano[plano["tipo"] == "A"]
         self.p, self.raizes, self.ov = pontuado, raizes, overrides
         self.desc = dict(zip(plano["reduzido"], plano["descricao"]))
-        self.cache, self.bases = {}, {}
+        self.cache, self.bases, self.fora_grupo = {}, {}, set()
+        desc_cla = dict(zip(plano["classificacao"], plano["desc_norm"]))
+        self.folha = {c: any(tem(desc_cla.get(a, ""), *TERMOS_GRUPO_FOLHA) for a in ancestrais(c, pontuado))
+                      for c in self.an["classificacao"]}
 
     @staticmethod
     def chave(alvo, grupo):
@@ -647,20 +663,36 @@ class Resolvedor:
                 lambda c: any(sob(c, p, self.p) for p in prefs))]
         return self.bases[prefs]
 
+    def _buscar(self, alvo, prefs, preferir_folha):
+        base = self._base(prefs) if prefs else self.an.iloc[0:0]
+        if base.empty:
+            return None
+        primeiro = None
+        for must, nots in ALVOS[alvo][2]:
+            ok = base["desc_norm"].map(
+                lambda d: all(tem(d, x) for x in must) and not any(tem(d, x) for x in nots))
+            c = base[ok]
+            if c.empty:
+                continue
+            c = c.assign(_n=c["desc_norm"].str.len()).sort_values(["_n", "classificacao"])
+            if not preferir_folha:
+                return c.iloc[0]["reduzido"], c.iloc[0]["descricao"]
+            if primeiro is None:
+                primeiro = (c.iloc[0]["reduzido"], c.iloc[0]["descricao"])
+            f = c[c["classificacao"].map(lambda x: self.folha.get(x, False))]
+            if not f.empty:
+                return f.iloc[0]["reduzido"], f.iloc[0]["descricao"]
+        return primeiro
+
     def sugestao(self, alvo, grupo):
         k = self.chave(alvo, grupo)
         if k not in self.cache:
-            res, prefs = None, self._prefixos(alvo, grupo)
-            base = self._base(prefs) if prefs else self.an.iloc[0:0]
-            if not base.empty:
-                for must, nots in ALVOS[alvo][2]:
-                    ok = base["desc_norm"].map(
-                        lambda d: all(tem(d, x) for x in must) and not any(tem(d, x) for x in nots))
-                    c = base[ok]
-                    if not c.empty:
-                        c = c.assign(_n=c["desc_norm"].str.len()).sort_values(["_n", "classificacao"])
-                        res = (c.iloc[0]["reduzido"], c.iloc[0]["descricao"])
-                        break
+            esc = ALVOS[alvo][0]
+            res = self._buscar(alvo, self._prefixos(alvo, grupo), esc in (PA, AT))
+            if res is None and esc == G and alvo in FORA_DO_GRUPO and self.raizes["RESULTADO"]:
+                res = self._buscar(alvo, tuple(self.raizes["RESULTADO"]), False)
+                if res:
+                    self.fora_grupo.add(k)
             self.cache[k] = res
         return self.cache[k]
 
@@ -676,8 +708,11 @@ class Resolvedor:
         for a in alvos:
             r = self.conta(a, grupo)
             if r:
-                aviso = "" if a == alvos[0] else f"fallback {ALVOS[alvos[0]][1]} → {ALVOS[a][1]}"
-                return r[0], r[1], aviso
+                avisos = [] if a == alvos[0] else [f"fallback {ALVOS[alvos[0]][1]} → {ALVOS[a][1]}"]
+                k = self.chave(a, grupo)
+                if k in self.fora_grupo and not self.ov.get(k):
+                    avisos.append(f"{ALVOS[a][1]}: conta fora do grupo do separador")
+                return r[0], r[1], " | ".join(avisos)
         return "", "", f"❌ sem conta '{ALVOS[alvos[0]][1]}' (defina no Mapa de contas)"
 
 # =====================================================================
@@ -817,13 +852,16 @@ def parse_separadores(txt: str):
     return out
 
 
-def itens_do_cadastro(cad: dict, tipos, separadores):
+def itens_do_cadastro(cad: dict, tipos, separadores, filantropica=False):
     """Itens a contabilizar sem o relatório de pendências:
-    Tipos 1/3/4 = todas as rubricas do cadastro; Tipo 2 = catálogo Empresa;
-    Tipo 10 = catálogo Outras Informações (itens 1 a 13), CADA ITEM EM LANÇAMENTO PRÓPRIO."""
+    Tipos 1/3/4 = todas as rubricas do cadastro; Tipo 2 = catálogo Empresa; Tipos 5/6 = catálogo Provisão
+    (Encargos/Estorno PIS só para filantrópica); Tipo 10 = catálogo Outras Informações (itens 1 a 13),
+    CADA ITEM EM LANÇAMENTO PRÓPRIO."""
+    provisao = {c: v for c, v in ITENS_PROVISAO.items() if filantropica or c not in ITENS_PROVISAO_PIS}
     fontes = {
         "Empresa": {c: v[0] for c, v in ITENS_EMPRESA.items()},
         "Outras Informações": {c: v[0] for c, v in ITENS_OUTRAS.items()},
+        "Provisão de Férias": provisao, "Provisão de 13º": provisao,
     }
     rubricas = {c: r["descricao"] for c, r in cad.items()}
     itens = []
@@ -842,7 +880,7 @@ def unificar_com_folha(itens, mesma_ferias: bool, mesma_rescisao: bool, manter_e
     os itens dessas seções passam a usar o lançamento da Folha (Tipo 1).
     - rubrica que já existe na Folha (mesmo separador e código): o item de Férias/Rescisão é descartado;
     - rubrica exclusiva de Férias/Rescisão: com manter_exclusivas continua no próprio Tipo 3/4
-      (como a Domínio grava, p.ex. Aviso Prévio com crédito em Rescisões a Pagar);
+      (como a Domínio grava, p.ex. Aviso Prévio e 51 Líquido Rescisão);
       sem manter_exclusivas é movida para a Folha (Tipo 1).
     Retorna (itens, quantidade unificada, quantidade de exclusivas mantidas)."""
     unir = {s for s, f in (("Férias", mesma_ferias), ("Rescisão", mesma_rescisao)) if f}
@@ -899,9 +937,9 @@ def e_socio(d):
     return tem(d, "EMPREGADOR") and tem(d, "INSS", "IRRF", "TROCO", "ESTOURO", "ADTO", "ADIANT*")
 
 
-def passivo_secao(secao, d):
-    if secao == "Férias": return ["FER_PAGAR", "SAL_PAGAR"]
-    if secao == "Rescisão": return ["RESC_PAGAR", "SAL_PAGAR"]
+def passivo_secao(d):
+    """Conta de passagem do cálculo. Férias e Rescisão também passam por Salários a Pagar, como a Domínio integra:
+    o líquido das férias sai pela 937 (Adiantamento de Férias) e o da rescisão pela 51 (Rescisões a Pagar)."""
     if e_socio(d): return ["PROLAB_PAGAR", "SAL_PAGAR"]
     return ["SAL_PAGAR"]
 
@@ -918,60 +956,78 @@ def e_licenca_remunerada(d):
 
 
 def e_maternidade(d):
-    """SALARIO MATERNIDADE / LIC.MATERN / LIC.MAT.INSS / SAL MAT"""
-    return tem(d, "MATERN*") or (tem(d, "LIC", "LICENC*", "SAL") and tem(d, "MAT"))
+    """SALARIO MATERNIDADE / LIC.MATERN / LIC.MATER.INSS / LIC.MAT.INSS / SAL MAT"""
+    return tem(d, "MATERN*", "MATER") or (tem(d, "LIC", "LICENC*", "SAL") and tem(d, "MAT"))
+
+
+# Rubricas de natureza salarial sem regra própria: vão para Salários sem pedir revisão
+TERMOS_SALARIO = ("SALARI*", "SAL", "ORDENADO*", "HORA*", "DIA", "DIAS", "DSR", "RSR", "REPOUSO", "ADICIONA*",
+                  "ADIC", "INSALUB*", "PERICUL*", "NOTURN*", "ANUENIO", "BIENIO", "TRIENIO", "QUINQUENIO",
+                  "SOBREAVISO", "PRONTIDAO", "GORJETA", "ACUMULO", "QUEBRA DE CAIXA", "REFLEXO*", "MEDIA*",
+                  "VANTAGE*", "AFAST*", "ANTECIP*", "DIF*", "HORISTA", "MENSALISTA", "AULA*", "PROFESSOR*",
+                  "JORNADA", "INTERVALO", "CONVOCAC*", "INTERMITENT*", "TEMPO DE SERVICO", "PISO", "SALDO")
 
 
 def alvo_dre_provento(d):
-    if tem(d, "PRO LABORE"): return ["PRO_LABORE", "SALARIOS"]
-    if tem(d, "BOLSA", "ESTAGI*", "RECESSO"): return ["BOLSA", "SALARIOS"]
+    """(alvos, regra específica?) — sem regra específica a rubrica cai em Salários e vai para revisão."""
+    if tem(d, "PRO LABORE"): return ["PRO_LABORE", "SALARIOS"], True
+    if tem(d, "BOLSA", "ESTAGI*", "RECESSO"): return ["BOLSA", "SALARIOS"], True
     # Licença remunerada (férias coletivas s/ período aquisitivo) = natureza salarial;
     # a versão "GOZADA(S)" é férias de fato.
-    if e_licenca_remunerada(d) and not tem(d, "GOZ*"): return ["SALARIOS"]
-    if tem(d, "HORAS EXTRA*", "EXTRAS", "BANCO DE HORAS"): return ["HE", "SALARIOS"]
-    if e13(d): return ["DECIMO", "SALARIOS"]
-    if e_ferias(d): return ["FERIAS", "SALARIOS"]
-    if tem(d, "AVISO PREVIO", "INDENIZ*", "MULTA", "ESTABILIDADE"): return ["INDENIZ", "SALARIOS"]
+    if e_licenca_remunerada(d) and not tem(d, "GOZ*"): return ["SALARIOS"], True
+    if tem(d, "HORAS EXTRA*", "EXTRAS", "BANCO DE HORAS"): return ["HE", "SALARIOS"], True
+    if e13(d): return ["DECIMO", "SALARIOS"], True
+    if e_ferias(d): return ["FERIAS", "SALARIOS"], True
+    if tem(d, "AVISO PREVIO", "INDENIZ*", "MULTA", "ESTABILIDADE"): return ["INDENIZ", "SALARIOS"], True
     if tem(d, "PREMIO*", "GRATIFIC*", "BONUS", "PLR", "PARTICIPACAO LUCRO*", "PARTIC LUCRO*"):
-        return ["PREMIOS", "SALARIOS"]
-    if tem(d, "COMISS*"): return ["COMISSOES", "PREMIOS", "SALARIOS"]
-    if tem(d, "VALE TRANSPORTE", "VT"): return ["VT"]
-    if tem(d, "PLANO DE SAUDE", "PLANO SAUDE", "ODONTO*", "ASSISTENCIA MEDICA"): return ["ASSIST"]
-    if tem(d, "REFEICAO", "ALIMENTACAO", "CESTA", "VR"): return ["ALIM"]
-    if tem(d, "SEGURO*"): return ["SEGURO", "ASSIST"]
-    if tem(d, "TREINAMENTO", "CURSO*"): return ["TREIN"]
-    return ["SALARIOS"]
+        return ["PREMIOS", "SALARIOS"], True
+    if tem(d, "COMISS*"): return ["COMISSOES", "PREMIOS", "SALARIOS"], True
+    if tem(d, "VALE TRANSPORTE", "VT"): return ["VT"], True
+    if tem(d, "PLANO DE SAUDE", "PLANO SAUDE", "ODONTO*", "ASSISTENCIA MEDICA"): return ["ASSIST"], True
+    if tem(d, "REFEICAO", "ALIMENTACAO", "CESTA", "VR"): return ["ALIM"], True
+    if tem(d, "SEGURO*"): return ["SEGURO", "ASSIST"], True
+    if tem(d, "TREINAMENTO", "CURSO*"): return ["TREIN"], True
+    return ["SALARIOS"], tem(d, *TERMOS_SALARIO)
 
 
-def classificar_provento(d, secao, baixa_prov):
-    L = passivo_secao(secao, d)
-    if tem(d, "ESTOURO", "TROCO"):
-        return ["ADIANT_SAL"], L, "Estouro/troco: crédito a receber do empregado", False
+def classificar_provento(d, baixa_prov):
+    L = passivo_secao(d)
+    if tem(d, "ESTOURO", "TROCO", "ARRED*"):
+        return ["ADIANT_SAL"], L, "Estouro/troco/arredondamento: crédito a receber do empregado", False
     if tem(d, "ADIANT*", "ADTO"):
         return alvo_adiant(d), L, "Adiantamento pago: Ativo × obrigação", False
-    if tem(d, "DEV", "DEVOLUCAO") and tem(d, "EMPREST*", "CONSIG*"):
-        return ["EMPREST"], L, "Devolução de consignado", True
-    # Maternidade: SEMPRE pela conta-ponte (a baixa é feita pelo Tipo 10 "Compensação da Ded. Sal. Maternidade").
-    # Lançar direto em INSS a Recolher e também compensar no Tipo 10 baixaria o INSS duas vezes.
-    if e_maternidade(d) and not tem(d, "DESC*", "DEDUC*", "PRORROG*", "EMPREGADOR"):
+    if tem(d, "DEV", "DEVOLUCAO", "ESTORNO*") and tem(d, "EMPREST*", "CONSIG*"):
+        return ["EMPREST"], L, "Devolução/estorno de consignado descontado", True
+    # Maternidade reembolsada pelo INSS: SEMPRE pela conta-ponte (baixa no Tipo 10 "Compensação da Ded. Sal.
+    # Maternidade"); lançar direto em INSS a Recolher e também compensar no Tipo 10 baixaria o INSS duas vezes.
+    # Prorrogação (Empresa Cidadã) e bolsa de estagiária não são reembolsadas pelo INSS.
+    if e_maternidade(d) and not tem(d, "DESC*", "DEDUC*", "PROR*", "EMPREGADOR", "BOLSA*", "ESTAGI*"):
         return ["BENEF_INSS"], L, "Salário-maternidade reembolsável → conta-ponte (baixa no Tipo 10)", False
     if tem(d, "INSS", "IRRF") and tem(d, "A MAIOR", "DIF*", "DEVOL*", "RESTITUI*"):
         return (["IRRF_REC"] if tem(d, "IRRF") else ["INSS_REC"]), L, "Restituição de retenção a maior", False
     if tem(d, "SALARIO FAMILIA", "SAL FAM*"):
         return ["BENEF_INSS"], L, "Salário-família → conta-ponte até a compensação na guia", False
-    dre = alvo_dre_provento(d)
+    if tem(d, "1 12") and tem(d, "INDENIZ*"):
+        # Projeção do aviso prévio indenizado: não foi provisionada, nunca baixa a provisão
+        return (["FERIAS", "INDENIZ"] if e_ferias(d) else ["INDENIZ", "DECIMO"]), L, \
+            "1/12 indenizado do aviso prévio (não provisionado)", False
+    dre, especifica = alvo_dre_provento(d)
     if baixa_prov and dre[0] in ("FERIAS", "DECIMO"):
-        return (["P_PROV_FER"] if dre[0] == "FERIAS" else ["P_PROV_13"]), L, "Baixa contra a provisão", False
+        prov = ["P_PROV_FER", "FERIAS"] if dre[0] == "FERIAS" else ["P_PROV_13", "DECIMO"]
+        return prov, L, "Baixa contra a provisão", False
+    if not especifica:
+        return dre, L, "Sem regra específica — confirme a natureza da rubrica (padrão: Salários)", True
     return dre, L, "", False
 
 
-def classificar_desconto(d, secao):
-    L = passivo_secao(secao, d)
+def classificar_desconto(d, baixa_prov):
+    L = passivo_secao(d)
     def r(c, obs="", rev=False): return L, c, obs, rev
-    if tem(d, "ESTOURO", "TROCO"): return r(["ADIANT_SAL"], "Baixa de estouro/troco anterior")
+    if tem(d, "ESTOURO", "TROCO", "ARRED*"):
+        return r(["ADIANT_SAL"], "Baixa de estouro/troco/arredondamento anterior")
     if tem(d, "LIQUIDO") and tem(d, "RESCIS*"):
-        # Sempre D Salários a Pagar × C Rescisões a Pagar (a Domínio grava essa rubrica no Tipo 1);
-        # na seção Rescisão o passivo da seção já é Rescisões a Pagar e o lançamento viraria curto-circuito.
+        # O cálculo de Rescisão passa por Salários a Pagar e esta rubrica (Tipo 4) leva o líquido para
+        # Rescisões a Pagar, quitada no pagamento.
         return ((["SAL_PAGAR"], ["RESC_PAGAR"],
                  "Líquido da rescisão pago à parte — transfere p/ Rescisões a Pagar", True))
     if tem(d, "PENSAO*"): return r(["PENSAO"], "Repasse ao beneficiário", True)
@@ -993,47 +1049,45 @@ def classificar_desconto(d, secao):
     if tem(d, "SEGURO*"): return r(["SEGURO", "ASSIST"], "Recuperação do custo do benefício")
     if tem(d, "AVISO PREVIO", "MULTA", "ESTABILIDADE", "INDENIZ*"):
         return r(["INDENIZ", "SALARIOS"], "Indenização devida pelo empregado", True)
-    if e13(d): return r(["DECIMO", "SALARIOS"], "Redução do custo de 13º")
+    if e13(d):
+        return r((["P_PROV_13"] if baixa_prov else []) + ["DECIMO", "SALARIOS"],
+                 "Redução do 13º contra a provisão" if baixa_prov else "Redução do custo de 13º")
     if e_maternidade(d): return r(["BENEF_INSS"], "Estorno de salário-maternidade pago a maior", True)
-    if e_ferias(d): return r(["FERIAS", "SALARIOS"], "Redução do custo de férias")
+    if e_ferias(d):
+        return r((["P_PROV_FER"] if baixa_prov else []) + ["FERIAS", "SALARIOS"],
+                 "Redução das férias contra a provisão" if baixa_prov else "Redução do custo de férias")
     if tem(d, "COMISS*"): return r(["COMISSOES", "PREMIOS", "SALARIOS"], "Estorno de comissões")
     if tem(d, "PREMIO*", "GRATIFIC*"): return r(["PREMIOS", "SALARIOS"], "Estorno de prêmio/gratificação")
     if tem(d, "FALTA*", "ATRASO*", "DSR", "HORAS", "DIAS", "PAGO A MAIOR", "INATIV*", "SUSPENS*", "AFASTAD*"):
         return r(["SALARIOS"], "Redução do custo de salários")
-    if tem(d, "ARRED*"):
-        return r(["SALARIOS"], "Arredondamento — redução do custo de salários", True)
     return r([], "Desconto sem regra — definir conta manualmente", True)
 
 
-def classificar_informativa(d, tipo):
+def classificar_informativa(d, tipo, baixa_prov=False):
     """Regra: informativa só integra se a descrição tiver FGTS (com ou sem ponto)
-    e não for base/dedução de base. Todo o resto: não integrar."""
+    e não for base/dedução de base. Todo o resto: não integrar.
+    Com baixa contra a provisão, o FGTS de férias/13º baixa o FGTS provisionado (exceto o do 1/12 indenizado)."""
     if e_base(d):
         return [], [], "Base/dedução de base — não gera lançamento", True
     if not e_fgts(d):
         return [], [], "Informativa sem FGTS na descrição — não integrar", True
-    dre = ["INDENIZ", "FGTS"] if tem(d, "40%", "20%") else ["FGTS"]
+    multa = tem(d, "40%", "20%")
+    dre = ["INDENIZ", "FGTS"] if multa else ["FGTS"]
+    if baixa_prov and not multa and not tem(d, "INDENIZ*"):
+        if e13(d):
+            dre = ["P_FGTS_13", "FGTS"]
+        elif e_ferias(d):
+            dre = ["P_FGTS_FER", "FGTS"]
+    obs = "FGTS de férias/13º contra a provisão" if dre[0].startswith("P_") else "Encargo FGTS"
     if tem(d, "A MAIOR") or tipo == "Inf. dedutora":
-        return ["FGTS_REC"], dre, "Estorno de FGTS a maior", True
-    return dre, ["FGTS_REC"], "Encargo FGTS", False
-
-
-def despesa_da_secao(alvos, secao, codigo, excecoes):
-    """Cálculo de Férias/Rescisão com configuração própria (flag desmarcada):
-    a despesa salarial (Salários, Horas Extras, Prêmios, Comissões) vira a despesa do cálculo
-    — Férias → despesa de Férias | Rescisão → despesa de Rescisão/Indenizações.
-    Exceções: códigos informados pelo usuário e tudo que não for despesa salarial
-    (13º, férias, aviso, FGTS, benefícios, pró-labore, contas patrimoniais)."""
-    if secao not in DESPESA_SECAO or not alvos or alvos[0] not in DESPESA_TROCAVEL:
-        return alvos, ""
-    if codigo in excecoes:
-        return alvos, f"Exceção: mantém a despesa da folha no cálculo de {secao}"
-    novo = DESPESA_SECAO[secao]
-    return novo + [a for a in alvos if a not in novo], f"Despesa do cálculo de {secao}"
+        return ["FGTS_REC"], dre, f"Estorno de FGTS a maior ({obs})", True
+    return dre, ["FGTS_REC"], obs, False
 
 
 def classificar_provisao(d, secao):
     """Itens das seções Provisão de Férias / Provisão de 13º."""
+    if tem(d, "TRANSFER*"):
+        return [], [], "Transferência de provisão entre empresas — configure manualmente na Domínio", True
     sfx = "FER" if "Férias" in secao else "13"
     base = "FERIAS" if sfx == "FER" else "DECIMO"
     if tem(d, "FGTS"):
@@ -1090,7 +1144,8 @@ def classificar_item_empresa(codigo, d, baixa_prov, filantropica=False):
         origem = (f"Inferido — no catálogo o item {codigo} é '{cat[0]}'" if cat
                   else f"Inferido — item {codigo} fora do catálogo")
     sfx = {"F": "FER", "13": "13"}.get(comp)
-    prov = bool(baixa_prov and sfx and nat in ("INSS", "SENAI", "PIS", "ISENCAO"))
+    # o 13º indenizado (projeção do aviso prévio) não foi provisionado: o INSS sobre ele vai para despesa
+    prov = bool(baixa_prov and sfx and nat in ("INSS", "SENAI", "PIS", "ISENCAO") and not tem(d, "INDENIZ*"))
     if nat in ("INSS", "INSS_SOCIO", "AUTONOMO", "SENAI"):
         deb, cred = ([f"P_INSS_{sfx}", f"P_PROV_{sfx}"] if prov else ["INSS"]), ["INSS_REC"]
     elif nat == "PIS":
@@ -1282,7 +1337,6 @@ CFG_WIDGETS = (("historico", "w_hist"), ("baixa_prov", "w_baixa"), ("socio_adm",
                ("bloqueio_extra", "w_bloq"), ("empresa", "w_cod"), ("complemento", "w_compl"),
                ("tipos_cadastro", "w_tipos_cad"), ("separadores_cadastro", "w_seps_cad"),
                ("mesma_rescisao", "w_mesma_resc"), ("mesma_ferias", "w_mesma_fer"),
-               ("excecoes_ferias", "w_exc_fer"), ("excecoes_rescisao", "w_exc_resc"),
                ("filantropica", "w_filant"), ("manter_exclusivas", "w_exclusivas"),
                ("partidas_multiplas", "w_multi"), ("liquidos", "w_liquidos"))
 
@@ -1341,9 +1395,9 @@ desenhar_passos(ph_passos, 1)
 MODO_PEND = "Só o que falta configurar (relatório de pendências)"
 MODO_TODOS = "Todos os eventos cadastrados"
 
-for k, v in (("w_hist", ""), ("w_baixa", False), ("w_socio", True), ("w_bloq", ""),
+for k, v in (("w_hist", ""), ("w_baixa", True), ("w_socio", True), ("w_bloq", ""),
              ("w_compl", COMPLEMENTO_PADRAO), ("w_mesma_resc", False), ("w_mesma_fer", False),
-             ("w_exc_fer", ""), ("w_exc_resc", ""), ("w_filant", False), ("w_exclusivas", True),
+             ("w_filant", False), ("w_exclusivas", True),
              ("w_forcar", False), ("w_multi", False), ("w_liquidos", LIQUIDOS_PADRAO), ("w_modo", MODO_PEND)):
     st.session_state.setdefault(k, v)
 
@@ -1363,7 +1417,7 @@ with st.sidebar:
         modo_txt = st.radio("O que contabilizar?", [MODO_PEND, MODO_TODOS], key="w_modo",
                             help="Pendências: gera só o que o relatório 'Rubricas/Itens não configurados' lista. "
                                  "Todos os eventos: gera o lançamento de todas as rubricas do cadastro geral, "
-                                 "mais os itens das abas Empresa e Outras Informações.")
+                                 "mais os itens das abas Empresa, Provisão de Férias/13º e Outras Informações.")
         modo_cad = modo_txt == MODO_TODOS
         f_pend = None
         if not modo_cad:
@@ -1408,18 +1462,20 @@ with st.sidebar:
     st.caption("Usar a mesma configuração da folha normal para:")
     mesma_resc = st.checkbox("Rescisão", key="w_mesma_resc",
                              help="Igual à Domínio. Marcado: a Rescisão usa os lançamentos da Folha "
-                                  "(Tipo 1) e o Tipo 4 não é gerado. Desmarcado: Tipo 4 próprio, com "
-                                  "crédito em Rescisões a Pagar e despesa de Rescisão.")
+                                  "(Tipo 1) e o Tipo 4 não é gerado. Desmarcado: Tipo 4 próprio, com a mesma "
+                                  "classificação por natureza; o cálculo passa por Salários a Pagar e a 51 "
+                                  "Líquido Rescisão leva o líquido para Rescisões a Pagar.")
     mesma_fer = st.checkbox("Férias", key="w_mesma_fer",
                             help="Igual à Domínio. Marcado: as Férias usam os lançamentos da Folha "
-                                 "(Tipo 1) e o Tipo 3 não é gerado. Desmarcado: Tipo 3 próprio, com "
-                                 "crédito em Férias a Pagar e despesa de Férias.")
+                                 "(Tipo 1) e o Tipo 3 não é gerado. Desmarcado: Tipo 3 próprio, com a mesma "
+                                 "classificação por natureza; o cálculo passa por Salários a Pagar e a 937 "
+                                 "Adiantamento de Férias leva o líquido para Adiantamento de Férias.")
     manter_excl = st.checkbox("Manter no Tipo 3/4 as rubricas exclusivas de Férias/Rescisão",
                               key="w_exclusivas", disabled=not (mesma_resc or mesma_fer),
                               help="Só vale quando 'mesma configuração' está marcada. Rubricas que existem "
-                                   "somente em Férias/Rescisão (ex.: Aviso Prévio, 13º 1/12 indenizado) não "
-                                   "têm lançamento na Folha; a Domínio as grava no próprio Tipo 3/4, com "
-                                   "crédito em Rescisões a Pagar. Desmarcado: vão para o Tipo 1.")
+                                   "somente em Férias/Rescisão (ex.: Aviso Prévio, 51 Líquido Rescisão) não "
+                                   "têm lançamento na Folha; a Domínio as grava no próprio Tipo 3/4. "
+                                   "Desmarcado: vão para o Tipo 1.")
 
     st.markdown("**3 · Encargos, provisões e sócios**")
     filant = st.checkbox("Entidade filantrópica (isenta de INSS patronal)", key="w_filant",
@@ -1428,17 +1484,13 @@ with st.sidebar:
                               "(débito INSS a Recolher × crédito INSS despesa, ou provisão se marcada a baixa). "
                               "Desmarcado: esses itens não são integrados.")
     baixa_prov = st.checkbox("Baixar férias/13º pagos contra a provisão", key="w_baixa",
-                             help="Deixe desmarcado se a Domínio já gera o 'Valor Estorno Provisão'.")
+                             help="Mantenha marcado quando a empresa integra a Provisão de Férias/13º (Tipos 5 e 6), "
+                                  "como a Domínio contabiliza na prática: férias, 13º e o FGTS/INSS sobre eles, pagos "
+                                  "no cálculo, debitam a provisão. O item 'Valor Estorno Provisão' é o ajuste do saldo "
+                                  "da provisão, não a baixa das férias pagas. Desmarque só se a empresa não provisiona.")
     socio_adm = st.checkbox("Pró-labore e encargos do sócio sempre em Despesas Administrativas", key="w_socio")
 
     with st.expander("Opções avançadas"):
-        st.caption("Despesa própria de Férias/Rescisão (só vale com 'mesma configuração' desmarcada): salários, "
-                   "horas extras, prêmios e comissões debitam a despesa de Férias (Tipo 3) ou de Rescisão (Tipo 4). "
-                   "Informe abaixo os códigos que devem manter a despesa da folha.")
-        exc_fer = st.text_input("Exceções Férias (códigos)", key="w_exc_fer", disabled=mesma_fer,
-                                placeholder="ex.: 1, 150, 8781")
-        exc_resc = st.text_input("Exceções Rescisão (códigos)", key="w_exc_resc", disabled=mesma_resc,
-                                 placeholder="ex.: 9179, 9180")
         bloq_extra = st.text_input("Contas extras de colaborador (reduzidos, separados por vírgula)", key="w_bloq",
                                    help="Além das detectadas automaticamente; itens patronais nunca poderão usá-las.")
         historico = HISTORICO_FIXO
@@ -1447,7 +1499,6 @@ with st.sidebar:
         complemento = st.text_input("Complemento", key="w_compl")
         st.caption(f"1 lançamento por rubrica/item · Código Sequencial = código da rubrica/item · "
                    f"Descrição = 'código - descrição' em caixa mista, máx. {LIM_DESC_EVENTO} caracteres.")
-    excecoes = {"Férias": codigos(exc_fer), "Rescisão": codigos(exc_resc)}
 
 if not (f_cad and f_plano and (f_pend or modo_cad)):
     st.info("👈 Comece pelo Passo 1: envie na barra lateral o cadastro geral de rubricas e o plano de contas"
@@ -1465,7 +1516,7 @@ try:
             st.info("Escolha ao menos um Tipo da Integração na barra lateral.")
             st.stop()
         cab = empresa_do_cadastro(f_cad.getvalue(), f_cad.name)
-        itens = itens_do_cadastro(cad, tipos_cad, parse_separadores(seps_cad))
+        itens = itens_do_cadastro(cad, tipos_cad, parse_separadores(seps_cad), filant)
     else:
         cab, itens = parse_pendencias(f_pend.getvalue(), f_pend.name)
 except Exception as e:
@@ -1641,7 +1692,6 @@ if socio_adm:
     grupo_socio = rot2pref.get(esc_socio)
 
 # ---------- Classificação (regras) ----------
-mesma_secao = {"Férias": mesma_fer, "Rescisão": mesma_resc}
 regras = []
 for it in itens:
     d, sec = norm(it["descricao"]), it["secao"]
@@ -1663,26 +1713,24 @@ for it in itens:
             fgts_forcado, tipo_cad = True, tipo
             tipo = "Informativa"
         if tipo in ("Informativa", "Inf. dedutora"):
-            deb, cred, obs, rev = classificar_informativa(d, tipo)
+            deb, cred, obs, rev = classificar_informativa(d, tipo, baixa_prov)
             if fgts_forcado:
                 obs = f"Rubrica de FGTS cadastrada como {tipo_cad} — tratada como informativa | {obs}"
                 rev = True
         elif tipo == "Desconto":
-            deb, cred, obs, rev = classificar_desconto(d, sec)
+            deb, cred, obs, rev = classificar_desconto(d, baixa_prov)
         else:
-            deb, cred, obs, rev = classificar_provento(d, sec, baixa_prov)
-        # Férias/Rescisão com configuração própria: a despesa também muda (com exceções)
-        if sec in DESPESA_SECAO and not mesma_secao[sec]:
-            exc = excecoes.get(sec, set())
-            deb, o1 = despesa_da_secao(deb, sec, it["codigo"], exc)
-            cred, o2 = despesa_da_secao(cred, sec, it["codigo"], exc)
-            obs = " | ".join(x for x in (obs, o1, o2) if x)
+            deb, cred, obs, rev = classificar_provento(d, baixa_prov)
     if grupo_socio and (e_socio(d) or nat == "INSS_SOCIO" or (nat == "ISENCAO" and tem(d, "PRO LAB*"))):
         prefixo = grupo_socio
     regras.append(dict(it=it, d=d, sec=sec, k=k, prefixo=prefixo, tipo=tipo, origem=origem,
                        deb=deb, cred=cred, obs=obs, rev=rev, nat=nat))
 
 n_isencao_ign = sum(1 for r in regras if r["nat"] == "ISENCAO") if not filant else 0
+if any(TIPO_INTEGRACAO.get(i["secao"]) in (5, 6) for i in itens) and not baixa_prov:
+    st.warning("⚠️ A empresa integra a Provisão de Férias/13º (Tipos 5 e 6), mas 'Baixar férias/13º pagos contra a "
+               "provisão' está desmarcado: férias e 13º pagos irão para despesa e o custo será contado duas vezes "
+               "(provisão mensal + pagamento).")
 if n_isencao_ign:
     st.info(f"ℹ️ {n_isencao_ign} item(ns) de isenção de filantropia não serão integrados. "
             "Se a empresa é filantrópica, marque 'Entidade filantrópica' na barra lateral.")
@@ -1779,7 +1827,7 @@ for r in regras:
         else:
             dc, dd = NULO, ""
     elif r["tipo"] in ("Provento", "Desconto"):
-        conta_liq = res.resolver(passivo_secao(sec, r["d"]), r["prefixo"])[0]
+        conta_liq = res.resolver(passivo_secao(r["d"]), r["prefixo"])[0]
     linhas.append({
         "Status": status, "Seção": sec, "Tipo Integração": str(tipo_int) if tipo_int else "—",
         "Separador": r["k"], "Nome do separador": it["sep_nome"] or NOME_PADRAO_SEM_SEPARADOR,
@@ -2041,14 +2089,13 @@ def excel_bytes(abas: dict) -> bytes:
 
 
 cfg_out = {
-    "versao": 8, "empresa": cod_empresa, "nome_empresa": cab["nome"],
+    "versao": 9, "empresa": cod_empresa, "nome_empresa": cab["nome"],
     "grupos": mapa_grupos, "grupo_socio": grupo_socio, "contas": dict(cfg_contas),
     "historico": historico, "hist_tipo": {str(t): v for t, v in hist_tipo.items() if v},
     "complemento": complemento, "baixa_prov": baixa_prov, "socio_adm": socio_adm,
     "bloqueio_extra": bloq_extra, "raizes": raizes,
     "mesma_rescisao": mesma_resc_cfg, "mesma_ferias": mesma_fer, "manter_exclusivas": manter_excl,
-    "partidas_multiplas": modo_multi, "liquidos": liquidos_sel,
-    "excecoes_ferias": exc_fer, "excecoes_rescisao": exc_resc, "filantropica": filant,
+    "partidas_multiplas": modo_multi, "liquidos": liquidos_sel, "filantropica": filant,
     "colunas": {k: v for k, v in sel.items() if v and v != "(nenhuma)"},
 }
 if modo_cad:
