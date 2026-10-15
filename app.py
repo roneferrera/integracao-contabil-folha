@@ -43,6 +43,7 @@ import io
 import json
 import numbers
 import re
+import struct
 import unicodedata
 import zipfile
 from difflib import SequenceMatcher
@@ -462,6 +463,38 @@ def norm_conta(txt) -> str:
     return s
 
 
+def _ler_xls_tolerante(dados: bytes) -> pd.DataFrame:
+    """.xls exportado pela Domínio que o xlrd recusa ('Expected BOF record'): o BOUNDSHEET aponta para registros
+    soltos que ficam antes do BOF da planilha. Corrige o ponteiro no fluxo Workbook e lê de novo."""
+    from xlrd import compdoc
+    log = io.StringIO()
+    cd = compdoc.CompDoc(dados, logfile=log)
+    for nome_fluxo in ("Workbook", "Book"):
+        mem, base, tam = cd.locate_named_stream(nome_fluxo)
+        if mem:
+            break
+    else:
+        raise ValueError("arquivo .xls sem o fluxo da planilha (Workbook)")
+    fluxo = bytearray(mem[base:base + tam])
+    pos, nivel, bofs, bounds = 0, 0, [], []
+    while pos + 4 <= len(fluxo):
+        tipo, tam_reg = struct.unpack_from("<HH", fluxo, pos)
+        if tipo == 0x0809:                     # BOF: início dos globais e de cada planilha
+            if nivel == 0:
+                bofs.append(pos)
+            nivel += 1
+        elif tipo == 0x000A:                   # EOF
+            nivel = max(0, nivel - 1)
+        elif tipo == 0x0085:                   # BOUNDSHEET: posição da planilha no fluxo
+            bounds.append(pos)
+        pos += 4 + tam_reg
+    for k, b in enumerate(bounds):
+        if k + 1 < len(bofs):
+            struct.pack_into("<I", fluxo, b + 4, bofs[k + 1])
+    return pd.read_excel(io.BytesIO(bytes(fluxo)), engine="xlrd", dtype=str, header=None,
+                         engine_kwargs={"logfile": log})
+
+
 @st.cache_data(show_spinner=False)
 def ler_tabela_bruta(dados: bytes, nome: str) -> pd.DataFrame:
     if nome.lower().endswith((".csv", ".txt")):
@@ -480,7 +513,15 @@ def ler_tabela_bruta(dados: bytes, nome: str) -> pd.DataFrame:
         larg = max((len(r) for r in rows), default=0)
         df = pd.DataFrame([r + [None] * (larg - len(r)) for r in rows])
     else:
-        df = pd.read_excel(io.BytesIO(dados), dtype=str, header=None)
+        try:
+            df = pd.read_excel(io.BytesIO(dados), dtype=str, header=None)
+        except Exception as erro:
+            if not nome.lower().endswith(".xls"):
+                raise
+            try:
+                df = _ler_xls_tolerante(dados)
+            except Exception:
+                raise ValueError(f"{erro} — abra o arquivo no Excel e salve como .xlsx") from erro
     hdr = 0
     for i in range(min(40, len(df))):
         vals = [norm(x) for x in df.iloc[i].tolist() if x is not None and not pd.isna(x)]
@@ -829,6 +870,10 @@ TERMOS_FOLHA_FORTE = ("FOLHA*", "EMPREGADO*", "SALARIO*", "FUNCIONARIO*", "COLAB
 # demais não vira padrão sozinho
 IMPLICITOS_PASSIVO = {"PAGAR", "RECOLHER"}
 GENERICOS = {"FOLHA*", "OBRIGAC*", "PESSOAL", "OUTRAS"}
+# termos genéricos que só valem no nome da própria conta, nunca vindos do grupo ("Outras Obrigações > Telefone a
+# pagar" não é "Outras contas a pagar" da folha)
+SO_NO_NOME = GENERICOS | {"ENCARGO*", "SOCIAIS", "TAXAS", "CONTRIBUIC*", "TRIBUTOS FEDERAIS", "IMPOSTOS FEDERAIS",
+                          "BENEFICIO*"}
 LONGO_PRAZO = ("NAO CIRCULANTE", "LONGO PRAZO", "EXIGIVEL A LONGO*", "REALIZAVEL A LONGO*")
 # como a conta foi achada (0 a 4); as fracas e os empates vão para "Revisar"
 COMO = {0: "pelo nome", 1: "pelo nome e grupo", 2: "só pelo grupo", 3: "pelo nome, no Passivo",
@@ -920,7 +965,8 @@ class Resolvedor:
 
     @staticmethod
     def _nivel(d, ctx, must, nots, nots_alvo, implicito):
-        """0 = termos no nome da conta | 1 = nome + grupo logo acima | 2 = só pelos grupos | None = não casa."""
+        """0 = termos no nome da conta | 1 = parte no nome, o resto nos grupos acima | 2 = só pelos grupos |
+        None = não casa."""
         if any(tem(d, x) for x in nots):
             return None
         falta = [x for x in must if not tem(d, x)]
@@ -928,13 +974,11 @@ class Resolvedor:
             return None          # sem o nome completo, a conta não pode ter termo que o alvo exclui
         if not falta:
             return 0
-        if not ctx or any(tem(ctx[0], x) for x in nots):
+        if not ctx or any(tem(ctx[0], x) for x in nots) or set(falta) & SO_NO_NOME:
             return None
-        if len(falta) < len(must) and all(tem(ctx[0], x) for x in falta):
-            return 1
-        if all(any(tem(g, x) for g in ctx) for x in falta):
-            return 2
-        return None
+        if not all(any(tem(g, x) for g in ctx) for x in falta):
+            return None
+        return 1 if len(falta) < len(must) else 2
 
     @staticmethod
     def _vetado(ctx, veto):
