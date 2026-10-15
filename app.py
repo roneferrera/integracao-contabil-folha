@@ -244,11 +244,12 @@ def e_base(d):
 
 
 def e_ferias(d):
-    """Férias de fato: 'FÉRIAS', 'FER' abreviado, 'ABONO PECUNIÁRIO' e as médias/vantagens do abono
-    (não 'Abono Salarial'/'Abono Natalino')."""
-    if tem(d, "FERIAS", "FER", "ABONO PECUNIARIO"):
+    """Férias de fato: 'FÉRIAS', 'FER' abreviado, 'ABONO PECUNIÁRIO' (também 'ABONO/ABON PECUN') e o abono com
+    médias/vantagens/1/3 ou do intermitente (não 'Abono Salarial'/'Abono Natalino')."""
+    if tem(d, "FERIAS", "FER", "ABONO PECUN*", "ABON PECUN*"):
         return True
-    return (tem(d, "ABONO") and tem(d, "MEDIA*", "VANTAGE*", "DIFERENC*", "DIF", "PARCELA*")
+    return (tem(d, "ABONO", "ABON")
+            and tem(d, "MEDIA*", "VANTAGE*", "DIFERENC*", "DIF", "PARCELA*", "1 3", "INTERMITENT*")
             and not tem(d, "SALARIAL", "NATALINO", "PIS"))
 
 
@@ -1349,7 +1350,7 @@ def alvo_dre_provento(d):
     if tem(d, "PREMIO*", "GRATIFIC*", "BONUS", "PLR", "PARTICIPACAO LUCRO*", "PARTIC LUCRO*"):
         return ["PREMIOS", "SALARIOS"], True
     if tem(d, "COMISS*"): return ["COMISSOES", "PREMIOS", "SALARIOS"], True
-    if tem(d, "VALE TRANSPORTE", "VT"): return ["VT"], True
+    if tem(d, "VALE TRANSPORTE", "VT", "MOBILIDADE"): return ["VT"], True
     if tem(d, "PLANO DE SAUDE", "PLANO SAUDE", "ODONTO*", "ASSISTENCIA MEDICA"): return ["ASSIST"], True
     if tem(d, "REFEICAO", "ALIMENTACAO", "CESTA", "VR"): return ["ALIM"], True
     if tem(d, "SEGURO*"): return ["SEGURO", "ASSIST"], True
@@ -1410,11 +1411,18 @@ def classificar_desconto(d, baixa_prov):
     if tem(d, "ASSOCIAC*"): return r(["REPASSES"], "Mensalidade descontada a repassar", True)
     if tem(d, "PLANO", "ODONTO*", "COPARTICIP*", "ASSISTENCIA MEDICA", "FARMACIA", "SAUDE"):
         return r(["ASSIST"], "Recuperação do custo do benefício")
-    if tem(d, "VALE TRANSPORTE", "VT"): return r(["VT"], "Recuperação dos 6% do VT")
+    if tem(d, "VALE TRANSPORTE", "VT", "MOBILIDADE"): return r(["VT"], "Recuperação do custo do vale-transporte/mobilidade")
     if tem(d, "REFEICAO", "ALIMENTACAO", "VR", "CESTA", "SUPERMERCADO"):
         return r(["ALIM"], "Recuperação do custo do benefício")
     if tem(d, "SEGURO*"): return r(["SEGURO", "ASSIST"], "Recuperação do custo do benefício")
-    if tem(d, "AVISO PREVIO", "MULTA", "ESTABILIDADE", "INDENIZ*"):
+    # Bolsa-auxílio (estágio): todo desconto da bolsa (afastamento, antecipação, 1/3 do recesso) volta para a
+    # conta da bolsa, a mesma do provento
+    if tem(d, "BOLSA*", "BOL"):
+        if tem(d, "LIQUIDO", "LIQ") and tem(d, "RESCIS*"):
+            return r(["BOLSA", "SALARIOS"], "Líquido da rescisão do estagiário já pago — estorna a bolsa repetida na "
+                                         "folha", True)
+        return r(["BOLSA", "SALARIOS"], "Redução do custo da bolsa-auxílio")
+    if tem(d, "AVISO PREV*", "MULTA", "ESTABILIDADE", "INDENIZ*"):
         return r(["INDENIZ", "SALARIOS"], "Indenização devida pelo empregado", True)
     if e13(d):
         return r((["P_PROV_13"] if baixa_prov else []) + ["DECIMO", "SALARIOS"],
@@ -1425,8 +1433,24 @@ def classificar_desconto(d, baixa_prov):
                  "Redução das férias contra a provisão" if baixa_prov else "Redução do custo de férias")
     if tem(d, "COMISS*"): return r(["COMISSOES", "PREMIOS", "SALARIOS"], "Estorno de comissões")
     if tem(d, "PREMIO*", "GRATIFIC*"): return r(["PREMIOS", "SALARIOS"], "Estorno de prêmio/gratificação")
-    if tem(d, "FALTA*", "ATRASO*", "DSR", "HORAS", "DIAS", "PAGO A MAIOR", "INATIV*", "SUSPENS*", "AFASTAD*"):
+    if tem(d, "GORJETA*"):
+        return r(["SALARIOS"], "Gorjeta já recebida dos clientes: estorna o provento da estimativa, fica só o encargo "
+                               "(Solução 12819)")
+    if tem(d, "LIQUIDO", "LIQ") and tem(d, "CONVOCAC*", "INTERMITENT*"):
+        return r(["ADIANT_SAL"], "Líquido já pago nas convocações anteriores do mês — baixa como adiantamento "
+                                 "(confirme como as convocações são contabilizadas)", True)
+    if tem(d, "AJUDA*", "APOIO*") and tem(d, "FINANC*"):
+        return r(["SALARIOS"], "Apoio Financeiro do governo (MP 1.230/2024, Portaria MTE 991/2024) pago direto ao "
+                               "empregado — reduz o salário pago pela empresa; confirme a conta", True)
+    # Antecipação salarial (Solução 3472): no reajuste, a diferença retroativa entra cheia como provento e o que já
+    # foi antecipado é descontado — estorna custo de salários, não é adiantamento a receber
+    if tem(d, "ANTECIP*", "ANTEC") or (tem(d, "ANT") and tem(d, "DESC*", "PARC*")):
+        return r(["SALARIOS"], "Desconto da antecipação salarial já paga — reduz o custo de salários")
+    if (tem(d, "FALTA*", "ATRASO*", "DSR", "HORAS", "DIAS", "PAGO A MAIOR", "INATIV*", "SUSPENS*", "AFAST*")
+            or (tem(d, "DIF*") and tem(d, "SALARI*", "SAL"))):
         return r(["SALARIOS"], "Redução do custo de salários")
+    if tem(d, *TERMOS_SALARIO) and not tem(d, "SALDO"):
+        return r(["SALARIOS"], "Desconto de natureza salarial — reduz o custo de salários (confirme)", True)
     return r([], "Desconto sem regra — definir conta manualmente", True)
 
 
