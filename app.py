@@ -2,11 +2,19 @@
 Integrador Contábil da Folha — Domínio Sistemas
 Motor 100% determinístico (regex + regras de substring). Sem IA, sem APIs, sem chaves.
 
-- Nenhuma conta, código reduzido ou classificação de plano é fixada no código.
+- Nenhuma conta, código reduzido ou classificação de plano é fixada no código. As contas são achadas em
+  qualquer plano: pelo nome (com as abreviações usuais expandidas), pelo nome dos grupos acima da conta
+  ("Provisão de Férias > INSS", "Obrigações Trabalhistas > Salários"), pelo lado do balanço (no Passivo o
+  "a pagar/a recolher" fica implícito) e pelo código do referencial da RFB (ECF), quando o plano tem.
+  Conta achada só pelo grupo, pelo referencial ou empatada com outra vai para "Revisar".
 - Exportação no layout de importação da Domínio (1 lançamento por rubrica/item):
-    aba "evento"  -> lançamento (tabela FOINTEGCONT): Código Sequencial = código da rubrica/item,
-                     Descrição = "código - descrição" (caixa mista, máx. 40 caracteres)
-    aba "integra" -> vínculo da rubrica/item ao seu lançamento (tabela FOINTEGCONTEVE)
+    evento  -> lançamento (tabela FOINTEGCONT): Código Sequencial = código da rubrica/item,
+               Descrição = "código - descrição" (caixa mista, máx. 40 caracteres)
+    integra -> vínculo da rubrica/item ao seu lançamento (tabela FOINTEGCONTEVE)
+  Arquivos TXT da importação via tabela (TAB, sem cabeçalho, Windows-1252). A importação grava 0 em campo
+  numérico vazio lido do arquivo; o lado sem conta (partidas múltiplas) só fica em branco com o campo em
+  "Valor fixo = NULO" no leiaute. Por isso o .zip separa os lançamentos em partes: duas contas, só débito
+  (sem a coluna CONTA_CRED) e só crédito (sem a coluna CONTA_DEB), com o passo a passo e os scripts do leiaute.
 - Tipos: 1 Folha mensal | 2 Empresa | 3 Férias | 4 Rescisão | 5 Prov. Férias | 6 Prov. 13 | 10 Outras Informações
 - Dois modos:
     * Pendências: lê o relatório "Rubricas/Itens não configurados"
@@ -26,15 +34,17 @@ Motor 100% determinístico (regex + regras de substring). Sem IA, sem APIs, sem 
 
 Executar:
     pip install -r requirements.txt
-    streamlit run app_corrigido.py
+    streamlit run app_v9.py
 """
 import csv
+import datetime as dt
 import hashlib
 import io
 import json
 import numbers
 import re
 import unicodedata
+import zipfile
 from difflib import SequenceMatcher
 from functools import lru_cache
 
@@ -60,7 +70,9 @@ LIM_DESC_EVENTO = 40                      # FOINTEGCONT.descricao = char(40)
 LIM_COMP_HIST = 512                       # FOINTEGCONT.comp_hist = varchar(512)
 HISTORICO_FIXO = "186"                   # Código do Histórico fixo em todos os lançamentos
 COMPLEMENTO_PADRAO = "<<Competencia>> - <<Descrição do Lançamento>>"
-NULO = "nulo"                            # texto gravado no lado sem conta (partidas múltiplas)
+NULO = "NULO"                            # lado sem conta (partidas múltiplas). Na importação via tabela o NULO
+                                         # vale só como "Valor fixo" do campo no leiaute: no TXT, vazio ou texto
+                                         # em campo numérico viram 0. O lado NULO sai do TXT (ver PARTES)
 SECOES_TIPO1 = ("Folha Normal", "Adiantamento", "13º Salário")
 # Itens de Líquido do Tipo 1 (FOINTEGCONTITENS): código -> (descrição, contas candidatas em ordem)
 LIQUIDOS = {
@@ -81,6 +93,16 @@ COLS_INTEGRA = ["Código da Empresa", "Separador", "Código Sequencial da Integr
 COLS_EVENTO = ["Código da Empresa", "Separador (0 quando é sem separador)",
                "Código Sequencial da Integração", COL_TIPO, "Descrição",
                "Código da Conta Débito", "Código da Conta Crédito", "Código do Histórico", "Complemento"]
+
+# Importação via tabela (importação por leiaute): um TXT por tabela, campos na ordem do leiaute
+TAB_EVENTO, TAB_INTEGRA = "FOINTEGCONT", "FOINTEGCONTEVE"
+CAMPOS_EVENTO = ["CODI_EMP", "I_SEPARADOR", "I_CODIGO", "TIPO", "DESCRICAO", "CONTA_DEB", "CONTA_CRED",
+                 "I_HISTORICO", "COMP_HIST"]
+CAMPOS_INTEGRA = ["CODI_EMP", "I_SEPARADOR", "I_CODIGO", "TIPO", "I_EVENTOS"]
+# parte -> (pasta, título, campo de FOINTEGCONT com Valor fixo = NULO no leiaute)
+PARTES = {1: ("parte_1_duas_contas", "lançamentos com débito e crédito", None),
+          2: ("parte_2_so_debito", "lançamentos só a débito (proventos)", "CONTA_CRED"),
+          3: ("parte_3_so_credito", "lançamentos só a crédito (descontos e líquidos)", "CONTA_DEB")}
 
 TIPOS_LAYOUT = {1: "Folha mensal", 2: "Empresa", 3: "Férias", 4: "Rescisão",
                 5: "Prov. Férias", 6: "Prov. 13", 10: "Outras Informações"}
@@ -331,7 +353,8 @@ def descricao_lancamento(codigo, descricao) -> str:
 # 2. PLANO DE CONTAS GENÉRICO
 # =====================================================================
 CAMPOS_PLANO = {"reduzido": "Código reduzido", "classificacao": "Classificação",
-                "descricao": "Descrição", "tipo": "Tipo A/S (opcional)"}
+                "descricao": "Descrição", "tipo": "Tipo A/S (opcional)", "ecf": "Classificação ECF (opcional)"}
+CAMPOS_OPCIONAIS = ("tipo", "ecf")
 ROTULOS_RAIZ = {"ATIVO": "Raiz(es) do Ativo", "PASSIVO": "Raiz(es) do Passivo",
                 "RESULTADO": "Raiz(es) de Custos/Despesas", "RECEITA": "Raiz(es) de Receitas"}
 
@@ -363,6 +386,80 @@ def sob(c, p, pontuado) -> bool:
     if pontuado:
         return c == p or c.startswith(p + ".")
     return c.startswith(p)
+
+
+# Abreviações usuais em nomes de contas (só no plano de contas; as rubricas continuam com norm()).
+# Dependentes do contexto (a palavra antes/depois) ficam em _expande_token.
+ABREV_CONTA = {
+    "SALS": "SALARIOS", "SALAR": "SALARIOS", "ORD": "ORDENADOS", "ORDEN": "ORDENADOS",
+    "ADTO": "ADIANTAMENTO", "ADTOS": "ADIANTAMENTOS", "ADT": "ADIANTAMENTO", "ADTS": "ADIANTAMENTOS",
+    "ADIANT": "ADIANTAMENTO", "ADIANTS": "ADIANTAMENTOS", "ANTEC": "ANTECIPACAO",
+    "PROV": "PROVISAO", "PROVS": "PROVISOES", "PROVIS": "PROVISAO", "FER": "FERIAS",
+    "RECOL": "RECOLHER", "RECOLH": "RECOLHER", "RECUP": "RECUPERAR", "PG": "PAGAR", "PAG": "PAGAR",
+    "CONTRIB": "CONTRIBUICAO", "CONTR": "CONTRIBUICAO", "CONTRIBS": "CONTRIBUICOES",
+    "PREVID": "PREVIDENCIA", "PREVIDENC": "PREVIDENCIA", "ENC": "ENCARGOS", "ENCS": "ENCARGOS",
+    "OBRIG": "OBRIGACOES", "OBRIGS": "OBRIGACOES", "FUNC": "FUNCIONARIOS", "FUNCS": "FUNCIONARIOS",
+    "FUNCION": "FUNCIONARIOS", "EMPREG": "EMPREGADOS", "COLAB": "COLABORADORES",
+    "GRAT": "GRATIFICACOES", "GRATIF": "GRATIFICACOES", "COMIS": "COMISSOES", "COMISS": "COMISSOES",
+    "INDENIZ": "INDENIZACOES", "INDEN": "INDENIZACOES", "RESC": "RESCISOES", "RESCIS": "RESCISOES",
+    "ASSIST": "ASSISTENCIA", "ODONT": "ODONTOLOGICA", "TRANSP": "TRANSPORTE", "REFEIC": "REFEICAO",
+    "ALIM": "ALIMENTACAO", "ALIMENT": "ALIMENTACAO", "BENEF": "BENEFICIOS", "PROLABORE": "PRO LABORE",
+    "PROLAB": "PRO LABORE", "IRF": "IRRF", "SOC": "SOCIAIS", "PESS": "PESSOAL", "DESP": "DESPESAS",
+    "CUST": "CUSTOS", "ADM": "ADMINISTRATIVAS", "ADMIN": "ADMINISTRATIVAS", "ADMINIST": "ADMINISTRATIVAS",
+    "VEND": "VENDAS", "OPER": "OPERACIONAIS", "OPERAC": "OPERACIONAIS", "HS": "HORAS",
+    "SERV": "SERVICOS", "SERVS": "SERVICOS", "CONSIG": "CONSIGNADOS", "CONSIGN": "CONSIGNADOS",
+    "EMPREST": "EMPRESTIMOS", "SIND": "SINDICAL", "MATERN": "MATERNIDADE", "PENS": "PENSAO",
+    "VT": "VALE TRANSPORTE", "VR": "VALE REFEICAO", "VA": "VALE ALIMENTACAO", "TERC": "TERCEIROS",
+    "CIRC": "CIRCULANTE", "CRED": "CREDITOS", "RECEB": "RECEBER",
+}
+_REC_RECEITA = ("BRUTA", "BRUTAS", "OPERACIONAL", "OPERACIONAIS", "FINANCEIRA", "FINANCEIRAS", "SERVICOS",
+                "VENDAS", "LIQUIDA", "SERV")
+
+
+def _expande_token(ant, w, prox):
+    if w == "SAL":
+        return "SALARIO" if prox in ("FAMILIA", "FAM", "MAT", "MATERN", "MATERNIDADE", "EDUCACAO") else "SALARIOS"
+    if w == "REC":
+        return "RECEITA" if prox in _REC_RECEITA else "RECOLHER" if ant == "A" else w
+    if w == "COMP":
+        return "COMPENSAR" if ant == "A" else w
+    if w == "PREV":
+        return "PREVIO" if ant in ("AVISO", "AV") else "PREVIDENCIA"
+    if w == "AV" and prox in ("PREV", "PREVIO"):
+        return "AVISO"
+    if w == "TRAB":
+        return ("TRABALHADOR" if ant.startswith("CRED") else "TRABALHO" if ant in ("ACID", "ACIDENTE")
+                else "TRABALHISTAS")
+    if w == "LAB" and ant == "PRO":
+        return "LABORE"
+    if w == "MAT" and ant in ("SAL", "SALARIO", "LIC", "LICENCA"):
+        return "MATERNIDADE"
+    if w == "FAM" and ant in ("SAL", "SALARIO"):
+        return "FAMILIA"
+    if w == "MED" and ant.startswith("ASSIST"):
+        return "MEDICA"
+    if w == "H" and prox.startswith("EXTRA"):
+        return "HORAS"
+    if w == "V" and prox.startswith(("TRANSP", "REFEIC", "ALIM")):
+        return "VALE"
+    if w == "DEC" and prox.startswith("TERC"):
+        return "DECIMO"
+    if w == "TERC" and ant in ("DEC", "DECIMO"):
+        return "TERCEIRO"
+    if w == "EMP" and prox.startswith("CONSIG"):
+        return "EMPRESTIMOS"
+    return ABREV_CONTA.get(w, w)
+
+
+def norm_conta(txt) -> str:
+    """norm() do nome da conta com as abreviações expandidas: 'ADTO 13 SAL' -> 'ADIANTAMENTO 13 SALARIOS',
+    'INSS A REC' -> 'INSS A RECOLHER', 'FUNDO DE GARANTIA' -> 'FGTS'."""
+    p = norm(txt).split()
+    out = [_expande_token(p[i - 1] if i else "", w, p[i + 1] if i + 1 < len(p) else "") for i, w in enumerate(p)]
+    s = " ".join(out)
+    s = re.sub(r"\bIMP(?:OSTO)? (?:DE )?RENDA\b", "IMPOSTO DE RENDA", s)
+    s = re.sub(r"\bFUNDO (?:DE )?GARANTIA(?: (?:DO|POR) TEMPO DE SERVICO)?\b", "FGTS", s)
+    return s
 
 
 @st.cache_data(show_spinner=False)
@@ -405,7 +502,9 @@ def auto_colunas(cols):
     m = {}
     for c in cols:
         n = norm(c)
-        if "reduzido" not in m and "REDUZ" in n:
+        if "ecf" not in m and ("ECF" in n.split() or "REFERENCIAL" in n):
+            m["ecf"] = c
+        elif "reduzido" not in m and "REDUZ" in n:
             m["reduzido"] = c
         elif "classificacao" not in m and n.startswith("CLASSIF"):
             m["classificacao"] = c
@@ -419,16 +518,21 @@ def auto_colunas(cols):
 
 
 @st.cache_data(show_spinner=False)
-def preparar_plano(raw: pd.DataFrame, c_red, c_cla, c_des, c_tip):
+def preparar_plano(raw: pd.DataFrame, c_red, c_cla, c_des, c_tip, c_ecf=None):
     df = pd.DataFrame({
         "reduzido": raw[c_red], "classificacao": raw[c_cla], "descricao": raw[c_des],
         "tipo": raw[c_tip] if c_tip else "",
+        "ecf": raw[c_ecf].fillna("").astype(str).str.replace(r"\.0$", "", regex=True).str.replace(r"\D", "", regex=True)
+        if c_ecf else "",
     }).dropna(subset=["reduzido", "classificacao"])
     df["reduzido"] = df["reduzido"].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
     df["classificacao"] = df["classificacao"].map(norm_classif)
     df["descricao"] = df["descricao"].fillna("").astype(str).str.strip()
     df = df[df["reduzido"].str.fullmatch(r"\d+") & (df["classificacao"] != "")]
+    # a exportação repete a conta quando ela tem mais de um código referencial: guarda todos
+    ecf = df.groupby(["reduzido", "classificacao"])["ecf"].agg(lambda s: "|".join(sorted({x for x in s if x})))
     df = df.drop_duplicates(subset=["reduzido", "classificacao"]).reset_index(drop=True)
+    df["ecf"] = [ecf.get((r, c), "") for r, c in zip(df["reduzido"], df["classificacao"])]
     pontuado = bool(df["classificacao"].str.contains(".", regex=False).mean() > 0.5)
     if not pontuado:
         df["classificacao"] = df["classificacao"].str.replace(".", "", regex=False)
@@ -440,23 +544,50 @@ def preparar_plano(raw: pd.DataFrame, c_red, c_cla, c_des, c_tip):
     if not t.isin(["A", "S"]).mean() >= 0.9:  # coluna ausente/irregular -> deduz pela hierarquia
         t = df["classificacao"].map(lambda c: "S" if c in pais else "A")
     df["tipo"] = t
-    df["desc_norm"] = df["descricao"].map(norm)
+    df["desc_norm"] = df["descricao"].map(norm_conta)
     return df, pontuado
 
 
+def _raiz_pelo_nome(d):
+    if (tem(d, "ATIVO") and not tem(d, "PASSIVO")) or (tem(d, "BENS", "DIREITOS") and not tem(d, "OBRIGACOES")):
+        return "ATIVO"
+    if tem(d, "PASSIVO", "OBRIGACOES", "EXIGIVEL*"):
+        return "PASSIVO"
+    if tem(d, "RECEITA*", "RENDAS", "INGRESSOS") and not tem(d, "CUSTO*", "DESPESA*"):
+        return "RECEITA"
+    if tem(d, "CUSTO*", "DESPESA*", "RESULTADO*", "GASTOS"):
+        return "RESULTADO"
+    return None
+
+
 def detectar_raizes(plano):
+    """Raízes do plano pelo nome; a raiz sem nome reconhecível (ex.: '1 - Contas Patrimoniais') é classificada
+    pelo referencial ECF das contas abaixo dela (1 = Ativo, 2 = Passivo) e, sem referencial, pelo 1º dígito
+    (1 = Ativo, 2 = Passivo) quando o lado ainda não foi achado."""
     raizes = plano[plano["pai"] == ""]
     out = {k: [] for k in ROTULOS_RAIZ}
+    sem_nome = []
     for _, r in raizes.iterrows():
-        d, c = r["desc_norm"], r["classificacao"]
-        if tem(d, "ATIVO") and not tem(d, "PASSIVO"):
-            out["ATIVO"].append(c)
-        elif tem(d, "PASSIVO"):
-            out["PASSIVO"].append(c)
-        elif tem(d, "RECEITA*") and not tem(d, "CUSTO*", "DESPESA*"):
-            out["RECEITA"].append(c)
-        elif tem(d, "CUSTO*", "DESPESA*", "RESULTADO*"):
-            out["RESULTADO"].append(c)
+        lado = _raiz_pelo_nome(r["desc_norm"])
+        if lado:
+            out[lado].append(r["classificacao"])
+        elif not tem(r["desc_norm"], "PATRIMONIO", "COMPENSACAO", "COMPENSACOES"):
+            sem_nome.append(r["classificacao"])
+    tem_ecf = "ecf" in plano.columns
+    pont = bool(plano["classificacao"].str.contains(".", regex=False).any())
+    for c in sem_nome:
+        filhos = plano[plano["classificacao"].map(lambda x: sob(x, c, pont)) & (plano["tipo"] == "A")]
+        codigos = [x[:1] for e in (filhos["ecf"] if tem_ecf else []) for x in str(e).split("|") if x]
+        lado = None
+        if codigos:
+            dig = max(set(codigos), key=codigos.count)
+            lado = {"1": "ATIVO", "2": "PASSIVO"}.get(dig)
+        elif c[:1] == "1" and not out["ATIVO"]:
+            lado = "ATIVO"
+        elif c[:1] == "2" and not out["PASSIVO"]:
+            lado = "PASSIVO"
+        if lado:
+            out[lado].append(c)
     return out, raizes
 
 
@@ -471,8 +602,8 @@ def grupos_resultado(plano, raizes_res, pontuado):
     na_raiz = plano["classificacao"].map(lambda c: any(sob(c, r, pontuado) for r in raizes_res))
     an = plano[(plano["tipo"] == "A") & na_raiz]
     sint = plano[(plano["tipo"] == "S") & na_raiz & ~plano["classificacao"].isin(raizes_res)]
-    sal = an[an["desc_norm"].map(lambda d: tem(d, "SALARIO*", "ORDENADO*")
-                                 and not tem(d, "PAGAR", "FAMILIA", "MATERN*", "PROVIS*", "EDUCACAO")
+    sal = an[an["desc_norm"].map(lambda d: tem(d, "SALARIO*", "ORDENADO*", "REMUNERAC*")
+                                 and not tem(d, "PAGAR", "FAMILIA", "MATERN*", "PROVIS*", "EDUCACAO", "DIRETOR*")
                                  and not e13(d))]["classificacao"].tolist()
     out = [{"classif": g.classificacao, "descricao": g.descricao, "caminho": cam(g.classificacao)}
            for g in sint.itertuples() if any(sob(c, g.classificacao, pontuado) for c in sal)]
@@ -496,7 +627,7 @@ def sugerir_grupo(nome_sep, cands):
     else:
         chave = "ADMINISTRATIV*"
     for i, g in enumerate(cands):
-        if tem(norm(f"{g['caminho']} {g['descricao']}"), chave):
+        if tem(norm_conta(f"{g['caminho']} {g['descricao']}"), chave):
             return i
     return 0
 
@@ -515,17 +646,22 @@ def _13(extra=(), nots=()):
 
 NAO_TERC = ["SERVICO*", "TERCEIROS", "ALUGUE*", "APLICAC*", "PJ", "PF", "AUTONOM*", "JUROS", "PROVIS*"]
 # INSS de terceiros/PJ/PF/retido em nota fiscal não é a conta da folha
-NAO_INSS_FOLHA = ["RECEITA BRUTA", "PROVIS*", "RETID*", "PJ", "PF", "SERVIC*", "AUTONOM*", "CPRB"]
+NAO_INSS_FOLHA = ["RECEITA BRUTA", "PROVIS*", "RETID*", "PJ", "PF", "SERVIC*", "AUTONOM*", "CPRB", "DESONERAC*"]
 NAO_INSS_NF = ["PJ", "PF", "RETID*", "SERVIC*", "NF", "NOTA*", "CLIENTE*"]
+NAO_SAL_PAGAR = ["FERIAS", "13O", "13A", "13", "DECIMO*", "PRO LABORE", "RESCIS*", "FAMILIA", "MATERN*",
+                 "EDUCACAO", "PROVIS*", "INSS", "FGTS", "IRRF", "PIS", "ADIANT*"]
 
 ALVOS = {
     # ---- DRE (restrito ao grupo do separador)
     "SALARIOS": (G, "Salários e Ordenados", [
         (["SALARIO*"], ["PAGAR", "FAMILIA", "MATERN*", "PROVIS*", "13O", "13A", "13", "DECIMO*",
                         "ADIANT*", "INSS", "FGTS", "EDUCACAO"]),
-        (["ORDENADO*"], ["PAGAR"])]),
+        (["ORDENADO*"], ["PAGAR"]),
+        (["REMUNERAC*"], ["PAGAR", "DIRETOR*", "ADMINISTRADOR*", "SOCIO*", "PRO LABORE", "VARIAVE*"])]),
     "PRO_LABORE": (G, "Pró-labore", [(["PRO LABORE"], ["PAGAR", "INSS"]),
-                                     (["HONORARIO*", "DIRETOR*"], []), (["RETIRADA*", "SOCIO*"], [])]),
+                                     (["HONORARIO*", "DIRETOR*"], []), (["RETIRADA*", "SOCIO*"], []),
+                                     (["REMUNERAC*", "DIRETOR*"], ["PAGAR"]),
+                                     (["REMUNERAC*", "ADMINISTRADOR*"], ["PAGAR"])]),
     "HE": (G, "Horas Extras", [(["HORAS EXTRA*"], []), (["HORA EXTRA*"], []), (["EXTRAORDINAR*"], [])]),
     "PREMIOS": (G, "Prêmios e Gratificações", [(["PREMIO*"], []), (["GRATIFICAC*"], []),
                                                (["BONIFICAC*"], [])]),
@@ -535,7 +671,8 @@ ALVOS = {
     "INSS": (G, "INSS (encargo)", [
         (["INSS"], ["PROVIS*", "RECOLHER", "PAGAR", "RECEITA BRUTA", "RETIDO", "COMPENSAR"]),
         (["PREVIDENCIA*"], ["RECOLHER", "PAGAR", "PRIVADA", "COMPLEMENTAR"]),
-        (["CONTRIBUIC*", "PREVIDENCIARIA*"], ["RECOLHER", "PAGAR", "RECEITA BRUTA"])]),
+        (["CONTRIBUIC*", "PREVIDENCIARIA*"], ["RECOLHER", "PAGAR", "RECEITA BRUTA"]),
+        (["ENCARGO*", "PREVIDENCIARI*"], ["RECOLHER", "PAGAR", "PROVIS*"])]),
     "FGTS": (G, "FGTS (encargo)", [(["FGTS"], ["PROVIS*", "RECOLHER", "PAGAR"])]),
     "PIS": (G, "PIS s/ Folha", [(["PIS"], ["PROVIS*", "RECOLHER", "PAGAR", "RETIDO", "FATURAMENTO",
                                            "RECEITA*", "COFINS"])]),
@@ -560,28 +697,43 @@ ALVOS = {
     "D_PIS_13": (G, "PIS s/ Provisão 13º (despesa)", _13(["PIS", "PROVIS*"])),
     # ---- Passivo
     "SAL_PAGAR": (PA, "Salários a Pagar", [
-        (["SALARIO*", "PAGAR"], ["FERIAS", "13O", "13A", "13", "DECIMO*", "PRO LABORE", "RESCIS*"]),
-        (["ORDENADO*", "PAGAR"], []), (["FOLHA*", "PAGAR"], [])]),
+        (["SALARIO*", "PAGAR"], NAO_SAL_PAGAR),
+        (["ORDENADO*", "PAGAR"], []), (["FOLHA*", "PAGAR"], ["INSS", "FGTS", "IRRF", "PIS", "PROVIS*"]),
+        (["REMUNERAC*", "PAGAR"], ["DIRETOR*", "PRO LABORE", "FERIAS", "13O", "13A", "13", "DECIMO*", "RESCIS*"]),
+        (["OBRIGAC*", "PESSOAL"], ["INSS", "FGTS", "IRRF", "PROVIS*"])]),
     "FER_PAGAR": (PA, "Férias a Pagar", [(["FERIAS", "PAGAR"], ["PROVIS*"])]),
     "RESC_PAGAR": (PA, "Rescisões a Pagar", [(["RESCIS*", "PAGAR"], [])]),
-    "PROLAB_PAGAR": (PA, "Pró-labore a Pagar", [(["PRO LABORE", "PAGAR"], []), (["PRO LABORE"], ["INSS"])]),
+    "PROLAB_PAGAR": (PA, "Pró-labore a Pagar", [(["PRO LABORE", "PAGAR"], []), (["PRO LABORE"], ["INSS"]),
+                                                (["HONORARIO*", "DIRETOR*"], ["INSS"]), (["RETIRADA*", "SOCIO*"], []),
+                                                (["REMUNERAC*", "DIRETOR*"], ["INSS"]),
+                                                (["REMUNERAC*", "ADMINISTRADOR*"], ["INSS"])]),
     "INSS_REC": (PA, "INSS a Recolher", [
         (["INSS", "RECOLHER"], NAO_INSS_FOLHA), (["INSS", "PAGAR"], NAO_INSS_FOLHA),
-        (["PREVIDENCIA SOCIAL"], NAO_INSS_FOLHA)]),
+        (["PREVIDENCIA SOCIAL"], NAO_INSS_FOLHA),
+        (["CONTRIBUIC*", "PREVIDENCIARI*"], NAO_INSS_FOLHA + ["COMPENSAR", "RECUPERAR"]),
+        (["OBRIGAC*", "PREVIDENCIARI*"], NAO_INSS_FOLHA), (["GPS"], NAO_INSS_FOLHA),
+        (["INSS"], NAO_INSS_FOLHA + ["COMPENSAR", "RECUPERAR"]),
+        (["ENCARGO*", "SOCIAIS"], NAO_INSS_FOLHA + ["FGTS", "IRRF", "COMPENSAR", "RECUPERAR"]),
+        (["TRIBUTOS FEDERAIS"], []), (["IMPOSTOS FEDERAIS"], [])]),
     "FGTS_REC": (PA, "FGTS a Recolher", [(["FGTS", "RECOLHER"], ["PROVIS*"]),
                                          (["FGTS", "PAGAR"], ["PROVIS*"]), (["FGTS"], ["PROVIS*"])]),
     "IRRF_REC": (PA, "IRRF s/ Folha a Recolher", [
         (["IRRF", "FOLHA*"], ["PROVIS*"]), (["IRRF", "SALARIO*"], []), (["IRRF", "TRABALH*"], []),
         (["IRRF", "RECOLHER"], NAO_TERC), (["IRRF", "PAGAR"], NAO_TERC),
-        (["IMPOSTO DE RENDA", "FONTE"], NAO_TERC), (["IR", "FONTE"], NAO_TERC), (["IRRF"], NAO_TERC)]),
+        (["IMPOSTO DE RENDA", "FONTE"], NAO_TERC), (["IR", "FONTE"], NAO_TERC), (["IRRF"], NAO_TERC),
+        (["IMPOSTO*", "RENDA", "RETID*"], NAO_TERC),
+        (["TRIBUTOS FEDERAIS"], NAO_TERC), (["IMPOSTOS FEDERAIS"], NAO_TERC)]),
     "PIS_REC": (PA, "PIS s/ Folha a Recolher", [(["PIS", "FOLHA*"], ["PROVIS*"]),
                                                 (["PIS", "RECOLHER"], ["PROVIS*", "RETIDO", "FATURAMENTO"])]),
     "SIND_REC": (PA, "Contribuição Sindical a Recolher", [
-        (["CONTRIBUIC*", "SINDICA*"], ["PATRONAL"]), (["SINDICA*"], ["PATRONAL"])]),
+        (["CONTRIBUIC*", "SINDICA*"], ["PATRONAL"]), (["SINDICA*"], ["PATRONAL"]),
+        (["CONTRIBUIC*", "ASSISTENCIA*"], ["PATRONAL", "MEDICA*", "SAUDE", "SOCIAL", "ODONTO*"]),
+        (["CONTRIBUIC*", "CONFEDERATIV*"], ["PATRONAL"])]),
     "SIND_PAT_REC": (PA, "Contribuição Sindical Patronal a Recolher", [(["SINDICA*", "PATRONAL"], [])]),
     "EMPREST": (PA, "Empréstimos Consignados a Repassar", [
         (["CONSIGNA*"], []), (["EMPRESTIMO*", "EMPREGADO*"], []),
-        (["EMPRESTIMO*", "FUNCIONARIO*"], []), (["EMPRESTIMO*", "FOLHA"], [])]),
+        (["EMPRESTIMO*", "FUNCIONARIO*"], []), (["EMPRESTIMO*", "FOLHA"], []),
+        (["CREDITO*", "TRABALHADOR*"], []), (["ECONSIGNADO*"], [])]),
     "PENSAO": (PA, "Pensão Alimentícia a Repassar", [(["PENSAO*"], [])]),
     "ISS_REC": (PA, "ISS Retido a Recolher", [
         (["ISS", "RECOLHER"], ["PROVIS*"]), (["ISS", "RETIDO"], []), (["ISSQN"], []), (["ISS"], ["PROVIS*"])]),
@@ -599,15 +751,17 @@ ALVOS = {
     "P_PIS_13": (PA, "PIS s/ Provisão 13º", _13(["PIS", "PROVIS*"])),
     # ---- Ativo
     "ADIANT_SAL": (AT, "Adiantamento de Salário", [
-        (["ADIANTAMENTO*", "SALARIO*"], ["13O", "13A", "13", "DECIMO*", "FERIAS"]),
+        (["ADIANTAMENTO*", "SALARI*"], ["13O", "13A", "13", "DECIMO*", "FERIAS"]),
         (["ADIANTAMENTO*", "EMPREGADO*"], []), (["ADIANTAMENTO*", "FUNCIONARIO*"], []),
-        (["ADIANTAMENTO*", "PESSOAL"], [])]),
-    "ADIANT_13": (AT, "Adiantamento de 13º", _13(["ADIANTAMENTO*"])),
-    "ADIANT_FER": (AT, "Adiantamento de Férias", [(["ADIANTAMENTO*", "FERIAS"], [])]),
+        (["ADIANTAMENTO*", "PESSOAL"], []), (["ADIANTAMENTO*", "COLABORADOR*"], []),
+        (["ANTECIPAC*", "SALARI*"], ["13O", "13A", "13", "DECIMO*", "FERIAS"])]),
+    "ADIANT_13": (AT, "Adiantamento de 13º", _13(["ADIANTAMENTO*"]) + _13(["ANTECIPAC*"])),
+    "ADIANT_FER": (AT, "Adiantamento de Férias", [(["ADIANTAMENTO*", "FERIAS"], []), (["ANTECIPAC*", "FERIAS"], [])]),
     "INSS_COMP": (AT, "INSS a Compensar (retenções)", [(["INSS", "COMPENSAR"], ["MATERN*", "FAMILIA"]),
                                                        (["INSS", "RECUPERAR"], [])]),
     "BENEF_INSS": (AT, "Sal.-Família/Maternidade a Compensar", [
         (["MATERN*", "COMPENSAR"], []), (["FAMILIA", "COMPENSAR"], []),
+        (["MATERN*", "RECUPERAR"], []), (["FAMILIA", "RECUPERAR"], []),
         (["INSS", "COMPENSAR"], NAO_INSS_NF), (["INSS", "RECUPERAR"], NAO_INSS_NF)]),
     "IRRF_COMP": (AT, "IRRF a Compensar", [
         (["IRRF", "COMPENSAR"], []), (["IRRF", "RECUPERAR"], []),
@@ -634,16 +788,91 @@ TERMOS_GRUPO_FOLHA = ("SALARIO*", "ORDENADO*", "TRABALHIST*", "PREVIDENCIARI*", 
 # procura em todo o resultado antes de cair em Salários.
 FORA_DO_GRUPO = {"BOLSA", "ASSIST", "VT", "ALIM", "SEGURO", "TREIN", "COMISSOES"}
 
+# Plano referencial da RFB (ECF) da coluna "Classificação ECF" do plano exportado da Domínio: é nacional e vale
+# para qualquer plano de contas mapeado. Os códigos mudam conforme o referencial (Geral × Imunes/Isentas), por
+# isso o referencial em uso é detectado pelas próprias contas. No Ativo/Passivo o código confirma ou descarta a
+# conta; nas despesas só confirma (na prática as empresas agrupam encargos em "Outros gastos com pessoal").
+ECF_REFERENCIAL = {
+    "Geral (L100/L300)": {
+        "SAL_PAGAR": ("201010101",), "FER_PAGAR": ("201010101",), "RESC_PAGAR": ("201010101", "201010160"),
+        "PROLAB_PAGAR": ("201010101",), "INSS_REC": ("201010103",), "FGTS_REC": ("201010104",),
+        "IRRF_REC": ("201010901", "201010109"), "PIS_REC": ("201010904", "201010109"), "SIND_REC": ("201010109",),
+        "CPRB_REC": ("201010911",), "ISS_REC": ("201010908", "201010912"),
+        "ADIANT_SAL": ("101020103",), "ADIANT_13": ("101020103",), "ADIANT_FER": ("101020103",),
+        "BENEF_INSS": ("101020418",), "INSS_COMP": ("101020417", "101020418"), "IRRF_COMP": ("101020401",),
+        "PIS_COMP": ("101020408",),
+        "PRO_LABORE": ("30101070101",), "SALARIOS": ("30101070102",), "INSS": ("30101070105",),
+        "FGTS": ("30101070106",), "ALIM": ("30101070113",), "ASSIST": ("30101070133",),
+        "D_PROV_FER": ("30101070126",), "D_PROV_13": ("30101070127",), "SEGURO": ("30101070140",),
+    },
+    "Imunes e isentas (U100/U150)": {
+        "SAL_PAGAR": ("201010101",), "FER_PAGAR": ("201010101",), "RESC_PAGAR": ("201010101",),
+        "PROLAB_PAGAR": ("201010101",), "INSS_REC": ("201010102",), "FGTS_REC": ("201010103",),
+        "ADIANT_SAL": ("101020102",), "ADIANT_13": ("101020102",), "ADIANT_FER": ("101020102",),
+        "SALARIOS": ("402010201",), "INSS": ("402010203",), "FGTS": ("402010203",),
+        "D_PROV_FER": ("402010205",), "D_PROV_13": ("402010205",), "PRO_LABORE": ("4020101",),
+    },
+}
+# Código referencial específico: a conta mapeada nele vale mesmo com nome fora do padrão (desde que o nome não
+# tenha termo que o alvo exclui: "INSS PJ a recolher" mapeada no INSS a recolher continua fora)
+ECF_SUFICIENTE = {"INSS_REC", "FGTS_REC", "BENEF_INSS", "INSS_COMP", "IRRF_COMP", "PIS_COMP", "CPRB_REC"}
+
+# Termos que, num grupo acima da conta (dentro do escopo da busca), indicam outro subrazão: em "Provisão de
+# Férias > INSS" a conta não é o INSS a recolher da folha. Só vetam o alvo que já exclui o termo no nome da conta.
+VETO_CONTEXTO = {"PROVIS*", "RECEITA BRUTA", "CPRB", "DESONERAC*", "RETID*", "RETIDO", "PJ", "PF", "TERCEIROS",
+                 "SERVICO*", "SERVIC*", "AUTONOM*", "NF", "NOTA*", "CLIENTE*", "ALUGUE*", "APLICAC*", "JUROS",
+                 "FATURAMENTO", "COFINS", "RECEITA*", "COMPENSAR", "RECUPERAR", "PRIVADA", "COMPLEMENTAR"}
+# ...exceto num grupo que também é da folha ("Retenções da folha > INSS"); provisão e CPRB vetam sempre
+VETO_SEMPRE = {"PROVIS*", "RECEITA BRUTA", "CPRB", "DESONERAC*", "PRIVADA", "COMPLEMENTAR"}
+TERMOS_FOLHA_FORTE = ("FOLHA*", "EMPREGADO*", "SALARIO*", "FUNCIONARIO*", "COLABORADOR*", "TRABALHIST*", "PESSOAL")
+# No Passivo o "a pagar"/"a recolher" fica implícito ("Obrigações Trabalhistas > Salários"); termo genérico
+# demais não vira padrão sozinho
+IMPLICITOS_PASSIVO = {"PAGAR", "RECOLHER"}
+GENERICOS = {"FOLHA*", "OBRIGAC*", "PESSOAL", "OUTRAS"}
+LONGO_PRAZO = ("NAO CIRCULANTE", "LONGO PRAZO", "EXIGIVEL A LONGO*", "REALIZAVEL A LONGO*")
+# como a conta foi achada (0 a 4); as fracas e os empates vão para "Revisar"
+COMO = {0: "pelo nome", 1: "pelo nome e grupo", 2: "só pelo grupo", 3: "pelo nome, no Passivo",
+        4: "pelo referencial ECF"}
+COMO_FRACO = {COMO[2], COMO[4]}
+
+
+def referencial_do_plano(plano):
+    """(nome, mapa alvo -> códigos) do referencial ECF que o plano segue; ('', {}) sem mapeamento confiável.
+    Confere os códigos das contas de Salários, INSS e FGTS a pagar/recolher com os nomes delas."""
+    if "ecf" not in plano.columns:
+        return "", {}
+    an = plano[(plano["tipo"] == "A") & (plano["ecf"] != "")]
+    if an.empty:
+        return "", {}
+    pontos = {}
+    for nome, mapa in ECF_REFERENCIAL.items():
+        p = 0
+        for alvo in ("SAL_PAGAR", "INSS_REC", "FGTS_REC"):
+            must, nots = ALVOS[alvo][2][0] if alvo == "SAL_PAGAR" else ALVOS[alvo][2][1]
+            for d, codigos in zip(an["desc_norm"], an["ecf"]):
+                if all(tem(d, x) for x in must) and not any(tem(d, x) for x in nots):
+                    p += 1 if any(c.startswith(mapa[alvo]) for c in codigos.split("|")) else -1
+        pontos[nome] = p
+    nome = max(pontos, key=pontos.get)
+    return (nome, ECF_REFERENCIAL[nome]) if pontos[nome] > 0 else ("", {})
+
 
 class Resolvedor:
     def __init__(self, plano, pontuado, raizes, overrides):
         self.an = plano[plano["tipo"] == "A"]
         self.p, self.raizes, self.ov = pontuado, raizes, overrides
         self.desc = dict(zip(plano["reduzido"], plano["descricao"]))
-        self.cache, self.bases, self.fora_grupo = {}, {}, set()
+        self.cla = dict(zip(plano["reduzido"], plano["classificacao"]))
+        self.cache, self.bases, self.fora_grupo, self.info = {}, {}, set(), {}
         desc_cla = dict(zip(plano["classificacao"], plano["desc_norm"]))
-        self.folha = {c: any(tem(desc_cla.get(a, ""), *TERMOS_GRUPO_FOLHA) for a in ancestrais(c, pontuado))
-                      for c in self.an["classificacao"]}
+        self.existentes = set(plano["classificacao"])
+        # grupos acima de cada conta analítica, do mais próximo para a raiz
+        self.anc = {c: [(a, desc_cla[a]) for a in reversed(ancestrais(c, pontuado)) if a in desc_cla]
+                    for c in self.an["classificacao"]}
+        self.folha = {c: any(tem(d, *TERMOS_GRUPO_FOLHA) for _, d in g) for c, g in self.anc.items()}
+        self.longo = {c: any(tem(d, *LONGO_PRAZO) for _, d in g) for c, g in self.anc.items()}
+        self.referencial, self.ref = referencial_do_plano(plano)
+        self.ecf = dict(zip(plano["reduzido"], plano["ecf"])) if "ecf" in plano.columns else {}
 
     @staticmethod
     def chave(alvo, grupo):
@@ -663,38 +892,129 @@ class Resolvedor:
                 lambda c: any(sob(c, p, self.p) for p in prefs))]
         return self.bases[prefs]
 
-    def _buscar(self, alvo, prefs, preferir_folha):
+    def _ecf(self, reduzido, codigos):
+        """1 = código referencial da conta confirma o alvo | -1 = contradiz | 0 = sem informação."""
+        conta = self.ecf.get(reduzido, "")
+        if not codigos or not conta:
+            return 0
+        return 1 if any(c.startswith(codigos) for c in conta.split("|")) else -1
+
+    def _contexto(self, c, prefs):
+        """Nomes dos grupos acima da conta dentro do escopo da busca (o grupo/raiz da busca não entra)."""
+        p = next((x for x in prefs if sob(c, x, self.p)), "")
+        return [d for a, d in self.anc.get(c, ()) if a != p and sob(a, p, self.p)]
+
+    @staticmethod
+    def _padroes(alvo):
+        """[(termos, exclusões, implícito)]: no Passivo, também cada padrão sem o 'a pagar/a recolher'."""
+        orig = [(must, nots, False) for must, nots in ALVOS[alvo][2]]
+        if ALVOS[alvo][0] != PA:
+            return orig
+        extra = []
+        for must, nots, _ in orig:
+            resto = [x for x in must if x not in IMPLICITOS_PASSIVO]
+            if (resto and len(resto) < len(must) and not set(resto) <= GENERICOS
+                    and all((resto, nots) != (m, n) for m, n, _ in orig + extra)):
+                extra.append((resto, nots, True))
+        return orig + extra
+
+    @staticmethod
+    def _nivel(d, ctx, must, nots, nots_alvo, implicito):
+        """0 = termos no nome da conta | 1 = nome + grupo logo acima | 2 = só pelos grupos | None = não casa."""
+        if any(tem(d, x) for x in nots):
+            return None
+        falta = [x for x in must if not tem(d, x)]
+        if (falta or implicito) and any(tem(d, x) for x in nots_alvo):
+            return None          # sem o nome completo, a conta não pode ter termo que o alvo exclui
+        if not falta:
+            return 0
+        if not ctx or any(tem(ctx[0], x) for x in nots):
+            return None
+        if len(falta) < len(must) and all(tem(ctx[0], x) for x in falta):
+            return 1
+        if all(any(tem(g, x) for g in ctx) for x in falta):
+            return 2
+        return None
+
+    @staticmethod
+    def _vetado(ctx, veto):
+        for g in ctx:
+            achados = [x for x in veto if tem(g, x)]
+            if achados and (set(achados) & VETO_SEMPRE or not tem(g, *TERMOS_FOLHA_FORTE)):
+                return True
+        return False
+
+    def _buscar(self, alvo, prefs, patrimonial):
+        """(reduzido, descrição, como, empatadas) da melhor conta do escopo ou None."""
         base = self._base(prefs) if prefs else self.an.iloc[0:0]
         if base.empty:
             return None
-        primeiro = None
-        for must, nots in ALVOS[alvo][2]:
-            ok = base["desc_norm"].map(
-                lambda d: all(tem(d, x) for x in must) and not any(tem(d, x) for x in nots))
-            c = base[ok]
-            if c.empty:
+        codigos = self.ref.get(alvo, ())
+        padroes = self._padroes(alvo)
+        nots_alvo = sorted({x for _, ns, _ in padroes for x in ns})
+        veto = [x for x in nots_alvo if x in VETO_CONTEXTO]
+        cands = []
+        for r in base.itertuples(index=False):
+            ctx = self._contexto(r.classificacao, prefs)
+            if veto and self._vetado(ctx, veto):
                 continue
-            c = c.assign(_n=c["desc_norm"].str.len()).sort_values(["_n", "classificacao"])
-            if not preferir_folha:
-                return c.iloc[0]["reduzido"], c.iloc[0]["descricao"]
-            if primeiro is None:
-                primeiro = (c.iloc[0]["reduzido"], c.iloc[0]["descricao"])
-            f = c[c["classificacao"].map(lambda x: self.folha.get(x, False))]
-            if not f.empty:
-                return f.iloc[0]["reduzido"], f.iloc[0]["descricao"]
-        return primeiro
+            for i, (must, nots, impl) in enumerate(padroes):
+                nivel = self._nivel(r.desc_norm, ctx, must, nots, nots_alvo, impl)
+                if nivel is not None:
+                    cands.append((i, nivel, 3 if impl and nivel == 0 else nivel, r))
+                    break
+            else:
+                if (codigos and alvo in ECF_SUFICIENTE and self._ecf(r.reduzido, codigos) == 1
+                        and not any(tem(r.desc_norm, x) for x in nots_alvo)):
+                    cands.append((len(padroes), 2, 4, r))
+        if not cands:
+            return None
+
+        def ordem(item):
+            i, nivel, como, r = item
+            e = self._ecf(r.reduzido, codigos)
+            # contradita pelo referencial vai por último; achada só pelo referencial fica depois das achadas pelo nome
+            return (patrimonial and e == -1, como == 4, e != 1, i, nivel,
+                    patrimonial and not self.folha.get(r.classificacao, False),
+                    patrimonial and self.longo.get(r.classificacao, False), len(r.desc_norm), r.classificacao)
+        cands.sort(key=ordem)
+        topo = ordem(cands[0])[:-2]
+        empatadas = [(c[3].reduzido, c[3].descricao) for c in cands[1:] if ordem(c)[:-2] == topo]
+        r = cands[0][3]
+        return r.reduzido, r.descricao, COMO[cands[0][2]], empatadas[:3]
 
     def sugestao(self, alvo, grupo):
         k = self.chave(alvo, grupo)
         if k not in self.cache:
             esc = ALVOS[alvo][0]
             res = self._buscar(alvo, self._prefixos(alvo, grupo), esc in (PA, AT))
+            if res is None and esc == G and grupo:
+                # encargos, provisões e benefícios costumam ficar num grupo irmão do mesmo departamento
+                pai = next((a for a in reversed(ancestrais(grupo, self.p)) if a in self.existentes), "")
+                if pai and pai not in self.raizes["RESULTADO"]:
+                    res = self._buscar(alvo, (pai,), False)
             if res is None and esc == G and alvo in FORA_DO_GRUPO and self.raizes["RESULTADO"]:
                 res = self._buscar(alvo, tuple(self.raizes["RESULTADO"]), False)
                 if res:
                     self.fora_grupo.add(k)
-            self.cache[k] = res
+            self.cache[k] = res[:2] if res else None
+            self.info[k] = {"como": res[2], "empate": res[3]} if res else {}
         return self.cache[k]
+
+    def alerta(self, alvo, grupo):
+        """Aviso para a conta sugerida (não definida pelo usuário) achada de forma fraca ou empatada com outra."""
+        k = self.chave(alvo, grupo)
+        r = None if self.ov.get(k) else self.sugestao(alvo, grupo)
+        if not r:
+            return ""
+        inf, msgs = self.info.get(k, {}), []
+        como = inf.get("como")
+        if como in COMO_FRACO or (como == COMO[3] and not self.folha.get(self.cla.get(r[0]), False)):
+            msgs.append(f"{ALVOS[alvo][1]}: conta {r[0]} achada {como} — confirme")
+        if inf.get("empate"):
+            msgs.append(f"{ALVOS[alvo][1]}: {r[0]} empatou com " + ", ".join(x for x, _ in inf["empate"])
+                        + " — confirme")
+        return " | ".join(msgs)
 
     def conta(self, alvo, grupo):
         k = self.chave(alvo, grupo)
@@ -712,6 +1032,9 @@ class Resolvedor:
                 k = self.chave(a, grupo)
                 if k in self.fora_grupo and not self.ov.get(k):
                     avisos.append(f"{ALVOS[a][1]}: conta fora do grupo do separador")
+                aviso = self.alerta(a, grupo)
+                if aviso:
+                    avisos.append(aviso)
                 return r[0], r[1], " | ".join(avisos)
         return "", "", f"❌ sem conta '{ALVOS[alvos[0]][1]}' (defina no Mapa de contas)"
 
@@ -1234,11 +1557,21 @@ def _eh_int(v) -> bool:
     return isinstance(v, str) and bool(re.fullmatch(r"-?\d+", v.strip()))
 
 
+def e_nulo(v) -> bool:
+    """Lado sem conta (partidas múltiplas), em qualquer caixa."""
+    return txt_cel(v).upper() == NULO
+
+
+def parte_do_lancamento(deb, cred) -> int:
+    """1 = débito e crédito | 2 = só débito (CONTA_CRED nula) | 3 = só crédito (CONTA_DEB nula)."""
+    return 3 if e_nulo(deb) else 2 if e_nulo(cred) else 1
+
+
 def checar_layout(evento: pd.DataFrame, integra: pd.DataFrame, multi: bool = False):
     out = []
 
     def _conta_ok(v):
-        return _eh_int(v) or (isinstance(v, str) and v.strip().lower() == NULO)
+        return _eh_int(v) or e_nulo(v)
     def add(nome, nivel, problemas):
         ok = not problemas
         out.append({"Verificação": nome, "Nível": nivel,
@@ -1275,13 +1608,16 @@ def checar_layout(evento: pd.DataFrame, integra: pd.DataFrame, multi: bool = Fal
     tipos_fora = sorted({t for t in evento[c_tip].tolist() if t not in TIPOS_LAYOUT})
     add("Aba evento: tipo da integração no conjunto gerado (1, 2, 3, 4, 5, 6, 10)", "Erro",
         f"tipos não previstos: {tipos_fora}" if tipos_fora else "")
-    s_deb, s_cred = evento[c_deb].astype(str).str.strip().str.lower(), evento[c_cred].astype(str).str.strip().str.lower()
-    ambos_nulos = (s_deb == NULO) & (s_cred == NULO)
+    n_deb, n_cred = evento[c_deb].map(e_nulo), evento[c_cred].map(e_nulo)
+    ambos_nulos = n_deb & n_cred
     add("Aba evento: todo lançamento tem ao menos uma conta (débito ou crédito)", "Erro",
         f"{int(ambos_nulos.sum())} lançamento(s) com as duas contas '{NULO}'" if ambos_nulos.any() else "")
-    iguais = (s_deb == s_cred) & (s_deb != NULO)
+    iguais = (evento[c_deb].map(txt_cel) == evento[c_cred].map(txt_cel)) & ~n_deb
     add("Aba evento: conta débito diferente da conta crédito", "Erro",
         f"{int(iguais.sum())} lançamento(s) com débito = crédito" if iguais.any() else "")
+    if not multi and (n_deb | n_cred).any():
+        add("Partidas dobradas: todo lançamento com débito e crédito", "Erro",
+            f"{int((n_deb | n_cred).sum())} lançamento(s) com um lado '{NULO}'")
     pk_ev = [c_emp, c_sep, c_cod, c_tip]
     dup_ev = evento.duplicated(pk_ev, keep=False)
     add("Aba evento: chave única (empresa + separador + código + tipo)", "Erro",
@@ -1311,8 +1647,8 @@ def checar_layout(evento: pd.DataFrame, integra: pd.DataFrame, multi: bool = Fal
         p_seq = []
         for (e_, s_), g_ in t1.groupby([c_emp, c_sep]):
             cods = sorted(int(x) for x in g_[c_cod])
-            if cods != list(range(1, len(cods) + 1)):
-                p_seq.append(f"separador {s_}: códigos fora de sequência 1..{len(cods)}")
+            if cods != list(range(cods[0], cods[0] + len(cods))):
+                p_seq.append(f"separador {s_}: códigos fora de sequência {cods[0]}..{cods[0] + len(cods) - 1}")
         add("Partidas múltiplas: lançamentos do Tipo 1 em sequência numérica (1, 2, 3…) por separador", "Erro",
             "; ".join(p_seq))
         liq_ok = integra[(integra[i_tip] == 1) & (integra[i_rub].map(lambda v: _eh_int(v) and int(v) < 0))]
@@ -1320,14 +1656,19 @@ def checar_layout(evento: pd.DataFrame, integra: pd.DataFrame, multi: bool = Fal
         sem_liq = sorted(seps_t1 - set(liq_ok[i_sep].tolist()))
         add("Partidas múltiplas: há lançamento de líquido (item negativo) em cada separador do Tipo 1", "Erro",
             f"separador(es) sem líquido: {sem_liq}" if sem_liq else "")
-        mistura = []
+        mistura, ordem_ruim = [], []
         for (e_, s_), g_ in t1.groupby([c_emp, c_sep]):
-            deb_ = g_[c_deb].astype(str).str.strip().str.lower()
-            cre_ = g_[c_cred].astype(str).str.strip().str.lower()
-            if ((deb_ != NULO) & (cre_ != NULO)).sum() and (((deb_ == NULO) | (cre_ == NULO)).sum() == 0):
+            g_ = g_.sort_values(c_cod)
+            partes = [parte_do_lancamento(d_, c_) for d_, c_ in zip(g_[c_deb], g_[c_cred])]
+            if 1 in partes and not {2, 3} & set(partes):
                 mistura.append(f"separador {s_}: nenhum lançamento de uma só conta")
+            # o lançamento composto (proventos, descontos e líquidos) fica contíguo, antes dos de duas contas
+            if 1 in partes and any(p != 1 for p in partes[partes.index(1):]):
+                ordem_ruim.append(f"separador {s_}")
         add("Partidas múltiplas: Tipo 1 com lançamentos de uma só conta (proventos/descontos/líquido)", "Aviso",
             "; ".join(mistura))
+        add("Partidas múltiplas: proventos, descontos e líquidos em sequência, antes dos lançamentos de duas contas",
+            "Erro", ("lançamento de duas contas no meio do composto: " + ", ".join(ordem_ruim)) if ordem_ruim else "")
     return out
 
 # =====================================================================
@@ -1338,7 +1679,8 @@ CFG_WIDGETS = (("historico", "w_hist"), ("baixa_prov", "w_baixa"), ("socio_adm",
                ("tipos_cadastro", "w_tipos_cad"), ("separadores_cadastro", "w_seps_cad"),
                ("mesma_rescisao", "w_mesma_resc"), ("mesma_ferias", "w_mesma_fer"),
                ("filantropica", "w_filant"), ("manter_exclusivas", "w_exclusivas"),
-               ("partidas_multiplas", "w_multi"), ("liquidos", "w_liquidos"))
+               ("partidas_multiplas", "w_multi"), ("liquidos", "w_liquidos"), ("leiaute", "w_leiaute"),
+               ("inicio_tipo1", "w_inicio_t1"))
 
 
 def aplicar_config(dados: bytes):
@@ -1364,6 +1706,195 @@ def aplicar_config(dados: bytes):
 
 def md5(txt: str) -> str:
     return hashlib.md5(txt.encode("utf-8")).hexdigest()[:10]
+
+# =====================================================================
+# 6b. ARQUIVOS DA IMPORTAÇÃO VIA TABELA (importação por leiaute)
+#     TXT: um registro por linha, campos separados por TAB, sem cabeçalho, Windows-1252, CR+LF, na ordem do
+#     leiaute (evento = FOINTEGCONT, integra = FOINTEGCONTEVE). A importação grava 0 em campo numérico vazio lido
+#     do arquivo; NULL só sai de campo com "Valor fixo = NULO" no leiaute, que não ocupa coluna no TXT. Em
+#     partidas múltiplas a parte 2 vai sem a coluna CONTA_CRED e a parte 3 sem a coluna CONTA_DEB.
+# =====================================================================
+def _campo_txt(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    if isinstance(v, numbers.Integral) and not isinstance(v, bool):
+        return str(int(v))
+    return re.sub(r"[\t\r\n]+", " ", str(v)).strip()
+
+
+def _txt(linhas) -> bytes:
+    corpo = "".join("\t".join(_campo_txt(v) for v in lin) + "\r\n" for lin in linhas)
+    return corpo.encode("cp1252", errors="replace")
+
+
+def fora_do_cp1252(textos):
+    """Textos com caractere que o Windows-1252 não tem (no TXT viraria '?')."""
+    out = []
+    for t in textos:
+        try:
+            str(t).encode("cp1252")
+        except UnicodeEncodeError:
+            out.append(str(t))
+    return out
+
+
+def _sql_leiaute(n, nulo):
+    """Leiaute n da importação: o campo 'nulo' de FOINTEGCONT com Valor fixo = NULO; os demais lidos do arquivo."""
+    out = []
+    for campo in ("CONTA_DEB", "CONTA_CRED"):
+        valor = "origem_valor = 'F', valor_fixo = 'NULO'" if campo == nulo else "origem_valor = 'I', valor_fixo = ''"
+        out.append(f"update bethadba.gelayout_campos set {valor}\n where i_layout = {n} and upper(i_nome) = "
+                   f"'{TAB_EVENTO}' and upper(trim(campo)) = '{campo}';")
+    return out + ["commit;", "", "-- conferência",
+                  f"select i_nome, i_sequencial, campo, origem_valor, valor_fixo\n  from bethadba.gelayout_campos\n"
+                  f" where i_layout = {n} and upper(i_nome) = '{TAB_EVENTO}'\n"
+                  f"   and upper(trim(campo)) in ('CONTA_DEB', 'CONTA_CRED')\n order by i_sequencial;"]
+
+
+def _texto(linhas) -> bytes:
+    return ("\r\n".join(linhas) + "\r\n").encode("cp1252", errors="replace")
+
+
+def _sql(linhas) -> bytes:
+    return ("\r\n".join(linhas) + "\r\n").encode("utf-8-sig")
+
+
+def pacote_importacao(evento, integra, emp, leiaute="", gerado_em=None):
+    """.zip da importação via tabela: TXT de cada parte, estrutura dos arquivos, LEIA-ME, scripts do leiaute (com o
+    número do leiaute) e de conferência. Retorna (bytes, {parte: (lançamentos, vínculos)}, passos)."""
+    c_emp, c_sep, c_cod, c_tip, *_ = COLS_EVENTO
+    c_deb, c_cred = COLS_EVENTO[5], COLS_EVENTO[6]
+    i_emp, i_sep, i_cod, i_tip, _ = COLS_INTEGRA
+    ev = evento.assign(_parte=[parte_do_lancamento(d, c) for d, c in zip(evento[c_deb], evento[c_cred])])
+    da_chave = {k: p for k, p in zip(map(tuple, ev[[c_emp, c_sep, c_cod, c_tip]].values.tolist()), ev["_parte"])}
+    it = integra.assign(_parte=[da_chave.get(k, 1) for k in
+                                map(tuple, integra[[i_emp, i_sep, i_cod, i_tip]].values.tolist())])
+    usadas = sorted(set(ev["_parte"])) or [1]
+    em_pastas = usadas != [1]
+    leiaute = txt_cel(leiaute)
+    arquivos, estrutura, resumo = {}, [], {}
+    for p in usadas:
+        pasta, _, nulo = PARTES[p]
+        campos = [c for c in CAMPOS_EVENTO if c != nulo]
+        cols = [COLS_EVENTO[CAMPOS_EVENTO.index(c)] for c in campos]
+        e_p, i_p = ev[ev["_parte"] == p], it[it["_parte"] == p]
+        pref = f"{pasta}/" if em_pastas else ""
+        arquivos[f"{pref}evento.txt"] = _txt(e_p[cols].values.tolist())
+        arquivos[f"{pref}integra.txt"] = _txt(i_p[COLS_INTEGRA].values.tolist())
+        resumo[p] = (len(e_p), len(i_p))
+        for pos, (c, d) in enumerate(zip(campos, cols), 1):
+            estrutura.append([f"{pref}evento.txt", pos, TAB_EVENTO, c, d])
+        if nulo:
+            estrutura.append([f"{pref}evento.txt", "", TAB_EVENTO, nulo, "Valor fixo = NULO no leiaute (fora do TXT)"])
+        for pos, (c, d) in enumerate(zip(CAMPOS_INTEGRA, COLS_INTEGRA), 1):
+            estrutura.append([f"{pref}integra.txt", pos, TAB_INTEGRA, c, d])
+    with io.StringIO() as s:
+        w = csv.writer(s, delimiter=";")
+        w.writerow(["arquivo", "posicao", "tabela", "campo", "descricao"])
+        w.writerows(estrutura)
+        arquivos["estrutura_arquivos.csv"] = s.getvalue().encode("utf-8-sig")
+
+    n_lei = leiaute if leiaute.isdigit() else "N"
+    passos = [f"Antes de importar, rode conferir_antes_de_importar_emp{emp}.sql (somente leitura): ele precisa "
+              "voltar vazio. Se trouxer linhas, esses códigos de lançamento já existem na empresa"
+              + (" — em partidas múltiplas, ajuste no app o 'Primeiro código do Tipo 1' para depois do último "
+                 "código existente." if em_pastas else ".")]
+    if em_pastas:
+        estado = None
+        for p in usadas:
+            pasta, titulo, nulo = PARTES[p]
+            ajuste = ("normal (CONTA_DEB e CONTA_CRED lidos do arquivo)" if not nulo else
+                      f"{nulo} com Valor fixo = NULO" + ("" if estado is None else
+                                                         f" e {estado} de volta para 'lido do arquivo'"))
+            if p > 1 and leiaute.isdigit():
+                ajuste += f" (script leiaute_{n_lei}_antes_da_parte_{p}.sql)"
+            passos.append(f"Parte {p} — {titulo}: {resumo[p][0]} lançamento(s). Leiaute: {ajuste}. Importe "
+                          f"{pasta}/evento.txt e depois {pasta}/integra.txt.")
+            estado = nulo
+        passos.append(f"No fim, volte {estado} para 'lido do arquivo' (leiaute normal)"
+                      + (f" — script leiaute_{n_lei}_restaurar.sql." if leiaute.isdigit() else "."))
+    else:
+        passos.append(f"Importe evento.txt e depois integra.txt com o leiaute normal (todos os campos lidos do "
+                      f"arquivo): {resumo[1][0]} lançamento(s) e {resumo[1][1]} vínculo(s).")
+
+    agora = (gerado_em or dt.datetime.now()).strftime("%d/%m/%Y %H:%M")
+    leia = ["INTEGRAÇÃO CONTÁBIL DA FOLHA — IMPORTAÇÃO VIA TABELA (importação por leiaute)",
+            f"Empresa {emp} | gerado em {agora} | {len(ev)} lançamento(s) em {TAB_EVENTO} e {len(it)} vínculo(s) "
+            f"em {TAB_INTEGRA}", "",
+            "FORMATO DOS ARQUIVOS",
+            f"   - evento.txt  -> {TAB_EVENTO}: " + ", ".join(CAMPOS_EVENTO),
+            f"   - integra.txt -> {TAB_INTEGRA}: " + ", ".join(CAMPOS_INTEGRA),
+            "   - Um registro por linha, campos separados por TAB, sem cabeçalho, Windows-1252, CR+LF, na ordem do "
+            "leiaute (posições em estrutura_arquivos.csv).",
+            "   - Importe sempre o evento.txt antes do integra.txt: o vínculo precisa do lançamento gravado."]
+    if em_pastas:
+        leia += ["", "POR QUE EM PARTES (lançamentos de uma só conta)",
+                 "   A importação via tabela grava 0 em campo numérico vazio lido do arquivo, e nenhum texto no TXT "
+                 "vira branco. O lado sem conta só fica em branco (NULL) com o campo no leiaute em Valor fixo = NULO — "
+                 "e campo com valor fixo não ocupa coluna no TXT. Por isso a parte 2 vai sem a coluna CONTA_CRED e a "
+                 "parte 3 sem a coluna CONTA_DEB.",
+                 "", "AJUSTE DO LEIAUTE (escolha um jeito)",
+                 "   a) Na tela da importação por leiaute: tabela FOINTEGCONT, campo indicado em cada parte -> "
+                 "Valor fixo = NULO.",
+                 "   b) Por SQL, no Interactive SQL (dbisql) com usuário com permissão de escrita; depois de cada "
+                 "script, feche e abra a tela de importação."
+                 + ("" if leiaute.isdigit() else " Para gerar os scripts, informe o número do leiaute no app "
+                    "(Opções avançadas).")]
+    leia += ["", "PASSO A PASSO"] + [f"   {i}. {t}" for i, t in enumerate(passos, 1)]
+    leia += ["", "CONFERÊNCIA NA DOMÍNIO",
+             "   - Arquivo > Contabilidade > Configurar Integração: confira lançamentos de cada guia"
+             + ("; na guia Folha, proventos só com Conta Débito, descontos e líquidos só com Conta Crédito "
+                "e os itens de líquido selecionados." if em_pastas else "."),
+             f"   - conferir_contas_zero_emp{emp}.sql (somente leitura) não pode trazer linha: conta 0 não existe.",
+             f"   - Lançamentos importados antes com 0 na contrapartida: corrigir_contas_zero_emp{emp}.sql troca o 0 por "
+             "branco (NULL) só nesta empresa.",
+             "   - Primeira importação neste banco: faça antes a cópia de segurança conforme o procedimento da sua "
+             "área."]
+    arquivos["LEIA-ME.txt"] = _texto(leia)
+
+    if em_pastas and leiaute.isdigit():
+        estado = None
+        for p in usadas:
+            nulo = PARTES[p][2]
+            if p > 1:
+                arquivos[f"leiaute_{n_lei}_antes_da_parte_{p}.sql"] = _sql(
+                    [f"-- Leiaute {n_lei}: antes da parte {p} ({PARTES[p][1]})",
+                     "-- Execute no Interactive SQL (dbisql); depois feche e abra a tela de importação.", ""]
+                    + _sql_leiaute(n_lei, nulo))
+            estado = nulo
+        arquivos[f"leiaute_{n_lei}_restaurar.sql"] = _sql(
+            [f"-- Leiaute {n_lei}: CONTA_DEB e CONTA_CRED de volta para 'lido do arquivo' (depois da última parte).", ""]
+            + _sql_leiaute(n_lei, None))
+    filtro = f"codi_emp = {int(emp)}" if _eh_int(emp) else "codi_emp = <EMPRESA>"
+    grupos_chave = {}
+    for s_, t_, c_ in zip(ev[c_sep], ev[c_tip], ev[c_cod]):
+        grupos_chave.setdefault((s_, t_), []).append(int(c_))
+    conds = []
+    for (s_, t_), cods in sorted(grupos_chave.items(), key=lambda x: (str(x[0][0]), x[0][1])):
+        cods = sorted(set(cods))
+        for i in range(0, len(cods), 400):
+            conds.append(f"(i_separador = {s_} and tipo = {t_} and i_codigo in "
+                         f"({', '.join(str(x) for x in cods[i:i + 400])}))")
+    arquivos[f"conferir_antes_de_importar_emp{emp}.sql"] = _sql(
+        ["-- Códigos de lançamento deste arquivo que JÁ existem na empresa. Deve voltar vazio antes de importar.",
+         "-- Somente leitura.",
+         f"select i_separador, tipo, i_codigo, descricao, conta_deb, conta_cred\n  from bethadba.{TAB_EVENTO.lower()}\n"
+         f" where {filtro}\n   and (" + "\n     or ".join(conds or ["1 = 0"]) + ")\n order by i_separador, tipo, i_codigo;"])
+    arquivos[f"conferir_contas_zero_emp{emp}.sql"] = _sql(
+        ["-- Lançamentos da integração com conta 0 (deve voltar vazio). Somente leitura.",
+         f"select i_separador, tipo, i_codigo, descricao, conta_deb, conta_cred\n  from bethadba.{TAB_EVENTO.lower()}\n"
+         f" where {filtro} and (conta_deb = 0 or conta_cred = 0)\n order by i_separador, tipo, i_codigo;"])
+    arquivos[f"corrigir_contas_zero_emp{emp}.sql"] = _sql(
+        ["-- Troca a conta 0 (inexistente no plano) por branco (NULL) nos lançamentos da integração desta empresa.",
+         "-- Use só para lançamentos importados antes com 0 na contrapartida. Interactive SQL com permissão de escrita.",
+         "", f"update bethadba.{TAB_EVENTO.lower()} set conta_deb = null where {filtro} and conta_deb = 0;",
+         f"update bethadba.{TAB_EVENTO.lower()} set conta_cred = null where {filtro} and conta_cred = 0;",
+         "commit;"])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for nome, conteudo in arquivos.items():
+            z.writestr(nome, conteudo)
+    return buf.getvalue(), resumo, passos
 
 # =====================================================================
 # 7. INTERFACE
@@ -1397,7 +1928,7 @@ MODO_TODOS = "Todos os eventos cadastrados"
 
 for k, v in (("w_hist", ""), ("w_baixa", True), ("w_socio", True), ("w_bloq", ""),
              ("w_compl", COMPLEMENTO_PADRAO), ("w_mesma_resc", False), ("w_mesma_fer", False),
-             ("w_filant", False), ("w_exclusivas", True),
+             ("w_filant", False), ("w_exclusivas", True), ("w_leiaute", ""),
              ("w_forcar", False), ("w_multi", False), ("w_liquidos", LIQUIDOS_PADRAO), ("w_modo", MODO_PEND)):
     st.session_state.setdefault(k, v)
 
@@ -1445,18 +1976,26 @@ with st.sidebar:
 
     st.markdown("**1 · Como lançar a folha**")
     modo_multi = st.checkbox("Lançar o líquido à parte (partidas múltiplas)", key="w_multi",
-                             help="Modelo da Solução 822: no Tipo 1 cada provento vira lançamento só de débito, cada "
-                                  "desconto só de crédito ('nulo' no lado sem conta) e o líquido é lançado pelos itens "
-                                  "de Líquido (códigos negativos). Os lançamentos do Tipo 1 seguem a numeração 1, 2, 3… "
-                                  "(proventos, descontos, informativas, líquidos). A Rescisão continua com duas contas "
-                                  "no Tipo 4, pois a Domínio não tem o item 'Líquido Rescisão' na guia Folha.")
+                             help="Modelo da Solução 6583: no Tipo 1 cada provento vira lançamento só de débito, cada "
+                                  "desconto só de crédito e o líquido é lançado pelos itens de Líquido (códigos "
+                                  "negativos). Os lançamentos do Tipo 1 seguem a numeração 1, 2, 3… (proventos, "
+                                  "descontos e líquidos em sequência; por último os de duas contas, como o FGTS). "
+                                  "Na importação via tabela o lado sem conta vai como Valor fixo = NULO no leiaute: "
+                                  "o .zip separa as partes. A Rescisão continua com duas contas no Tipo 4, pois a "
+                                  "Domínio não tem o item 'Líquido Rescisão' na guia Folha.")
     st.caption("Desligado: cada rubrica leva débito e crédito (Salários a Pagar). "
                "Ligado: proventos só débito, descontos só crédito e o líquido sai nos itens de líquido.")
-    liquidos_sel = []
+    liquidos_sel, inicio_t1 = [], 1
     if modo_multi:
         st.session_state["w_liquidos"] = [int(x) for x in st.session_state["w_liquidos"] if int(x) in LIQUIDOS]
         liquidos_sel = st.multiselect("Itens de líquido a lançar", list(LIQUIDOS), key="w_liquidos",
                                       format_func=lambda c: f"{c} · {LIQUIDOS[c][0]}")
+        st.session_state["w_inicio_t1"] = max(1, int(st.session_state.get("w_inicio_t1") or 1))
+        inicio_t1 = st.number_input("Primeiro código dos lançamentos do Tipo 1", min_value=1, step=1,
+                                    key="w_inicio_t1",
+                                    help="1 para empresa sem integração configurada. Se a empresa já tem lançamentos "
+                                         "no Tipo 1 (modo pendências), comece depois do último código existente — "
+                                         "o script conferir_antes_de_importar do .zip mostra os que coincidem.")
 
     st.markdown("**2 · Férias e Rescisão**")
     st.caption("Usar a mesma configuração da folha normal para:")
@@ -1499,6 +2038,10 @@ with st.sidebar:
         complemento = st.text_input("Complemento", key="w_compl")
         st.caption(f"1 lançamento por rubrica/item · Código Sequencial = código da rubrica/item · "
                    f"Descrição = 'código - descrição' em caixa mista, máx. {LIM_DESC_EVENTO} caracteres.")
+        leiaute_num = st.text_input("Número do leiaute da importação via tabela (opcional)", key="w_leiaute",
+                                    placeholder="ex.: 18",
+                                    help="Com o número, o .zip traz os scripts SQL que deixam CONTA_DEB/CONTA_CRED "
+                                         "com Valor fixo = NULO em cada parte e restauram o leiaute no fim.")
 
 if not (f_cad and f_plano and (f_pend or modo_cad)):
     st.info("👈 Comece pelo Passo 1: envie na barra lateral o cadastro geral de rubricas e o plano de contas"
@@ -1573,10 +2116,10 @@ cfg_cols = cfg.get("colunas", {})
 exp_plano = st.expander("⚙️ Colunas e raízes do plano",
                         expanded=not all(auto.get(c) for c in ("reduzido", "classificacao", "descricao")))
 with exp_plano:
-    cc = st.columns(4)
+    cc = st.columns(len(CAMPOS_PLANO))
     sel = {}
     for i, (campo, rot) in enumerate(CAMPOS_PLANO.items()):
-        opts = (["(nenhuma)"] if campo == "tipo" else []) + cols
+        opts = (["(nenhuma)"] if campo in CAMPOS_OPCIONAIS else []) + cols
         wk = f"c_{campo}"
         if st.session_state.get(wk) not in opts:
             pref = cfg_cols.get(campo) if cfg_cols.get(campo) in opts else auto.get(campo)
@@ -1585,7 +2128,8 @@ with exp_plano:
 
 try:
     plano, pontuado = preparar_plano(raw, sel["reduzido"], sel["classificacao"], sel["descricao"],
-                                     None if sel["tipo"] in (None, "(nenhuma)") else sel["tipo"])
+                                     None if sel["tipo"] in (None, "(nenhuma)") else sel["tipo"],
+                                     None if sel["ecf"] in (None, "(nenhuma)") else sel["ecf"])
 except Exception as e:
     st.error(f"Não foi possível montar o plano com essas colunas: {e}")
     st.stop()
@@ -1683,7 +2227,7 @@ desenhar_passos(ph_passos, 3)
 grupo_socio = None
 if socio_adm:
     adm = next((g["classif"] for g in cands
-                if tem(norm(f"{g['caminho']} {g['descricao']}"), "ADMINISTRATIV*")), None)
+                if tem(norm_conta(f"{g['caminho']} {g['descricao']}"), "ADMINISTRATIV*")), None)
     op_socio = ["(mesmo grupo do separador)"] + rotulos
     if st.session_state.get("w_grupo_socio") not in op_socio:
         pc = cfg.get("grupo_socio")
@@ -1746,16 +2290,24 @@ cfg_contas = st.session_state.setdefault("cfg_contas", {})
 linhas_map = []
 for chave, (a, g) in sorted(pares.items()):
     sug = base_res.sugestao(a, g)
+    inf = base_res.info.get(chave, {})
     linhas_map.append({
         "Chave": chave, "Alvo": ALVOS[a][1],
         "Escopo": f"grupo {g}" if ALVOS[a][0] == G else ESCOPO_ROTULO[ALVOS[a][0]],
         "Sugerida": sug[0] if sug else "", "Descrição sugerida": sug[1] if sug else "❌ não encontrada",
+        "Como foi achada": ("⚠️ " if inf.get("como") in COMO_FRACO else "") + inf.get("como", ""),
+        "Empatou com": ", ".join(f"{x} {d}" for x, d in inf.get("empate", [])),
         "Conta definida": cfg_contas.get(chave, ""),
     })
 df_map = pd.DataFrame(linhas_map)
 n_nf = int(((df_map["Sugerida"] == "") & (df_map["Conta definida"] == "")).sum())
-with st.expander(f"Contas encontradas no plano — {n_nf} sem conta definida", expanded=n_nf > 0):
-    st.caption("O app procurou cada conta pelo nome no plano da empresa. Onde aparecer '❌ não encontrada', "
+n_conf = int((((df_map["Como foi achada"].str.startswith("⚠️")) | (df_map["Empatou com"] != ""))
+              & (df_map["Conta definida"] == "")).sum())
+with st.expander(f"Contas encontradas no plano — {n_nf} sem conta definida, {n_conf} para confirmar",
+                 expanded=bool(n_nf or n_conf)):
+    st.caption("O app procura cada conta no plano da empresa pelo nome (com as abreviações usuais), pelos grupos "
+               "acima dela, pelo lado do balanço e pelo referencial ECF — sem depender do plano padrão. "
+               "'Como foi achada' com ⚠️ ou 'Empatou com' preenchido: confira. Onde aparecer '❌ não encontrada', "
                "informe o código reduzido na coluna 'Conta definida' (também serve para trocar uma sugestão). "
                "Os valores ficam na configuração salva da empresa.")
     ed_map = st.data_editor(df_map, key=f"map_{md5(df_map.to_json())}", hide_index=True,
@@ -1883,7 +2435,7 @@ def validar(row):
         vals[lado] = c
         if not c:
             msgs.append(f"{lado} vazio")
-        elif c.lower() == NULO:
+        elif e_nulo(c):
             pass
         elif c not in idx_plano.index:
             msgs.append(f"{lado} {c} inexistente")
@@ -1891,8 +2443,10 @@ def validar(row):
             msgs.append(f"{lado} {c} é sintética")
         elif row["Seção"] in SECOES_DE_ITENS and c in colab:
             msgs.append(f"{lado} {c} é conta de colaborador — proibido em item patronal")
-    if vals["Débito"].lower() == NULO and vals["Crédito"].lower() == NULO:
+    if e_nulo(vals["Débito"]) and e_nulo(vals["Crédito"]):
         msgs.append(f"as duas contas estão '{NULO}'")
+    elif (e_nulo(vals["Débito"]) or e_nulo(vals["Crédito"])) and not modo_multi:
+        msgs.append(f"lado '{NULO}' só vale em partidas múltiplas")
     elif vals["Débito"] and vals["Débito"] == vals["Crédito"]:
         msgs.append("⚡ débito = crédito")
     dl = txt_cel(row["Descrição Lançamento"])
@@ -1975,8 +2529,8 @@ exp["_s"] = [str(v) for v in exp["_sep"]]
 exp["_tipo"] = [int(TIPO_INTEGRACAO[s]) for s in exp["Seção"]]
 exp["_cod"] = [int(c) for c in exp["Código"]]          # código da rubrica/item
 exp["_lanc"] = exp["_cod"]                              # código do lançamento (sequencial no Tipo 1 em partidas múltiplas)
-exp["_deb"] = [txt_cel(v) for v in exp["Débito"]]
-exp["_cred"] = [txt_cel(v) for v in exp["Crédito"]]
+exp["_deb"] = [NULO if e_nulo(v) else txt_cel(v) for v in exp["Débito"]]
+exp["_cred"] = [NULO if e_nulo(v) else txt_cel(v) for v in exp["Crédito"]]
 exp["_hist"] = [txt_cel(hist_tipo.get(t)) or txt_cel(historico) for t in exp["_tipo"]]
 exp["_desc"] = [txt_cel(v) for v in exp["Descrição Lançamento"]]
 
@@ -2015,11 +2569,12 @@ if modo_multi:
         exp = pd.concat([exp, pd.DataFrame(liq_rows)], ignore_index=True)
     t1 = exp[exp["_tipo"] == 1].copy()
     if not t1.empty:
-        t1["_grp"] = [3 if c < 0 else 0 if cr == NULO else 1 if de == NULO else 2
+        # lançamento composto contíguo: só débito (proventos), só crédito (descontos), líquidos; depois duas contas
+        t1["_grp"] = [2 if c < 0 else 0 if e_nulo(cr) else 1 if e_nulo(de) else 3
                       for c, de, cr in zip(t1["_cod"], t1["_deb"], t1["_cred"])]
         t1["_ord"] = [abs(c) for c in t1["_cod"]]
         t1 = t1.sort_values(["_s", "_grp", "_ord"], kind="stable")
-        t1["_lanc"] = t1.groupby("_s").cumcount() + 1
+        t1["_lanc"] = t1.groupby("_s").cumcount() + int(inicio_t1)
         exp.loc[t1.index, "_lanc"] = t1["_lanc"]
     exp = exp.sort_values(["_s", "_tipo", "_lanc"], kind="stable").reset_index(drop=True)
     if not liquidos_sel:
@@ -2067,14 +2622,37 @@ with st.expander(f"Conformidade com o layout da Domínio (FOINTEGCONT / FOINTEGC
         st.dataframe(pd.DataFrame(checagens), hide_index=True, use_container_width=True)
     else:
         st.info("Nenhum lançamento para conferir.")
-    st.caption("O texto dos cabeçalhos segue o modelo da Domínio; as verificações acima conferem ordem das colunas, "
-               "tipos, limites de tamanho, chave única e vínculos do arquivo contra as tabelas de destino.")
+    st.caption("As verificações conferem ordem das colunas, tipos, limites de tamanho, chave única e vínculos do arquivo "
+               "contra as tabelas de destino (FOINTEGCONT e FOINTEGCONTEVE).")
+
+zip_imp, resumo_partes, passos_imp = (pacote_importacao(evento, integra, emp, leiaute_num) if n
+                                      else (b"", {}, []))
+sem_cp = fora_do_cp1252(evento[COLS_EVENTO[4]].tolist() + [complemento]) if n else []
+if sem_cp:
+    st.warning("⚠️ Texto com caractere fora do Windows-1252 (no TXT vira '?'): " + "; ".join(sem_cp[:5]))
 
 e1, e2, e3 = st.columns(3)
-e1.metric("Lançamentos (aba evento)", len(evento))
-e2.metric("Vínculos (aba integra)", len(integra))
+e1.metric("Lançamentos (evento)", len(evento))
+e2.metric("Vínculos (integra)", len(integra))
 e3.metric("Configurar manualmente", len(manuais))
-with st.expander("Pré-visualizar o arquivo (abas evento e integra)"):
+with st.expander("Como importar na Domínio (importação via tabela)", expanded=len(resumo_partes) > 1):
+    if len(resumo_partes) > 1:
+        st.info("A importação via tabela grava **0** em campo numérico vazio lido do arquivo — por isso a "
+                "contrapartida vinha 0. O lado sem conta só fica **em branco** com o campo em **Valor fixo = NULO** "
+                "no leiaute (campo com valor fixo não ocupa coluna no TXT). O .zip separa os lançamentos em partes: "
+                "a parte 2 vai sem a coluna CONTA_CRED e a parte 3 sem a coluna CONTA_DEB.")
+        st.dataframe(pd.DataFrame([{"Parte": p, "Pasta": PARTES[p][0], "O que vai": PARTES[p][1],
+                                    "Campo com Valor fixo = NULO": PARTES[p][2] or "— (leiaute normal)",
+                                    "Lançamentos": v[0], "Vínculos": v[1]} for p, v in resumo_partes.items()]),
+                     hide_index=True, use_container_width=True)
+    for i, t_ in enumerate(passos_imp, 1):
+        st.markdown(f"{i}. {t_}")
+    st.caption("O .zip traz o LEIA-ME com este passo a passo, a posição de cada coluna (estrutura_arquivos.csv), "
+               "a consulta que mostra se algum código de lançamento já existe na empresa (antes de importar), a que "
+               "confere se ficou conta 0 (depois) e o script que corrige lançamentos já importados com 0"
+               + ("; com o número do leiaute (Opções avançadas), também os scripts do leiaute de cada parte."
+                  if len(resumo_partes) > 1 else "."))
+with st.expander("Pré-visualizar o arquivo (evento e integra)"):
     t1, t2 = st.tabs([ABA_EVENTO, ABA_INTEGRA])
     t1.dataframe(evento.astype(str), hide_index=True, use_container_width=True)
     t2.dataframe(integra.astype(str), hide_index=True, use_container_width=True)
@@ -2089,13 +2667,14 @@ def excel_bytes(abas: dict) -> bytes:
 
 
 cfg_out = {
-    "versao": 9, "empresa": cod_empresa, "nome_empresa": cab["nome"],
+    "versao": 10, "empresa": cod_empresa, "nome_empresa": cab["nome"],
     "grupos": mapa_grupos, "grupo_socio": grupo_socio, "contas": dict(cfg_contas),
     "historico": historico, "hist_tipo": {str(t): v for t, v in hist_tipo.items() if v},
     "complemento": complemento, "baixa_prov": baixa_prov, "socio_adm": socio_adm,
     "bloqueio_extra": bloq_extra, "raizes": raizes,
     "mesma_rescisao": mesma_resc_cfg, "mesma_ferias": mesma_fer, "manter_exclusivas": manter_excl,
-    "partidas_multiplas": modo_multi, "liquidos": liquidos_sel, "filantropica": filant,
+    "partidas_multiplas": modo_multi, "liquidos": liquidos_sel, "filantropica": filant, "leiaute": leiaute_num,
+    "inicio_tipo1": int(inicio_t1),
     "colunas": {k: v for k, v in sel.items() if v and v != "(nenhuma)"},
 }
 if modo_cad:
@@ -2110,6 +2689,10 @@ if not manuais.empty:
     conf_abas["configurar_manual"] = manuais
 if checagens:
     conf_abas["conformidade_layout"] = pd.DataFrame(checagens)
+if n:
+    conf_abas["evento"] = evento.assign(**{"Parte da importação": [
+        parte_do_lancamento(d_, c_) for d_, c_ in zip(evento[COLS_EVENTO[5]], evento[COLS_EVENTO[6]])]})
+    conf_abas["integra"] = integra
 
 bloqueio_import = (bool(erros_layout) or (not fora.empty and not forcar) or n == 0
                    or bool(liq_sem_conta) or (modo_multi and not liquidos_sel))
@@ -2151,11 +2734,16 @@ elif not fora.empty and not forcar:
              "Passo 2 ou marque 'Permitir exportar mesmo assim' no Passo 3.")
 
 sufixo = "_completo" if modo_cad else ""
-st.download_button(f"⬇️ Baixar arquivo de importação ({len(evento)} lançamentos)",
-                   excel_bytes({ABA_INTEGRA: integra, ABA_EVENTO: evento}),
-                   file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.xlsx", disabled=bloqueio_import,
-                   type="primary")
-c2, c3 = st.columns(2)
+st.download_button(f"⬇️ Baixar arquivos da importação via tabela (.zip com TXT — {len(evento)} lançamentos"
+                   + (f", {len(resumo_partes)} partes)" if len(resumo_partes) > 1 else ")"),
+                   zip_imp, file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.zip", mime="application/zip",
+                   disabled=bloqueio_import, type="primary")
+c1_, c2, c3 = st.columns(3)
+c1_.download_button("📄 Mesmo conteúdo em planilha (integra/evento)",
+                    excel_bytes({ABA_INTEGRA: integra, ABA_EVENTO: evento}),
+                    file_name=f"integracao_folha_emp{cod_empresa}{sufixo}.xlsx", disabled=bloqueio_import,
+                    help="Só para consulta: em partidas múltiplas o lado sem conta aparece como NULO, e a importação "
+                         "via tabela grava 0 nele. Para importar, use os TXT do .zip.")
 c2.download_button("📋 Planilha de conferência completa", excel_bytes(conf_abas),
                    file_name=f"conferencia_folha_emp{cod_empresa}{sufixo}.xlsx")
 c3.download_button("💾 Salvar configuração da empresa (.json)",
