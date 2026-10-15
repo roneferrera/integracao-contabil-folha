@@ -1767,7 +1767,7 @@ def aplicar_config(dados: bytes):
     st.session_state["cfg_contas"] = {str(k): str(v) for k, v in cfg.get("contas", {}).items()}
     for chave, wk in CFG_WIDGETS:
         if chave in cfg:
-            st.session_state[wk] = cfg[chave]
+            st.session_state[wk] = txt_cel(cfg[chave]) if wk in ("w_cod", "w_leiaute") else cfg[chave]
     for t, v in cfg.get("hist_tipo", {}).items():
         st.session_state[f"w_hist_{t}"] = str(v)
 
@@ -1996,7 +1996,7 @@ MODO_TODOS = "Todos os eventos cadastrados"
 
 for k, v in (("w_hist", ""), ("w_baixa", True), ("w_socio", True), ("w_bloq", ""),
              ("w_compl", COMPLEMENTO_PADRAO), ("w_mesma_resc", False), ("w_mesma_fer", False),
-             ("w_filant", False), ("w_exclusivas", True), ("w_leiaute", ""),
+             ("w_filant", False), ("w_exclusivas", True), ("w_leiaute", ""), ("w_cod", ""),
              ("w_forcar", False), ("w_multi", False), ("w_liquidos", LIQUIDOS_PADRAO), ("w_modo", MODO_PEND)):
     st.session_state.setdefault(k, v)
 
@@ -2013,6 +2013,11 @@ with st.sidebar:
 
     with box_arq:
         st.header("Passo 1 · Arquivos")
+        st.text_input("Código da empresa na Domínio", key="w_cod", placeholder="ex.: 56",
+                      help="Empresa que vai receber a integração: vai no CODI_EMP dos TXT, nos scripts SQL e no nome "
+                           "dos arquivos. Em branco, o app usa o código lido do relatório de pendências (ou do "
+                           "cadastro de rubricas, no modo 'Todos os eventos').")
+        ph_empresa = st.empty()
         modo_txt = st.radio("O que contabilizar?", [MODO_PEND, MODO_TODOS], key="w_modo",
                             help="Pendências: gera só o que o relatório 'Rubricas/Itens não configurados' lista. "
                                  "Todos os eventos: gera o lançamento de todas as rubricas do cadastro geral, "
@@ -2037,7 +2042,6 @@ with st.sidebar:
                                     help="Sem separador = folha centralizada (Separador 0). "
                                          "Informando, todos os eventos são replicados para cada separador.")
             st.caption("Tipo 10: cada item da aba Outras Informações (1 a 13) gera o seu próprio lançamento.")
-        ph_empresa = st.empty()
 
     st.divider()
     st.header("Regras desta empresa")
@@ -2112,7 +2116,8 @@ with st.sidebar:
                                          "com Valor fixo = NULO em cada parte e restauram o leiaute no fim.")
 
 if not (f_cad and f_plano and (f_pend or modo_cad)):
-    st.info("👈 Comece pelo Passo 1: envie na barra lateral o cadastro geral de rubricas e o plano de contas"
+    st.info("👈 Comece pelo Passo 1: informe o código da empresa na Domínio e envie na barra lateral o cadastro "
+            "geral de rubricas e o plano de contas"
             + ("." if modo_cad else " e o relatório de rubricas/itens não configurados — ou escolha "
                "'Todos os eventos cadastrados' em 'O que contabilizar?'.")
             + " Se já configurou esta empresa antes, carregue também a configuração salva.")
@@ -2163,18 +2168,21 @@ if cad and sum(1 for r in cad.values() if not r["descricao"]):
     st.warning(f"{sum(1 for r in cad.values() if not r['descricao'])} rubrica(s) do cadastro sem descrição lida — "
                "confira o layout do relatório.")
 
-origem_bytes = f_cad.getvalue() if modo_cad else f_pend.getvalue()
-pid = hashlib.md5(origem_bytes + (b"|cad" if modo_cad else b"|pend")).hexdigest()
-if st.session_state.get("pend_id") != pid:
-    st.session_state["pend_id"] = pid
-    if not cfg.get("empresa"):
-        st.session_state["w_cod"] = cab["codigo"]
-st.session_state.setdefault("w_cod", cab["codigo"])
-cod_empresa = ph_empresa.text_input("Código da empresa na Domínio", key="w_cod",
-                                    help="Lido do relatório; confira antes de baixar o arquivo.")
-if cfg.get("empresa") and cab["codigo"] and str(cfg["empresa"]) != cab["codigo"]:
-    st.warning(f"⚠️ A configuração carregada é da empresa {cfg['empresa']}, "
-               f"mas o {'cadastro' if modo_cad else 'relatório'} é da empresa {cab['codigo']}.")
+fonte_emp = "cadastro" if modo_cad else "relatório"
+cod_lido = txt_cel(cab["codigo"])
+cod_digitado = txt_cel(st.session_state.get("w_cod"))
+cod_empresa = cod_digitado or cod_lido
+if cod_lido:
+    ph_empresa.caption(f"Lido do {fonte_emp}: {cod_lido} - {cab['nome'][:40]}" + ("" if cod_digitado else " · em uso"))
+else:
+    ph_empresa.caption(f"O {fonte_emp} não traz o código da empresa — informe acima.")
+if cod_digitado and cod_lido and cod_digitado != cod_lido:
+    origem_cod = " (da configuração carregada)" if txt_cel(cfg.get("empresa")) == cod_digitado else ""
+    st.warning(f"⚠️ Os arquivos vão para a empresa {cod_digitado}{origem_cod}, mas o {fonte_emp} é da empresa "
+               f"{cod_lido} — confira o código no Passo 1.")
+empresa_ok = cod_empresa.isdigit()
+if not empresa_ok:
+    st.error("❌ Informe o código da empresa na Domínio (somente números) no Passo 1, na barra lateral.")
 
 # ---------- 1. Estrutura do plano ----------
 st.subheader("Passo 2 · Plano de contas")
@@ -2233,7 +2241,7 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Eventos no lote" if modo_cad else "Itens pendentes", len(itens))
 m2.metric("Rubricas no cadastro", len(cad))
 m3.metric("Contas no plano", len(plano))
-m4.metric("Empresa", f'{cab["codigo"]} - {cab["nome"][:25]}')
+m4.metric("Empresa", f'{cod_empresa} - {cab["nome"][:25]}' if cod_empresa == cod_lido else (cod_empresa or "—"))
 if modo_cad:
     cont = pd.Series([TIPO_INTEGRACAO[i["secao"]] for i in itens]).value_counts().sort_index()
     st.caption("Eventos por Tipo da Integração: "
@@ -2672,15 +2680,16 @@ integra = pd.DataFrame({
     COLS_INTEGRA[4]: exp["_cod"].tolist(),          # código da rubrica/item (negativo = item de líquido)
 }, columns=COLS_INTEGRA).drop_duplicates().reset_index(drop=True)
 
-if not isinstance(emp, int):
-    st.warning("Código da empresa não numérico — confira na barra lateral.")
 cortadas = sum(1 for c, d in zip(exp["_cod"], exp["Descrição"])
                if c > 0 and len(f"{c} - {caixa_mista(d)}") > LIM_DESC_EVENTO)
 if cortadas:
     st.info(f"{cortadas} descrição(ões) cortada(s) em {LIM_DESC_EVENTO} caracteres — "
             "ajuste na coluna 'Descrição Lançamento' se quiser abreviar.")
 
-checagens = checar_layout(evento, integra, multi=modo_multi) if n else []
+# sem o código da empresa o bloqueio já aparece uma vez ("falta o código"): a conformidade confere o resto
+emp_conf = {COLS_EVENTO[0]: emp if empresa_ok else 0}
+checagens = (checar_layout(evento.assign(**emp_conf), integra.assign(**{COLS_INTEGRA[0]: emp_conf[COLS_EVENTO[0]]}),
+                           multi=modo_multi) if n else [])
 erros_layout = [c for c in checagens if c["Nível"] == "Erro" and c["Resultado"] == "❌"]
 avisos_layout = [c for c in checagens if c["Nível"] == "Aviso" and c["Resultado"] == "⚠️"]
 with st.expander(f"Conformidade com o layout da Domínio (FOINTEGCONT / FOINTEGCONTEVE) — "
@@ -2762,9 +2771,11 @@ if n:
         parte_do_lancamento(d_, c_) for d_, c_ in zip(evento[COLS_EVENTO[5]], evento[COLS_EVENTO[6]])]})
     conf_abas["integra"] = integra
 
-bloqueio_import = (bool(erros_layout) or (not fora.empty and not forcar) or n == 0
+bloqueio_import = (bool(erros_layout) or (not fora.empty and not forcar) or n == 0 or not empresa_ok
                    or bool(liq_sem_conta) or (modo_multi and not liquidos_sel))
 motivos = []
+if not empresa_ok:
+    motivos.append("falta o código da empresa na Domínio (Passo 1)")
 if n == 0:
     motivos.append("nenhum lançamento foi gerado")
 if erros_layout:
